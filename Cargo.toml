@@ -1,0 +1,35 @@
+[package]
+name = "wind-dict"
+version = "0.1.0"
+edition = "2021"
+description = "常驻托盘的桌面词典：全局热键唤起，离线词典为主"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# GUI。走本地路径：本项目依赖 windui 尚未发布的「后台工具」能力（全局热键、
+# EventCtx 显隐窗口、关闭拦截转隐藏、启动即隐藏），见 docs/adr/0004。
+windui = { path = "../wind-ui-rust" }
+
+# 词库与用户数据。bundled 编入 SQLite 自身，免去用户装 DLL。
+# 二进制因此 +~1.5MB——相对 windui 的极简理念是笔真实开销，见 docs/adr/0006。
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# 错误传播。词典的失败模式（库损坏、网络、API 报错）对用户都是「查不到」，
+# 不需要调用方按类型分支处理，故用 anyhow 而非自定义错误枚举。
+anyhow = "1"
+
+# 仅构建期工具（examples/build_ecdict.rs）与测试使用。
+#
+# csv 放这里而非 [dependencies] 是刻意的：词库构建是**开发期**的一次性动作，
+# 其产物是随程序分发的 .db 文件。运行时只读 SQLite，永远不碰 CSV。
+# 放进 [dependencies] 会让 csv 及其依赖被链进那个以体积为卖点的最终二进制。
+[dev-dependencies]
+csv = "1"
+
+[profile.release]
+# 与 windui 对齐：体积优先 + LTO。词库才是体积大头，代码段能省则省。
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
