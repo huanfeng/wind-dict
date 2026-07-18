@@ -307,6 +307,34 @@ pub trait Wordlist {
     fn complete(&self, prefix: &str, limit: usize) -> anyhow::Result<Vec<Candidate>>;
 }
 
+// ── 收藏与历史 ────────────────────────────────────────────────
+
+/// 收藏项：一个被用户主动标记的词头，附收藏时间与可选备注。
+///
+/// 收藏是**意图**——用户表达「我在意这个词」。它是纯粹的书签，**不承载**掌握程度、
+/// 复习次数、复习计划等学习状态（本项目不存在「生词本」概念，见术语表「收藏」）。
+/// 故这里只有 `note` 一个自由字段，没有任何学习进度字段——这是刻意的边界。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Favorite {
+    pub headword: Headword,
+    /// 收藏时间（Unix 纪元秒）。
+    pub added_at: i64,
+    /// 用户备注。书签语义下唯一的附加信息。
+    pub note: Option<String>,
+}
+
+/// 历史项：一个查过的词头，附最近一次查询的时间。
+///
+/// 历史是**事实**——系统被动记录「这个词被查过」，不代表用户在意它（与收藏的分界，
+/// 见术语表）。同一词头重复查询只**更新时间**、不新增条目，故这里没有「查询次数」
+/// 之类的字段：历史回答「我最近查了什么」，不做统计。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub headword: Headword,
+    /// 最近一次查询的时间（Unix 纪元秒）。
+    pub looked_up_at: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,6 +10,7 @@
 
 pub mod cedict;
 pub mod ecdict;
+pub mod userdata;
 
 /// 前缀查询的半开区间上界：把末位字符 +1，得到 `[prefix, upper)`。
 ///
