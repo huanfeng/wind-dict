@@ -42,6 +42,10 @@ $EcdictUrl = "https://raw.githubusercontent.com/skywind3000/ECDICT/master/ecdict
 $CedictUrl = "https://www.mdbg.net/chinese/export/cedict/cedict_1_0_ts_utf-8_mdbg.txt.gz"
 
 # ---------- 部署目标 (可在 deploy.local.ps1 覆盖) ----------
+#
+# 注意: Uninstall 会 Remove-Item -Recurse -Force 整个目录, 故这里只放随程序分发、
+# 可整体替换的东西 (exe + 词库)。用户数据 (收藏/历史) 必须永不丢失, 因此另存于
+# %LOCALAPPDATA%\wind-dict-data\ , 不在此目录内 —— 见 src/main.rs 的 userdata_path。
 $DeployDirRelease = "$env:LOCALAPPDATA\wind-dict"
 $DeployDirDev     = "$env:LOCALAPPDATA\wind-dict-dev"
 $deployCfg = "$ScriptDir\deploy.local.ps1"
