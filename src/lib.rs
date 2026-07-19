@@ -10,6 +10,7 @@
 //! 3. **补全只由离线词典驱动**（`domain::Wordlist`）——查询源永不逐键触发。
 
 pub mod domain;
+pub mod skin;
 pub mod source;
 pub mod store;
 pub mod ui;

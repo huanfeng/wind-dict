@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use windui::prelude::*;
 
+use wind_dict::skin::Skin;
 use wind_dict::source::offline::OfflineDictionary;
 use wind_dict::store::userdata::{UserData, UserDataState};
 use wind_dict::ui;
@@ -58,8 +59,16 @@ fn main() {
             TrayMenuItem::item("退出", |ctx| ctx.quit()),
         ]);
 
+    // 皮肤固定为「简约明亮」。另两套不是死代码，但用户**暂时切不了**——运行时换肤
+    // 需要 windui 先补能力，不是这里少写一行。动手接线前先读 ADR-0012，它记着为什么
+    // 「存个 Rc<RefCell<Skin>> 手动重建树」这个顺手的做法不能用。
+    let skin = Skin::light();
+
     App::new("wind-dict", 460, 560)
         .min_size(360, 400)
+        // 无系统标题栏：标题栏由 `ui::title_bar` 自绘，才能与整体配色一致。
+        .frameless()
+        .theme(skin.theme.clone())
         .tray(tray)
         // 常驻：启动不闪窗口，关闭只收起，进程始终活着等热键。见 ADR-0006。
         .start_hidden()
@@ -68,7 +77,7 @@ fn main() {
             ctx.show_window()
         })
         .screenshot_from_args()
-        .content(ui::build(dict, user))
+        .content(ui::build(dict, user, skin))
         .run();
 }
 

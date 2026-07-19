@@ -21,6 +21,7 @@ use windui::core::{EventCtx, Widget};
 use windui::prelude::*;
 
 use crate::domain::{Candidate, Dictionary, Entry, Headword, Lookup, Query, Sense, Wordlist};
+use crate::skin::Skin;
 use crate::source::offline::OfflineDictionary;
 use crate::store::userdata::{now_secs, UserDataState};
 
@@ -169,7 +170,7 @@ fn headwords_to_record(entries: &[Entry]) -> Vec<Headword> {
 ///
 /// `user` 不可用时顶部常驻一条警示，说明历史记录失效及其原因（收藏有入口后一并
 /// 纳入，见 `unavailable_bar`）。
-pub fn build(dict: OfflineDictionary, user: UserDataState) -> Element {
+pub fn build(dict: OfflineDictionary, user: UserDataState, skin: Skin) -> Element {
     let dict = Rc::new(dict);
     let unavailable = match &user {
         UserDataState::Ready(_) => None,
@@ -184,11 +185,93 @@ pub fn build(dict: OfflineDictionary, user: UserDataState) -> Element {
         hint: signal(String::from("输入一个词开始查询")),
     });
 
-    let mut root = Element::col()
+    // 无系统标题栏：整窗都是客户区，故顶部这条标题栏由我们自己画（见 `title_bar`）。
+    Element::col()
         .fill()
-        .bg(Color::hex(0xFFFFFF))
-        .padding(16)
-        .spacing(10);
+        .bg(skin.theme.palette.bg)
+        .child(title_bar(&skin))
+        .child(Element::divider())
+        .child(body(st, unavailable).weight(1.0))
+}
+
+/// 自定义标题栏：应用标识 + 窗口按钮。
+///
+/// 整条 `window_drag()` 可拖动窗口；落在窗口按钮上不拖、正常点击（windui 按「命中
+/// 可聚焦控件则不拖」处理）。
+fn title_bar(skin: &Skin) -> Element {
+    Element::row()
+        .width_match()
+        .height(38)
+        .cross(Align::Stretch)
+        .bg(skin.titlebar)
+        .window_drag()
+        .child(brand(skin).weight(1.0))
+        // 窗口按钮的宽度（46px，与设计一致）、图标形状与 hover 色均由 windui 硬编码，
+        // 只有图标色可调。框架的 `BTN_H = 32` 在这里不生效——本行 `cross(Stretch)`
+        // 会把按钮拉到 38 高。
+        //
+        // hover 红沿用框架的 `0xE81123` 而非设计稿的 `#E5484D`：两者并列可辨（前者
+        // 饱和度明显更高），但关闭键的 hover 红是 Windows 的系统惯例色，跟随系统比
+        // 跟随设计稿更对——这不是「差别太小懒得改」。
+        .child(Element::window_button(WindowButtonKind::Minimize).fg_role(Role::TextMuted))
+        .child(Element::window_button(WindowButtonKind::Maximize).fg_role(Role::TextMuted))
+        .child(Element::window_button(WindowButtonKind::Close).fg_role(Role::TextMuted))
+}
+
+/// 标题栏左侧的应用标识：图标 + 名称 + 能力副标题。
+fn brand(skin: &Skin) -> Element {
+    Element::row()
+        .cross(Align::Center)
+        .spacing(9)
+        .padding_xy(14, 0)
+        .child(
+            // 图标：强调色圆角块 + 一个「词」字。用汉字而非拉丁字母首字母，
+            // 因为这是个中英双向的词典，汉字比 "W" 更说明它是什么。
+            //
+            // 居中靠**外层容器**而非 `text_align`：后者只管水平（见 windui
+            // `Element::text_align` 的文档），单靠它会让 12px 的字顶在 20px 块的
+            // 上沿。这是 windui 自己 `badge_intent` 的写法。
+            Element::row()
+                .cross(Align::Center)
+                .size(20, 20)
+                .bg_role(Role::Accent)
+                .corner(5.0)
+                .child(
+                    Element::label("词")
+                        .font_size(12.0)
+                        .font_weight(600)
+                        .fg_role(Role::OnAccent)
+                        .width_match()
+                        .text_align(Align::Center),
+                ),
+        )
+        .child(
+            Element::label("wind-dict")
+                .font_size(12.5)
+                .font_weight(600)
+                .fg(skin.text2),
+        )
+        .child(
+            // 「英汉 · 汉英」说的是**查询方向**，不是两个词典——术语表禁止的是
+            // 「汉英词典」这个组合，方向名本身合法（见 `domain::Direction`）。
+            // 此处紧跟应用名，读作能力描述。
+            //
+            // 用 `text_muted` 而非设计稿此处的 `--faint`：faint 对三套皮肤的标题栏
+            // 底都只有 ~2:1 对比度（远低于 AA 的 4.5），而这行是界面上**唯一**告知
+            // 用户「中英两个方向都收」的地方——ADR-0003 拿掉了方向选择器，信息只剩
+            // 这一处。装饰性文字可以淡，承载唯一信息的文字不可以。muted 也仍未达
+            // 4.5（3.2/3.2/5.2），但那是设计稿整体的色阶问题，不该在这里独自解决。
+            Element::label("英汉 · 汉英")
+                .font_size(12.0)
+                .fg_role(Role::TextMuted),
+        )
+}
+
+/// 主体区域。
+///
+/// 底色由 `build` 的根容器统一铺，此处不再铺一遍——同一块区域填两次纯色是白费。
+fn body(st: Rc<State>, unavailable: Option<String>) -> Element {
+    let mut root = Element::col().fill().padding(16).spacing(10);
     // 不可用时才占这一行：正常情况下不该为一个不会发生的故障留白。
     if let Some(why) = unavailable {
         root = root.child(unavailable_bar(&why));
@@ -199,7 +282,7 @@ pub fn build(dict: OfflineDictionary, user: UserDataState) -> Element {
             Element::leaf()
                 .reactive()
                 .widget(Completer {
-                    dict: dict.clone(),
+                    dict: st.dict.clone(),
                     query: st.query,
                     candidates: st.candidates,
                     last_version: st.query.version(),
@@ -227,12 +310,21 @@ pub fn build(dict: OfflineDictionary, user: UserDataState) -> Element {
 /// 告知，不能指望这条。
 ///
 /// 文案暂只提历史记录：收藏尚无界面入口，提一个用户还够不着的能力只会让人困惑。
+///
+/// **警示性由边框承载，文字用正文色**。琥珀色文字（此前的 `0xB54708`）压在淡黄底上
+/// 只有 5.2:1 且底色写死——深色皮肤下会变成黑底里一整块近白卡片。改用同色系淡底的
+/// `Intent::badge_colors` 也不行：它拿同一个色既当底又当字，三套皮肤实测只有
+/// 2.9–3.9:1，够不到 AA 的 4.5。
+///
+/// 故把「严重性」与「可读性」拆到两个通道：文字走 `Text` 拿满对比度，严重性交给
+/// `Danger` 边框。这同时满足 WCAG 1.4.1——彩色文字对色觉障碍用户等同普通文字，
+/// 而边框加「不可用」这三个字是冗余编码，不依赖颜色也能读懂。
 fn unavailable_bar(why: &str) -> Element {
     Element::label(format!("历史记录不可用：{why}"))
         .font_size(13.0)
-        .fg(Color::hex(0xB54708))
-        .bg(Color::hex(0xFFFAEB))
-        .border(Color::hex(0xFEDF89), 1)
+        .fg_role(Role::Text)
+        .bg_role(Role::SurfaceAlt)
+        .border_role(Role::Danger, 1)
         .corner(6.0)
         .padding(8)
         .width_match()
@@ -268,7 +360,7 @@ fn result_area(st: Rc<State>) -> Element {
         .spacing(6)
         .child(
             Element::label_rc(st.hint)
-                .fg(Color::hex(0x636E72))
+                .fg_role(Role::TextMuted)
                 .height(20)
                 .width_match(),
         )
@@ -284,6 +376,11 @@ fn result_area(st: Rc<State>) -> Element {
 /// 两类词条**形状不同**（英汉有音标与词形变化，汉英有拼音、繁体与量词，且中文不屈折），
 /// 故必须 match 两个分支——这正是 ADR-0009 拆分词条类型所买到的：编译器不允许
 /// 「给中文词条读词形变化」这类无意义的访问。
+///
+/// 颜色一律走 `Role` 而非具体色值。此处原先写的 `0x2D3436` / `0x636E72` 恰好就是
+/// windui `Palette::default()` 的 `text` / `text_muted`——它们从来不是选定的颜色，
+/// 只是照默认主题抄下来的常量。皮肤成为变量的那一刻，这种抄写就从冗余变成了错误：
+/// 深色皮肤下 `0x2D3436` 压在 `0x17191C` 上只有 1.39:1，等于看不见。
 fn entry_view(e: Entry) -> Element {
     match e {
         Entry::English(x) => {
@@ -295,7 +392,7 @@ fn entry_view(e: Entry) -> Element {
             col = col.child(
                 Element::label(head)
                     .font_size(18.0)
-                    .fg(Color::hex(0x2D3436))
+                    .fg_role(Role::Text)
                     .height(26)
                     .width_match(),
             );
@@ -318,7 +415,7 @@ fn entry_view(e: Entry) -> Element {
             col = col.child(
                 Element::label(format!("{}  [{}]", x.headword, x.pinyin))
                     .font_size(18.0)
-                    .fg(Color::hex(0x2D3436))
+                    .fg_role(Role::Text)
                     .height(26)
                     .width_match(),
             );
@@ -326,7 +423,7 @@ fn entry_view(e: Entry) -> Element {
             if x.traditional != x.headword.as_str() {
                 col = col.child(
                     Element::label(format!("繁体：{}", x.traditional))
-                        .fg(Color::hex(0x636E72))
+                        .fg_role(Role::TextMuted)
                         .height(20)
                         .width_match(),
                 );
@@ -338,7 +435,7 @@ fn entry_view(e: Entry) -> Element {
             if !x.classifiers.is_empty() {
                 col = col.child(
                     Element::label(format!("量词：{}", x.classifiers.join("、")))
-                        .fg(Color::hex(0x636E72))
+                        .fg_role(Role::TextMuted)
                         .height(20)
                         .width_match(),
                 );
