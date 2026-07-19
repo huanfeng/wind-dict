@@ -45,7 +45,9 @@ $CedictUrl = "https://www.mdbg.net/chinese/export/cedict/cedict_1_0_ts_utf-8_mdb
 #
 # 注意: Uninstall 会 Remove-Item -Recurse -Force 整个目录, 故这里只放随程序分发、
 # 可整体替换的东西 (exe + 词库)。用户数据 (收藏/历史) 必须永不丢失, 因此另存于
-# %LOCALAPPDATA%\wind-dict-data\ , 不在此目录内 —— 见 src/main.rs 的 userdata_path。
+# %LOCALAPPDATA%\wind-dict-data\ , 不在此目录内 —— 见 docs/adr/0011。
+#
+# 改这两个路径前先读那份 ADR: 若把部署目录指到用户数据目录上, 卸载即数据丢失。
 $DeployDirRelease = "$env:LOCALAPPDATA\wind-dict"
 $DeployDirDev     = "$env:LOCALAPPDATA\wind-dict-dev"
 $deployCfg = "$ScriptDir\deploy.local.ps1"

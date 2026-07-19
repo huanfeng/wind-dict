@@ -74,18 +74,9 @@ fn main() {
 
 /// 打开用户数据库：`%LOCALAPPDATA%\wind-dict-data\userdata.db`。
 ///
-/// **此目录绝不可与部署目录重合**，否则卸载即数据丢失。`scripts/dev.ps1` 部署到
-/// `%LOCALAPPDATA%\wind-dict`（dev 为 `-dev`），其卸载动作是
-/// `Remove-Item -Recurse -Force` 整个目录——用户数据只要落在里面就会被一并清除。
-/// 故独立成 `wind-dict-data`：数据的存活不依赖另一个脚本的删除范围写得够不够小心。
-///
-/// 选 Local 而非 Roaming（`%APPDATA%`）：这是个**常驻进程持续打开的 SQLite 文件**，
-/// 而漫游配置在登录/注销时整体同步——注销时可能把写到一半的库拷走，两台机器交替
-/// 登录则是后写者整体覆盖。那与 `store/userdata.rs` 特意保留回滚日志换取崩溃安全的
-/// 用心正好相悖。何况 `%APPDATA%` 只在 AD 域漫游配置环境下才真的漫游，「换机器带着
-/// 收藏」多半是想象中的收益；而历史记录一旦漫游，等于把「查过哪些词」送出本机。
-///
-/// 词库反之——它随程序分发、可整体替换，与部署目录同生共死（见 `store/mod.rs`）。
+/// 位置由两条否定性约束确定——**不在部署目录内**（`dev.ps1` 卸载会
+/// `Remove-Item -Recurse -Force` 整个部署目录）、**不在漫游目录内**（登录/注销的
+/// 整体同步会拷走写到一半的库）。完整论证与被拒方案见 `docs/adr/0011`。
 fn open_userdata() -> UserDataState {
     let path = match userdata_path() {
         Ok(p) => p,
