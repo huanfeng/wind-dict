@@ -74,6 +74,18 @@ const TAB_FAVORITES: usize = 1;
 /// 侧栏一次最多列出的历史条数。侧栏是「最近查过什么」，不是全量档案。
 const SIDE_LIMIT: usize = 100;
 
+/// 词头与词性用的衬线字族。
+///
+/// 词典的专业观感很大程度来自衬线体——正文用无衬线、词头用衬线是纸质词典的惯例。
+/// 取 Georgia 是因为它随 Windows 分发、必然存在，且字面宽、小字号也清晰。
+///
+/// 中文词头它没有字形，会由系统回退到默认中文字体（无衬线）。这是刻意接受的：
+/// Windows 自带的中文衬线只有宋体，大字号下笔画细弱、观感陈旧，回退反而更好。
+const SERIF: &str = "Georgia";
+
+/// 词头字号。比正文大一个数量级——词头是这一屏的主角，其余都是它的注解。
+const HEADWORD_SIZE: f32 = 38.0;
+
 /// 侧栏的一行。
 #[derive(Clone, PartialEq, Eq)]
 struct SideRow {
@@ -575,7 +587,9 @@ fn side_list(st: Rc<State>) -> Element {
 
 /// 主列：查询框 + 补全候选 + 结果。
 fn main_column(st: Rc<State>, unavailable: Option<String>) -> Element {
-    let mut root = Element::col().fill().padding(16).spacing(10);
+    // 左右 28px 而非 16：查询框与词条正文都靠这份留白与侧栏拉开距离。设计稿此处是
+    // 40px，但那是在更宽的画布上；920px 窗口减去侧栏后按 28 收，观感相当。
+    let mut root = Element::col().fill().padding_xy(28, 16).spacing(12);
     // 不可用时才占这一行：正常情况下不该为一个不会发生的故障留白。
     if let Some(why) = unavailable {
         root = root.child(unavailable_bar(&why));
@@ -604,7 +618,8 @@ fn main_column(st: Rc<State>, unavailable: Option<String>) -> Element {
         .child(Element::text_input(st.query, "输入中文或英文…").width_match())
         .child(notice_bar(st.notice))
         .child(candidate_list(st.clone()))
-        .child(Element::divider())
+        // 此处原有一条分隔线。拿掉了：候选区收起后它就紧贴查询框，把主列切成两截，
+        // 而它要分隔的两样东西（候选、结果）本就不会同时是空的。区域感交给留白。
         .child(result_area(st))
 }
 
@@ -653,6 +668,7 @@ fn unavailable_bar(why: &str) -> Element {
 
 /// 候选列表：点一条即「确定查询词」，触发查询。
 fn candidate_list(st: Rc<State>) -> Element {
+    let candidates = st.candidates;
     Element::list_signal(
         st.candidates,
         |c: &Candidate| c.headword.as_str().to_string(),
@@ -672,6 +688,12 @@ fn candidate_list(st: Rc<State>) -> Element {
     )
     .height(160)
     .width_match()
+    // 没有候选时**整块收起**，而不是留一条 160px 的空白带。
+    //
+    // `visible_when` 会让 `measure` 直接返回 `Size::ZERO`（windui `core.rs` 的
+    // measure 开头就短路），故这里是真的不占位，不是画成透明。开屏时这一条空白
+    // 曾占去窗口近四成高度，是界面显得空荡的主要来源。
+    .visible_when(move || !candidates.get().is_empty())
 }
 
 /// 结果区：提示 + 词头卡片。
@@ -698,15 +720,16 @@ fn result_area(st: Rc<State>) -> Element {
 /// 一张词头卡片：大字词头 + 收藏星标 + 该词头下的全部词条。
 fn card_view(c: Card, st: Rc<State>) -> Element {
     let hw = c.headword.clone();
-    let mut col = Element::col().spacing(6).width_match().padding(8);
+    // 卡片之间留出一个身位，靠间距而非分隔线区分——多个词头时才看得出边界。
+    let mut col = Element::col().spacing(10).width_match().padding_xy(0, 10);
     col = col.child(
         Element::row()
             .cross(Align::Center)
             .width_match()
             .child(
                 Element::label(hw.to_string())
-                    .font_size(28.0)
-                    .font_weight(500)
+                    .font_size(HEADWORD_SIZE)
+                    .font_family(SERIF)
                     .fg_role(Role::Text)
                     .weight(1.0),
             )
@@ -741,19 +764,36 @@ fn star(fav: bool, hw: Headword, st: Rc<State>) -> Element {
 fn entry_view(e: Entry) -> Element {
     match e {
         Entry::English(x) => {
-            let mut col = Element::col().spacing(4).width_match();
-            if let Some(p) = &x.phonetic {
-                col = col.child(
-                    Element::label(format!("[{p}]"))
-                        .font_size(14.0)
-                        .fg_role(Role::TextMuted)
-                        .height(22)
-                        .width_match(),
-                );
+            let mut col = Element::col().spacing(8).width_match();
+            // 音标与词性同一行：它们都是「这个词是什么」的元信息，与释义分属两层。
+            if x.phonetic.is_some() || x.pos.is_some() {
+                let mut meta = Element::row()
+                    .cross(Align::Center)
+                    .spacing(12)
+                    .width_match();
+                if let Some(p) = &x.phonetic {
+                    meta = meta.child(
+                        Element::label(format!("[{p}]"))
+                            .font_size(15.0)
+                            .fg_role(Role::TextMuted),
+                    );
+                }
+                // 词性用衬线 + 强调色。设计稿此处是斜体，而 windui 没有斜体 API
+                // （`font_style`/`italic` 全无），故改由字族与颜色承载这份身份。
+                if let Some(pos) = &x.pos {
+                    meta = meta.child(
+                        Element::label(pos.clone())
+                            .font_size(15.0)
+                            .font_family(SERIF)
+                            .fg_role(Role::Accent),
+                    );
+                }
+                col = col.child(meta);
             }
-            // 中文释义为主，默认展示（ECDICT 的 translation 字段）。
+            // 中文释义为主，默认展示（ECDICT 的 translation 字段）。放大一档：它是
+            // 用户查词时真正要读的那行字，不该与音标、量词等注解同等大小。
             if let Some(zh) = &x.zh_definition {
-                col = col.child(Element::label(zh.clone()).width_match());
+                col = col.child(Element::label(zh.clone()).font_size(16.0).width_match());
             }
             // 英英释义默认折叠，用户主动展开才可见——这是刻意的产品决定，非偷懒。
             if let Some(en) = &x.en_definition {
@@ -766,12 +806,12 @@ fn entry_view(e: Entry) -> Element {
             col
         }
         Entry::Chinese(x) => {
-            let mut col = Element::col().spacing(4).width_match();
+            let mut col = Element::col().spacing(8).width_match();
+            // 拼音是中文词条的「音标」，与英汉分支同一层级，故用同一档字号。
             col = col.child(
                 Element::label(format!("[{}]", x.pinyin))
-                    .font_size(14.0)
+                    .font_size(15.0)
                     .fg_role(Role::TextMuted)
-                    .height(22)
                     .width_match(),
             );
             // 繁体与词头不同才展示——相同时显示两遍是噪音。
@@ -785,7 +825,11 @@ fn entry_view(e: Entry) -> Element {
             }
             // 英文释义按义项分行。`;` 分隔的是同一义项的不同措辞，不另起一行。
             for (i, s) in x.senses.iter().enumerate() {
-                col = col.child(Element::label(format!("{}. {}", i + 1, join(s))).width_match());
+                col = col.child(
+                    Element::label(format!("{}. {}", i + 1, join(s)))
+                        .font_size(16.0)
+                        .width_match(),
+                );
             }
             if !x.classifiers.is_empty() {
                 col = col.child(
