@@ -9,7 +9,9 @@
 //! 2. **译源绝不自动兜底**（adr/0002）——离线未命中时提示用户，不静默发网络请求。
 //! 3. **补全只由离线词典驱动**（`domain::Wordlist`）——查询源永不逐键触发。
 
+pub mod autostart;
 pub mod domain;
+pub mod settings;
 pub mod skin;
 pub mod source;
 pub mod store;

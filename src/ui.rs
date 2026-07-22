@@ -23,7 +23,8 @@ use windui::core::{EventCtx, Widget};
 use windui::prelude::*;
 
 use crate::domain::{Candidate, Dictionary, Entry, Headword, Lookup, Query, Sense, Wordlist};
-use crate::skin::Skin;
+use crate::settings::Settings;
+use crate::skin::{Skin, SkinKind};
 use crate::source::offline::OfflineDictionary;
 use crate::store::userdata::{now_secs, UserDataState};
 
@@ -75,6 +76,10 @@ const TAB_FAVORITES: usize = 1;
 
 /// 侧栏一次最多列出的历史条数。侧栏是「最近查过什么」，不是全量档案。
 const SIDE_LIMIT: usize = 100;
+
+/// 主列当前显示哪一页。
+const PAGE_DICT: usize = 0;
+const PAGE_SETTINGS: usize = 1;
 
 /// 词头与词性用的衬线字族。
 ///
@@ -177,6 +182,19 @@ struct State {
     notice: Signal<String>,
     /// 可折叠区（当前只有「英英释义」）的展开态。
     expanded: ExpandedStates,
+    /// 主列当前页：词典 / 设置。
+    page: Signal<usize>,
+    /// 当前设置。界面上的各个控件绑到它的分量信号，改动经 `save_settings` 落库。
+    settings: RefCell<Settings>,
+    /// 设置页的即时反馈（保存失败、需重启生效等）。空串 = 无。
+    settings_note: Signal<String>,
+    /// 设置页的重建计数。
+    ///
+    /// 设置页上有若干**构建时求值**的显示——皮肤卡片的选中环、词库路径文字。它们
+    /// 不是控件自带的状态，改了设置若不重建就会停在旧值上（选中环留在原来那张卡片，
+    /// 是最显眼的一处）。故设置一变就整页重建，而不是逐处想办法局部刷新：设置页的
+    /// 重建成本可以忽略，而「有的刷了有的没刷」是很难查的那种不一致。
+    settings_rev: Signal<Vec<u64>>,
 }
 
 /// 可折叠区的展开态集合，按键长期持有。
@@ -195,12 +213,15 @@ struct State {
 struct ExpandedStates(RefCell<HashMap<String, Signal<bool>>>);
 
 impl ExpandedStates {
-    /// 取某个键的展开态，没有则新建（默认折叠）。**同一键永远返回同一个信号**。
-    fn get(&self, key: &str) -> Signal<bool> {
+    /// 取某个键的展开态，没有则按 `default_open` 新建。**同一键永远返回同一个信号**。
+    ///
+    /// 默认值由调用方给（来自设置里的「默认展开英英释义」），而不是写死 false——
+    /// 但只对**尚未出现过**的键生效：用户手动折叠过的，不该因为改了设置又被展开。
+    fn get(&self, key: &str, default_open: bool) -> Signal<bool> {
         if let Some(s) = self.0.borrow().get(key) {
             return *s;
         }
-        let s = signal(false);
+        let s = signal(default_open);
         self.0.borrow_mut().insert(key.to_string(), s);
         s
     }
@@ -322,6 +343,86 @@ impl State {
                 "{}「{hw}」失败：{e}",
                 if now_fav { "取消收藏" } else { "收藏" }
             )),
+        }
+    }
+
+    /// 落盘当前设置。**失败当场告知**——设置是用户主动表达的意图，静默失败会让人
+    /// 以为改好了，下次启动才发现没变。与收藏写入失败同一条原则。
+    ///
+    /// 返回是否成功，供调用方决定要不要接着做别的（如改注册表）。
+    /// 宣告设置有变，令设置页重建。
+    fn bump_settings(&self) {
+        let n = self.settings_rev.get().first().copied().unwrap_or(0);
+        self.settings_rev.set(vec![n.wrapping_add(1)]);
+    }
+
+    fn save_settings(&self) -> bool {
+        let UserDataState::Ready(u) = &self.user else {
+            self.settings_note
+                .set("设置无法保存：用户数据未能打开".into());
+            return false;
+        };
+        match u.save_settings(&self.settings.borrow()) {
+            Ok(()) => {
+                self.bump_settings();
+                true
+            }
+            Err(e) => {
+                self.settings_note.set(format!("保存设置失败：{e}"));
+                false
+            }
+        }
+    }
+
+    /// 换皮肤。
+    ///
+    /// 目前**只能重启生效**：`ThemeHandle::set` 不重建元素树，而本应用的自绘区域色
+    /// （标题栏底、侧栏底、卡片底）在 windui 的 `Role` 里没有对应项，解析不出来。
+    /// 完整论证见 ADR-0012。这里如实告知用户，而不是让他点完毫无反应。
+    fn set_skin(&self, kind: SkinKind) {
+        self.settings.borrow_mut().skin = kind;
+        if self.save_settings() {
+            self.settings_note
+                .set(format!("已选「{}」，重启后生效", kind.name()));
+        }
+    }
+
+    /// 开关开机自启。
+    ///
+    /// 先写注册表再落库：注册表才是**真相**（用户可能在别处删掉自启项），库里存的
+    /// 只是界面初值。反过来先落库的话，注册表写失败时库里就留下了一个假状态。
+    fn set_autostart(&self, on: bool) {
+        if let Err(e) = crate::autostart::set(on) {
+            self.settings_note.set(format!("设置开机启动失败：{e}"));
+            return;
+        }
+        self.settings.borrow_mut().autostart = on;
+        if self.save_settings() {
+            self.settings_note.set(String::new());
+        }
+    }
+
+    /// 英英释义是否默认展开。**立即生效**——它只影响此后新建卡片的初始展开态。
+    fn set_expand_en(&self, on: bool) {
+        self.settings.borrow_mut().expand_en = on;
+        if self.save_settings() {
+            self.settings_note.set(String::new());
+        }
+    }
+
+    /// 换词库路径。只能重启生效：词库连接在 `main` 里打开后交给了界面，运行期换库
+    /// 意味着重建整条查询链路，而那点收益抵不上它带来的状态一致性问题。
+    fn set_dict_path(&self, is_ec: bool, path: std::path::PathBuf) {
+        {
+            let mut s = self.settings.borrow_mut();
+            if is_ec {
+                s.ecdict = Some(path);
+            } else {
+                s.cedict = Some(path);
+            }
+        }
+        if self.save_settings() {
+            self.settings_note.set("词库已更改，重启后生效".into());
         }
     }
 
@@ -447,6 +548,11 @@ pub fn build(dict: OfflineDictionary, user: UserDataState, skin: Skin) -> Elemen
         UserDataState::Ready(_) => None,
         UserDataState::Unavailable(why) => Some(why.clone()),
     };
+    // 设置读不到时退回默认（`Settings::from_pairs` 保证），不让程序起不来。
+    let settings = match &user {
+        UserDataState::Ready(u) => u.settings(),
+        UserDataState::Unavailable(_) => Settings::default(),
+    };
     let st = Rc::new(State {
         dict: dict.clone(),
         user,
@@ -459,6 +565,10 @@ pub fn build(dict: OfflineDictionary, user: UserDataState, skin: Skin) -> Elemen
         revision: signal(0),
         notice: signal(String::new()),
         expanded: ExpandedStates::default(),
+        page: signal(PAGE_DICT),
+        settings: RefCell::new(settings),
+        settings_note: signal(String::new()),
+        settings_rev: signal(vec![0]),
     });
     // 开屏即列出历史：侧栏空着会让人以为功能坏了。
     st.reload_side();
@@ -555,7 +665,7 @@ fn body(st: Rc<State>, unavailable: Option<String>, skin: &Skin) -> Element {
         // 栏间那条线是侧栏**自己的右边框**，不再是一个独立节点：单边边框不参与
         // 布局，而 1px 色块要占一列，容器一改间距就得跟着调。
         .child(sidebar(st.clone(), skin))
-        .child(main_column(st, unavailable).weight(1.0))
+        .child(pages(st, unavailable).weight(1.0))
 }
 
 /// 侧栏：历史 / 收藏两个页签 + 列表。
@@ -592,11 +702,50 @@ fn sidebar(st: Rc<State>, skin: &Skin) -> Element {
                 vec![
                     ("历史", side_list(st.clone())),
                     // 术语表弃用「生词本」，见 `TAB_HISTORY` 处的说明。
-                    ("收藏", side_list(st)),
+                    ("收藏", side_list(st.clone())),
                 ],
             )
             .fill()
-            .padding_xy(8, 8),
+            .padding_xy(8, 8)
+            .weight(1.0),
+        )
+        // 设置入口。此前刻意不做，因为「点了没地方去」；现在设置页有了，它才该出现。
+        .child(settings_entry(st))
+}
+
+/// 侧栏底部的设置入口。
+fn settings_entry(st: Rc<State>) -> Element {
+    let page = st.page;
+    Element::row()
+        .width_match()
+        .height(46)
+        .cross(Align::Center)
+        .padding_xy(16, 0)
+        .spacing(10)
+        .border_role(Role::Divider, 1)
+        .border_edges(Edges::TOP)
+        .clickable()
+        .on_click(move |_ctx| page.set(PAGE_SETTINGS))
+        .child(Element::label("设置").font_size(13.0).fg_role(Role::Text))
+}
+
+/// 主列：词典页与设置页叠在一起，按 `page` 切换。
+///
+/// 用叠层而非替换，是为了保住词典页的状态——查询词、候选、结果卡片、滚动位置都在
+/// 元素树里，若切页时把整棵子树换掉，从设置页回来会发现结果没了。
+fn pages(st: Rc<State>, unavailable: Option<String>) -> Element {
+    let (p1, p2) = (st.page, st.page);
+    Element::stack()
+        .fill()
+        .child(
+            main_column(st.clone(), unavailable)
+                .fill()
+                .visible_when(move || p1.get() == PAGE_DICT),
+        )
+        .child(
+            settings_page(st)
+                .fill()
+                .visible_when(move || p2.get() == PAGE_SETTINGS),
         )
 }
 
@@ -664,6 +813,267 @@ fn main_column(st: Rc<State>, unavailable: Option<String>) -> Element {
         // 此处原有一条分隔线。拿掉了：候选区收起后它就紧贴查询框，把主列切成两截，
         // 而它要分隔的两样东西（候选、结果）本就不会同时是空的。区域感交给留白。
         .child(result_area(st))
+}
+
+/// 设置页。
+///
+/// 分组与卡片式行照设计稿，但**项目按本项目的能力来**：设计稿的「发音」「例句翻译」
+/// 两组没有对应数据源，不画；换来的是设计稿没有的热键、开机自启、词库路径——那才是
+/// 一个常驻词典真正要让用户调的东西。
+fn settings_page(st: Rc<State>) -> Element {
+    let page = st.page;
+    Element::col()
+        .fill()
+        .child(
+            // 页头：返回 + 标题。
+            Element::row()
+                .width_match()
+                .height(56)
+                .cross(Align::Center)
+                .padding_xy(22, 0)
+                .spacing(12)
+                .border_role(Role::Divider, 1)
+                .border_edges(Edges::BOTTOM)
+                .child(
+                    Element::row()
+                        .size(32, 32)
+                        .cross(Align::Center)
+                        .corner(8.0)
+                        .clickable()
+                        .on_click(move |_ctx| page.set(PAGE_DICT))
+                        .child(
+                            Element::label("←")
+                                .width_match()
+                                .text_align(Align::Center)
+                                .font_size(18.0)
+                                .fg_role(Role::Text),
+                        ),
+                )
+                .child(
+                    Element::label("设置")
+                        .font_size(22.0)
+                        .font_family(SERIF)
+                        .fg_role(Role::Text),
+                ),
+        )
+        .child(
+            Element::scroll()
+                .fill()
+                .child(Element::host_signal(st.settings_rev, move |_rev: u64| {
+                    settings_body(st.clone())
+                })),
+        )
+}
+
+/// 设置页正文。每次 `settings_rev` 变动整体重建，故其中的构建时求值（选中环、
+/// 词库路径）总是新鲜的。
+fn settings_body(st: Rc<State>) -> Element {
+    Element::col()
+        .width_match()
+        .max_width(620)
+        .padding_xy(40, 26)
+        .spacing(28)
+        .child(notice_bar(st.settings_note))
+        .child(group("外观", skin_cards(st.clone())))
+        .child(group("唤起", hotkey_row(st.clone())))
+        .child(group("启动", autostart_row(st.clone())))
+        .child(group("词库", dict_rows(st.clone())))
+        .child(group("释义显示", expand_en_row(st)))
+}
+
+/// 一个设置分组：小标题 + 内容卡片。
+fn group(title: &str, body: Element) -> Element {
+    Element::col()
+        .width_match()
+        .spacing(12)
+        .child(
+            Element::label(title)
+                .font_size(12.0)
+                .font_weight(700)
+                .fg_role(Role::TextMuted),
+        )
+        .child(body)
+}
+
+/// 卡片：设置行的容器。
+fn card(rows: Vec<Element>) -> Element {
+    let mut col = Element::col()
+        .width_match()
+        .bg_role(Role::Surface)
+        .border_role(Role::Border, 1)
+        .corner(12.0);
+    let last = rows.len().saturating_sub(1);
+    for (i, r) in rows.into_iter().enumerate() {
+        // 行间分隔线交给上边框，末行不画——比在行之间插色块少一层节点。
+        let r = if i == 0 {
+            r
+        } else {
+            r.border_role(Role::Divider, 1).border_edges(Edges::TOP)
+        };
+        let _ = last;
+        col = col.child(r);
+    }
+    col
+}
+
+/// 一行设置：左标题（可带副标题）+ 右控件。
+fn row(title: &str, subtitle: Option<&str>, control: Element) -> Element {
+    let mut left = Element::col().spacing(2).weight(1.0).child(
+        Element::label(title)
+            .font_size(14.0)
+            .font_weight(500)
+            .fg_role(Role::Text)
+            .width_match(),
+    );
+    if let Some(sub) = subtitle {
+        left = left.child(
+            Element::label(sub)
+                .font_size(12.0)
+                .fg_role(Role::TextMuted)
+                .width_match(),
+        );
+    }
+    Element::row()
+        .width_match()
+        .cross(Align::Center)
+        .padding_xy(18, 14)
+        .spacing(12)
+        .child(left)
+        .child(control)
+}
+
+/// 皮肤卡片三选一。
+fn skin_cards(st: Rc<State>) -> Element {
+    let mut row = Element::row()
+        .width_match()
+        .spacing(14)
+        .cross(Align::Stretch);
+    for kind in SkinKind::ALL {
+        let st = st.clone();
+        let current = st.settings.borrow().skin == kind;
+        let sw = kind.skin().swatch;
+        row = row.child(
+            Element::col()
+                .weight(1.0)
+                .bg_role(Role::Surface)
+                .border_role(if current { Role::Accent } else { Role::Border }, 2)
+                .corner(12.0)
+                .padding(14)
+                .spacing(4)
+                .clickable()
+                .on_click(move |_ctx| st.set_skin(kind))
+                .child(
+                    // 三色预览块。
+                    // 每块都描边：浅色皮肤的底色块与卡片底同为近白，不描边就看不见，
+                    // 三色预览只剩两色。
+                    Element::row()
+                        .spacing(5)
+                        .height(18)
+                        .child(swatch_chip(sw[0]))
+                        .child(swatch_chip(sw[1]))
+                        .child(swatch_chip(sw[2])),
+                )
+                .child(
+                    Element::label(kind.name())
+                        .font_size(14.0)
+                        .font_weight(600)
+                        .fg_role(Role::Text),
+                )
+                .child(
+                    Element::label(kind.desc())
+                        .font_size(12.0)
+                        .fg_role(Role::TextMuted),
+                ),
+        );
+    }
+    row
+}
+
+/// 皮肤预览色块。
+fn swatch_chip(c: Color) -> Element {
+    Element::leaf()
+        .size(18, 18)
+        .corner(4.0)
+        .bg(c)
+        .border_role(Role::Border, 1)
+}
+
+/// 唤起热键。当前**只读展示**——改键需要框架支持运行时重注册，见下方注释。
+fn hotkey_row(st: Rc<State>) -> Element {
+    let spec = st.settings.borrow().hotkey;
+    card(vec![row(
+        "唤起热键",
+        Some("全局生效。改键需框架支持运行时重注册，暂未开放"),
+        // 键帽样式：与设计稿的 Ctrl/K 同形，但这里显示的是**真实生效**的热键，
+        // 不是装饰——设计稿那组键帽在我们这儿按了没用，故当初没照做。
+        Element::label(spec.to_string())
+            .font_size(12.5)
+            .font_weight(600)
+            .fg_role(Role::TextMuted)
+            .border_role(Role::Border, 1)
+            .corner(6.0)
+            .padding_xy(10, 5),
+    )])
+}
+
+/// 开机自启。
+fn autostart_row(st: Rc<State>) -> Element {
+    let on = signal(st.settings.borrow().autostart);
+    let st2 = st.clone();
+    card(vec![row(
+        "开机时启动",
+        Some("登录后自动在托盘常驻，等待热键唤起"),
+        Element::switch(on).on_toggle(move |_ctx| st2.set_autostart(on.get())),
+    )])
+}
+
+/// 释义显示。
+fn expand_en_row(st: Rc<State>) -> Element {
+    let on = signal(st.settings.borrow().expand_en);
+    let st2 = st.clone();
+    card(vec![row(
+        "默认展开英英释义",
+        Some("关闭时英英释义仍在，只是需要点开"),
+        Element::switch(on).on_toggle(move |_ctx| st2.set_expand_en(on.get())),
+    )])
+}
+
+/// 词库路径。
+fn dict_rows(st: Rc<State>) -> Element {
+    card(vec![dict_row(st.clone(), true), dict_row(st, false)])
+}
+
+fn dict_row(st: Rc<State>, is_ec: bool) -> Element {
+    let (title, cur) = if is_ec {
+        ("英汉词库", st.settings.borrow().ecdict.clone())
+    } else {
+        ("汉英词库", st.settings.borrow().cedict.clone())
+    };
+    let shown = cur
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "（默认：程序同目录）".into());
+    row(
+        title,
+        Some(&shown),
+        Element::button("选择…").on_click(move |ctx| {
+            let st = st.clone();
+            ctx.request_pick_file(
+                PickDialog::new()
+                    .title(if is_ec {
+                        "选择英汉词库"
+                    } else {
+                        "选择汉英词库"
+                    })
+                    .filter("SQLite 词库", &["db"]),
+                move |picked| {
+                    if let Some(p) = picked {
+                        st.set_dict_path(is_ec, p);
+                    }
+                },
+            );
+        }),
+    )
 }
 
 /// 需当场告知的消息条。空串时零高度、不占位。
@@ -783,7 +1193,9 @@ fn card_view(c: Card, st: Rc<State>) -> Element {
     );
     for (i, e) in c.entries.into_iter().enumerate() {
         // 键带序号：同一词头下可能有多条词条（多音字），各自的折叠区应能分别开合。
-        let expanded = st.expanded.get(&format!("{hw}#{i}"));
+        let expanded = st
+            .expanded
+            .get(&format!("{hw}#{i}"), st.settings.borrow().expand_en);
         col = col.child(entry_view(e, expanded));
     }
     col
@@ -996,6 +1408,19 @@ mod tests {
         assert_eq!(分组, vec!["馀", "余"]);
     }
 
+    /// 展开态的默认值来自设置，但**只对尚未出现过的键生效**——用户手动折叠过的
+    /// 词条，不该因为后来改了「默认展开」而被强行展开。
+    #[test]
+    fn 默认展开只对新键生效() {
+        let states = ExpandedStates::default();
+        // 先以「默认折叠」建键，再手动展开。
+        states.get("a#0", false).set(true);
+        // 此后即便传入 default_open=false，已有的键也保持原状。
+        assert!(states.get("a#0", false).get(), "已存在的键不受默认值影响");
+        // 新键才吃默认值。
+        assert!(states.get("b#0", true).get(), "新键应按默认值展开");
+    }
+
     /// 一无所获时没有卡片——空列表而非一张空卡片。
     #[test]
     fn 一无所获没有卡片() {
@@ -1010,10 +1435,10 @@ mod tests {
     #[test]
     fn 同一键取回同一个展开态() {
         let states = ExpandedStates::default();
-        let a = states.get("make#0");
+        let a = states.get("make#0", false);
         a.set(true);
         // 模拟卡片重建：重新取一次。
-        let b = states.get("make#0");
+        let b = states.get("make#0", false);
         assert!(b.get(), "重建后展开态应当保持");
     }
 
@@ -1021,8 +1446,8 @@ mod tests {
     #[test]
     fn 不同键的展开态互不影响() {
         let states = ExpandedStates::default();
-        states.get("行#0").set(true);
-        assert!(states.get("行#0").get());
-        assert!(!states.get("行#1").get(), "另一条词条不该被带着展开");
+        states.get("行#0", false).set(true);
+        assert!(states.get("行#0", false).get());
+        assert!(!states.get("行#1", false).get(), "另一条词条不该被带着展开");
     }
 }

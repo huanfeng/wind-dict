@@ -11,19 +11,24 @@ use std::path::PathBuf;
 
 use windui::prelude::*;
 
-use wind_dict::skin::Skin;
+use wind_dict::settings::{HotkeySpec, Settings};
 use wind_dict::source::offline::OfflineDictionary;
 use wind_dict::store::userdata::{UserData, UserDataState};
 use wind_dict::ui;
 
-/// 唤起热键：Ctrl+Alt+D。
-///
-/// 键位尚未做成可配置——这是已知的开放问题（热键是全局独占资源，撞键时用户
-/// 目前只能改代码）。
-const HOTKEY_CHAR: char = 'D';
-
 fn main() {
-    let (ecdict, cedict) = dict_paths();
+    // 用户数据先开：设置存在其中，而词库路径、热键、皮肤都要由设置决定。
+    //
+    // 用户数据打不开**不致命**：查询是主体功能，收藏与历史是其增益，为后者让整个
+    // 工具起不来是不成比例的。但也**不静默降级**——不可用的原因带进界面如实告知
+    // （见 `ui::build`）。设置在这种情况下退回默认，程序照常可用。
+    let user = open_userdata();
+    let settings = match &user {
+        UserDataState::Ready(u) => u.settings(),
+        UserDataState::Unavailable(_) => Settings::default(),
+    };
+
+    let (ecdict, cedict) = dict_paths(&settings);
 
     // 词库缺失是致命的：离线词典是本工具的主体，没有它整个程序没有意义。
     // 与其起一个查什么都「未收录」的空壳（那是在撒谎——术语表里「一无所获」的意思是
@@ -41,14 +46,8 @@ fn main() {
         }
     };
 
-    // 用户数据打不开**不致命**：查询是主体功能，收藏与历史是其增益，为后者让整个
-    // 工具起不来是不成比例的。但也**不静默降级**——不可用的原因带进界面如实告知
-    // （见 `ui::build`），否则用户会以为收藏成功了，实则从未写入。这与词库缺失时
-    // 宁可退出是同一条原则的两种刻度：都不撒谎，只是代价不同。
-    let user = open_userdata();
-
     let tray = Tray::new()
-        .tooltip(format!("wind-dict — Ctrl+Alt+{HOTKEY_CHAR} 查询"))
+        .tooltip(format!("wind-dict — {} 查询", settings.hotkey))
         .icon_rgba(16, 16, &icon())
         .on_left_click(|ctx| ctx.show_window())
         .on_double_click(|ctx| ctx.show_window())
@@ -59,10 +58,11 @@ fn main() {
             TrayMenuItem::item("退出", |ctx| ctx.quit()),
         ]);
 
-    // 皮肤固定为「简约明亮」。另两套不是死代码，但用户**暂时切不了**——运行时换肤
-    // 需要 windui 先补能力，不是这里少写一行。动手接线前先读 ADR-0012，它记着为什么
-    // 「存个 Rc<RefCell<Skin>> 手动重建树」这个顺手的做法不能用。
-    let skin = Skin::light();
+    // 皮肤取自设置。**运行期换肤仍做不到**——`ThemeHandle::set` 不重建元素树，而
+    // 本应用的自绘区域色在 windui 的 `Role` 里没有对应项（ADR-0012）。故设置页改了
+    // 皮肤只写库、提示「重启后生效」，由这里在下次启动时读出来。这正是 ADR-0012
+    // 记下的那条「允许的临时退让」。
+    let skin = settings.skin.skin();
 
     // 窗口尺寸按**双栏**定：224px 侧栏是固定开销，主列要装得下词条正文才有意义。
     // 460 宽是单栏时代的遗留，减去侧栏只剩 236px，长释义会挤成一条窄带。
@@ -82,9 +82,7 @@ fn main() {
         // 常驻：启动不闪窗口，关闭只收起，进程始终活着等热键。见 ADR-0006。
         .start_hidden()
         .hide_on_close()
-        .hotkey(Hotkey::new(Key::Char(HOTKEY_CHAR)).ctrl().alt(), |ctx| {
-            ctx.show_window()
-        })
+        .hotkey(to_hotkey(settings.hotkey), |ctx| ctx.show_window())
         .screenshot_from_args()
         .content(ui::build(dict, user, skin))
         .run();
@@ -125,10 +123,28 @@ fn userdata_path() -> Result<PathBuf, String> {
     Ok(dir.join("userdata.db"))
 }
 
-/// 词库路径：命令行参数优先，否则取 exe 同目录。
+/// 把设置里的热键转成 windui 的注册用类型。
+fn to_hotkey(spec: HotkeySpec) -> Hotkey {
+    let mut hk = Hotkey::new(Key::Char(spec.key));
+    if spec.ctrl {
+        hk = hk.ctrl();
+    }
+    if spec.alt {
+        hk = hk.alt();
+    }
+    if spec.shift {
+        hk = hk.shift();
+    }
+    hk
+}
+
+/// 词库路径。优先级：命令行参数 > 设置 > exe 同目录。
+///
+/// 命令行压过设置，是因为它是**当次显式指定**的——开发时用 `.cache/dict/` 里的库
+/// 调试，不该被用户设置里的路径顶掉，也不该反过来把设置改坏。
 ///
 /// exe 同目录而非工作目录：常驻工具从托盘/热键启动时，工作目录是什么完全不可控。
-fn dict_paths() -> (PathBuf, PathBuf) {
+fn dict_paths(settings: &Settings) -> (PathBuf, PathBuf) {
     let mut args = std::env::args().skip(1).filter(|a| !a.starts_with("--"));
     if let (Some(a), Some(b)) = (args.next(), args.next()) {
         return (PathBuf::from(a), PathBuf::from(b));
@@ -137,7 +153,15 @@ fn dict_paths() -> (PathBuf, PathBuf) {
         .ok()
         .and_then(|p| p.parent().map(PathBuf::from))
         .unwrap_or_default();
-    (dir.join("ecdict.db"), dir.join("cedict.db"))
+    let ec = settings
+        .ecdict
+        .clone()
+        .unwrap_or_else(|| dir.join("ecdict.db"));
+    let ce = settings
+        .cedict
+        .clone()
+        .unwrap_or_else(|| dir.join("cedict.db"));
+    (ec, ce)
 }
 
 /// 托盘图标：16×16 纯色 RGBA8（占位，免捆绑资源文件）。

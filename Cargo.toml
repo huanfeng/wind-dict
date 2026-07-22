@@ -18,6 +18,14 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # 不需要调用方按类型分支处理，故用 anyhow 而非自定义错误枚举。
 anyhow = "1"
 
+# 开机自启：读写 `HKCU\...\Run` 注册表项。这是本项目第一个平台特定依赖。
+#
+# 取 windows crate 而非调 `reg.exe` 子进程：后者零依赖，但要拼命令行、解析输出，
+# 且「程序启动子进程改注册表 Run 键」正是杀软重点盯防的行为模式，误报风险实打实。
+# 只启用注册表一个 feature，编译期开销可控。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_System_Registry", "Win32_Foundation"] }
+
 # 仅构建期工具（examples/build_ecdict.rs）与测试使用。
 #
 # csv 放这里而非 [dependencies] 是刻意的：词库构建是**开发期**的一次性动作，

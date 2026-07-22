@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::domain::{Favorite, Headword, HistoryEntry};
+use crate::settings::Settings;
 
 /// 建表。两表均以 `word` 为主键——这不是随意选择：
 /// - 历史的 `INSERT ... ON CONFLICT(word) DO UPDATE` 靠它实现「重复更新时间戳、不新增行」，
@@ -40,6 +41,10 @@ CREATE TABLE IF NOT EXISTS favorites (
 CREATE TABLE IF NOT EXISTS history (
     word         TEXT PRIMARY KEY,
     looked_up_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );";
 
 /// 用户数据库。
@@ -173,6 +178,44 @@ impl UserData {
         self.conn
             .execute("DELETE FROM history", [])
             .context("清空历史失败")?;
+        Ok(())
+    }
+
+    /// 读出全部设置。
+    ///
+    /// 读取失败按「没有这一项」处理，由 `Settings::from_pairs` 退回默认——设置读不到
+    /// 不该让程序起不来，与词库缺失时宁可退出是不同刻度的取舍（见 `settings` 模块）。
+    pub fn settings(&self) -> Settings {
+        let map = self.settings_map().unwrap_or_default();
+        Settings::from_pairs(|k| map.get(k).cloned())
+    }
+
+    fn settings_map(&self) -> Result<std::collections::HashMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT key, value FROM settings")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut map = std::collections::HashMap::new();
+        for r in rows {
+            let (k, v) = r?;
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
+
+    /// 整份写回。
+    ///
+    /// **失败必须告知调用方**（返回 `Result`，不吞）：改设置是用户主动表达的意图，
+    /// 与历史记录那种被动事实不同——静默失败会让用户以为改好了，下次启动才发现没变。
+    /// 这与 `favorites` 的失败处理是同一条原则。
+    pub fn save_settings(&self, s: &Settings) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("INSERT INTO settings(key, value) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value")?;
+        for (k, v) in s.to_pairs() {
+            stmt.execute(rusqlite::params![k, v])
+                .with_context(|| format!("保存设置项 {k} 失败"))?;
+        }
         Ok(())
     }
 
@@ -321,6 +364,48 @@ mod tests {
     // ── 收藏与历史相互独立 ─────────────────────────────────
 
     // ── 持久化 ────────────────────────────────────────────
+
+    /// 设置须跨重开存活，且**改一项不影响其余项**——`ON CONFLICT DO UPDATE` 若写错成
+    /// `INSERT OR REPLACE` 到整表，或键名拼错，都会在这里暴露。
+    #[test]
+    fn 设置跨重开持久化且可覆盖() {
+        use crate::settings::{HotkeySpec, Settings};
+        use crate::skin::SkinKind;
+        let path = std::env::temp_dir().join(format!("wind_dict_set_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let mut s = Settings {
+            hotkey: "Ctrl+Shift+K".parse().unwrap(),
+            autostart: true,
+            skin: SkinKind::Dark,
+            expand_en: true,
+            ecdict: Some(std::path::PathBuf::from(r"D:\ec.db")),
+            cedict: None,
+        };
+        {
+            let db = UserData::open(&path).unwrap();
+            db.save_settings(&s).unwrap();
+        }
+        {
+            let db = UserData::open(&path).unwrap();
+            assert_eq!(db.settings(), s, "设置须跨重开原样存活");
+            // 只改一项后重写，其余项不得被抹掉。
+            s.skin = SkinKind::Paper;
+            db.save_settings(&s).unwrap();
+            let back = db.settings();
+            assert_eq!(back.skin, SkinKind::Paper);
+            assert_eq!(back.hotkey, "Ctrl+Shift+K".parse::<HotkeySpec>().unwrap());
+            assert!(back.autostart, "未改动的项不该被覆盖");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 全新的库读出默认设置，而不是报错。
+    #[test]
+    fn 新库读出默认设置() {
+        let db = UserData::in_memory().unwrap();
+        assert_eq!(db.settings(), crate::settings::Settings::default());
+    }
 
     #[test]
     fn 数据跨重开持久化() {
