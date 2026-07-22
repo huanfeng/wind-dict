@@ -176,7 +176,9 @@ impl Cedict {
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("打开汉英词库失败：{}", path.display()))?;
-        conn.pragma_update(None, "cache_size", -2000)?;
+        // 汉英词库仅 15MB，8MB 缓存已能覆盖大半；与英汉的 32MB 不同是因为体量差一个
+        // 数量级，给同样的额度只是白占（见 docs/adr/0006 的缓存放宽一节）。
+        conn.pragma_update(None, "cache_size", -8000)?;
         conn.pragma_update(None, "journal_mode", "OFF")?;
         Ok(Self { conn })
     }

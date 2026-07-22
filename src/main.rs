@@ -73,6 +73,10 @@ fn main() {
         .min_size(720, 480)
         // 无系统标题栏：标题栏由 `ui::title_bar` 自绘，才能与整体配色一致。
         .frameless()
+        // GPU 渲染（Direct2D）。本项目不以「后台内存尽可能小」为目标——见 ADR-0006
+        // 的修订，需求已改为优先响应与渲染质量。无 GPU、RDP 远程会话、离屏截图等
+        // 情形 windui 会自动回退软渲染，不会失败。
+        .accelerated(true)
         .theme(skin.theme.clone())
         .tray(tray)
         // 常驻：启动不闪窗口，关闭只收起，进程始终活着等热键。见 ADR-0006。
