@@ -157,6 +157,65 @@ impl Widget for SideLoader {
     }
 }
 
+/// 监视备注输入、落库的响应式控件。
+///
+/// 与 `Completer` 同构，靠 `on_update` 相位工作。之所以需要它，是因为 windui 的
+/// `text_input` 没有提交/失焦回调——没有「什么时候算改完了」这个信号，只能盯变化。
+///
+/// **逐次变更即写库**：本地 SQLite 的一次小写入是微秒级，而「攒着等提交」在没有提交
+/// 事件的前提下必然要引入定时器，那会破坏 windui「空闲零 CPU」这条指标。代价是用户
+/// 每敲一个字就写一次库，这是清楚的取舍，不是疏忽。
+struct NoteSaver {
+    st: Rc<State>,
+    headword: Headword,
+    text: Signal<String>,
+    last_version: u64,
+}
+
+impl Widget for NoteSaver {
+    fn on_update(&mut self, _ctx: &mut EventCtx) {
+        let v = self.text.version();
+        if v == self.last_version {
+            return;
+        }
+        self.last_version = v;
+        self.st.set_note(&self.headword, self.text.get());
+    }
+}
+
+/// 监视设置开关、把变更落到实处的响应式控件。
+///
+/// **为什么不用 `Element::switch(..).on_toggle(..)`**：windui 的 `Switch` 没有实现
+/// `Widget::take_click`，而该 trait 方法的默认实现是空的——挂上去的回调被静默吞掉，
+/// 开关照样滑动、动画照样正常，但什么都不会发生。这个坑已上报框架。
+///
+/// 改为盯信号版本：无论用户怎么让开关翻转，这里都收得到。落实失败时**把开关拨回
+/// 原位**——开关显示「开」而注册表没写，比报个错更误导人。
+struct SettingToggle {
+    st: Rc<State>,
+    on: Signal<bool>,
+    last_version: u64,
+    /// 落实这次变更，返回是否成功。
+    apply: fn(&State, bool) -> bool,
+}
+
+impl Widget for SettingToggle {
+    fn on_update(&mut self, _ctx: &mut EventCtx) {
+        let v = self.on.version();
+        if v == self.last_version {
+            return;
+        }
+        self.last_version = v;
+        let want = self.on.get();
+        if !(self.apply)(&self.st, want) {
+            self.on.set(!want);
+            // 回拨自己也会推高版本，须同步记下，否则下一帧会把回拨当成新的用户操作，
+            // 来回翻转停不下来。
+            self.last_version = self.on.version();
+        }
+    }
+}
+
 /// 界面状态。
 struct State {
     dict: Rc<OfflineDictionary>,
@@ -188,6 +247,11 @@ struct State {
     settings: RefCell<Settings>,
     /// 设置页的即时反馈（保存失败、需重启生效等）。空串 = 无。
     settings_note: Signal<String>,
+    /// 「清空历史」是否已进入确认态。
+    ///
+    /// 用两步确认而非弹模态框：清空不可撤销，但为它拉起一个系统模态框在常驻小工具上
+    /// 过重；而「点一次变成『确认清空』，再点才真清」既拦得住误触，又不打断心流。
+    confirm_clear: Signal<bool>,
     /// 设置页的重建计数。
     ///
     /// 设置页上有若干**构建时求值**的显示——皮肤卡片的选中环、词库路径文字。它们
@@ -362,7 +426,11 @@ impl State {
                 .set("设置无法保存：用户数据未能打开".into());
             return false;
         };
-        match u.save_settings(&self.settings.borrow()) {
+        // 先落成一句再 match：`match` 的 scrutinee 里的 `Ref` 会活到整个 match 结束，
+        // 而分支里的 `bump_settings()` 会触发重建。今天重建只 `borrow()`，但只要将来
+        // 有人在重建路径上写一次 `borrow_mut()`，就是运行期 panic 且现场极难读。
+        let saved = u.save_settings(&self.settings.borrow());
+        match saved {
             Ok(()) => {
                 self.bump_settings();
                 true
@@ -380,10 +448,16 @@ impl State {
     /// （标题栏底、侧栏底、卡片底）在 windui 的 `Role` 里没有对应项，解析不出来。
     /// 完整论证见 ADR-0012。这里如实告知用户，而不是让他点完毫无反应。
     fn set_skin(&self, kind: SkinKind) {
+        let prev = self.settings.borrow().skin;
         self.settings.borrow_mut().skin = kind;
         if self.save_settings() {
             self.settings_note
                 .set(format!("已选「{}」，重启后生效", kind.name()));
+        } else {
+            // 没落库就把内存改回去，否则选中环会停在一个从未保存的皮肤上——
+            // 看着像选中了，重启后却变回旧的。
+            self.settings.borrow_mut().skin = prev;
+            self.bump_settings();
         }
     }
 
@@ -391,39 +465,160 @@ impl State {
     ///
     /// 先写注册表再落库：注册表才是**真相**（用户可能在别处删掉自启项），库里存的
     /// 只是界面初值。反过来先落库的话，注册表写失败时库里就留下了一个假状态。
-    fn set_autostart(&self, on: bool) {
+    fn set_autostart(&self, on: bool) -> bool {
         if let Err(e) = crate::autostart::set(on) {
             self.settings_note.set(format!("设置开机启动失败：{e}"));
-            return;
+            return false;
         }
         self.settings.borrow_mut().autostart = on;
-        if self.save_settings() {
-            self.settings_note.set(String::new());
+        if !self.save_settings() {
+            // 注册表已改、库没写上。真实状态仍是对的（`autostart_now` 以注册表为准），
+            // 只是这次没能记进库里——如实报出，不谎称成功。
+            return false;
         }
+        self.settings_note.set(String::new());
+        true
+    }
+
+    /// 开机自启的**真实**状态：以注册表为准，读不到才退回库里存的值。
+    ///
+    /// 注册表才是权威——用户可能在任务管理器或 msconfig 里禁掉自启，那时库里仍是
+    /// `true`，若拿库值做开关初值，开关会一直显示开着而实际早已关闭。
+    fn autostart_now(&self) -> bool {
+        crate::autostart::is_enabled().unwrap_or_else(|_| self.settings.borrow().autostart)
     }
 
     /// 英英释义是否默认展开。**立即生效**——它只影响此后新建卡片的初始展开态。
-    fn set_expand_en(&self, on: bool) {
+    fn set_expand_en(&self, on: bool) -> bool {
         self.settings.borrow_mut().expand_en = on;
-        if self.save_settings() {
-            self.settings_note.set(String::new());
+        if !self.save_settings() {
+            return false;
         }
+        self.settings_note.set(String::new());
+        true
     }
 
     /// 换词库路径。只能重启生效：词库连接在 `main` 里打开后交给了界面，运行期换库
     /// 意味着重建整条查询链路，而那点收益抵不上它带来的状态一致性问题。
-    fn set_dict_path(&self, is_ec: bool, path: std::path::PathBuf) {
+    fn set_dict_path(&self, is_ec: bool, path: Option<std::path::PathBuf>) {
+        // **先校验再落库**。选错文件的代价是致命的：词库打不开时 `main` 直接 exit，
+        // 而 release 构建没有控制台（`windows_subsystem = "windows"`），用户看到的是
+        // 「双击没反应、托盘不出现、零提示」，且设置存在 %LOCALAPPDATA% 里无从下手。
+        // 文件选择器只按扩展名过滤，把汉英库选进英汉槽它照收——非校验不可。
+        if let Some(p) = &path {
+            if let Err(e) = crate::source::offline::probe_dict(p, is_ec) {
+                self.settings_note
+                    .set(format!("这个文件不能用作词库：{e:#}"));
+                return;
+            }
+        }
+        let has = path.is_some();
         {
             let mut s = self.settings.borrow_mut();
             if is_ec {
-                s.ecdict = Some(path);
+                s.ecdict = path;
             } else {
-                s.cedict = Some(path);
+                s.cedict = path;
             }
         }
         if self.save_settings() {
-            self.settings_note.set("词库已更改，重启后生效".into());
+            self.settings_note.set(if has {
+                "词库已更改，重启后生效".into()
+            } else {
+                "已恢复默认词库路径，重启后生效".into()
+            });
         }
+    }
+
+    /// 从当前页签移除一行：历史页删历史条目，收藏页取消收藏。
+    ///
+    /// **动作随页签而变**是刻意的：侧栏的 × 意思是「把这一行从我眼前的这个列表里
+    /// 去掉」。在历史里那是删记录，在收藏里那是取消收藏——若两处都去删历史，收藏页
+    /// 的 × 就会点了没反应。
+    ///
+    /// 失败当场告知：两者都是用户主动表达的意图，与历史的**被动写入**不同。
+    fn remove_side_row(&self, hw: &Headword) {
+        let UserDataState::Ready(u) = &self.user else {
+            self.notice.set("用户数据未能打开，无法修改".into());
+            return;
+        };
+        let on_favorites = self.side_tab.get() == TAB_FAVORITES;
+        let r = if on_favorites {
+            u.remove_favorite(hw)
+        } else {
+            u.remove_history(hw)
+        };
+        match r {
+            Ok(()) => {
+                self.notice.set(String::new());
+                self.bump();
+            }
+            Err(e) => self.notice.set(format!(
+                "{}「{hw}」失败：{e}",
+                if on_favorites {
+                    "取消收藏"
+                } else {
+                    "删除历史"
+                }
+            )),
+        }
+    }
+
+    /// 清空全部历史记录。破坏性且不可撤销，故调用方须先做二次确认。
+    fn clear_history(&self) {
+        let UserDataState::Ready(u) = &self.user else {
+            self.settings_note.set("用户数据未能打开，无法清空".into());
+            return;
+        };
+        match u.clear_history() {
+            Ok(()) => {
+                self.settings_note.set("历史记录已清空".into());
+                self.bump();
+            }
+            Err(e) => self.settings_note.set(format!("清空历史失败：{e}")),
+        }
+    }
+
+    /// 历史与收藏的条数，供设置页如实显示「要清掉多少」。
+    fn counts(&self) -> (usize, usize) {
+        let UserDataState::Ready(u) = &self.user else {
+            return (0, 0);
+        };
+        (
+            u.history(usize::MAX).map(|v| v.len()).unwrap_or(0),
+            u.favorites().map(|v| v.len()).unwrap_or(0),
+        )
+    }
+
+    /// 写收藏备注。空串视作清除备注。
+    ///
+    /// **不 `bump()`**：备注变更不影响侧栏列表与卡片分组，而 `bump` 会触发整轮重建，
+    /// 逐字敲备注时那意味着每个字符重建一次结果区——输入框会被连同重建掉，焦点与
+    /// 光标位置随之丢失，根本没法打字。
+    fn set_note(&self, hw: &Headword, note: String) {
+        let UserDataState::Ready(u) = &self.user else {
+            return;
+        };
+        let arg = if note.trim().is_empty() {
+            None
+        } else {
+            Some(note.trim())
+        };
+        if let Err(e) = u.set_note(hw, arg) {
+            self.notice.set(format!("保存备注失败：{e}"));
+        }
+    }
+
+    /// 取某词头的收藏备注。未收藏或无备注时为空串。
+    fn note_of(&self, hw: &Headword) -> String {
+        let UserDataState::Ready(u) = &self.user else {
+            return String::new();
+        };
+        u.favorites()
+            .ok()
+            .and_then(|v| v.into_iter().find(|f| &f.headword == hw))
+            .and_then(|f| f.note)
+            .unwrap_or_default()
     }
 
     /// 宣告用户数据有变，驱动侧栏与卡片重取。
@@ -568,6 +763,7 @@ pub fn build(dict: OfflineDictionary, user: UserDataState, skin: Skin) -> Elemen
         page: signal(PAGE_DICT),
         settings: RefCell::new(settings),
         settings_note: signal(String::new()),
+        confirm_clear: signal(false),
         settings_rev: signal(vec![0]),
     });
     // 开屏即列出历史：侧栏空着会让人以为功能坏了。
@@ -765,16 +961,41 @@ fn side_list(st: Rc<State>) -> Element {
     Element::list_signal(
         st.side_rows,
         |r: &SideRow| r.headword.as_str().to_string(),
-        move |r: SideRow| {
-            let st = st.clone();
-            let word = r.headword.as_str().to_string();
-            Element::nav_row(word.clone()).on_click(move |_ctx| {
-                st.query.set(word.clone());
-                st.lookup(&word);
-            })
-        },
+        move |r: SideRow| side_row(r, st.clone()),
     )
     .fill()
+}
+
+/// 侧栏的一行：词头（点击即查）+ 移除按钮。
+///
+/// 不用 `Element::nav_row`：它自带的 `›` 是「钻入子页」的语义，而这里点一行的动作是
+/// 「查这个词」，查完人还在原地。图标与语义不符会让人误以为侧边还有一层。
+fn side_row(r: SideRow, st: Rc<State>) -> Element {
+    let word = r.headword.as_str().to_string();
+    let (pick_st, del_st) = (st.clone(), st);
+    let (pick_word, del_hw) = (word.clone(), r.headword.clone());
+    Element::row()
+        .width_match()
+        .height(36)
+        .cross(Align::Center)
+        .corner(8.0)
+        .padding_xy(10, 0)
+        .clickable()
+        .on_click(move |_ctx| {
+            pick_st.query.set(pick_word.clone());
+            pick_st.lookup(&pick_word);
+        })
+        .child(
+            Element::label(word)
+                .font_size(13.5)
+                .fg_role(Role::Text)
+                .weight(1.0),
+        )
+        .child(
+            Element::icon_button("×")
+                .fg_role(Role::TextMuted)
+                .on_click(move |_ctx| del_st.remove_side_row(&del_hw)),
+        )
 }
 
 /// 主列：查询框 + 补全候选 + 结果。
@@ -822,6 +1043,7 @@ fn main_column(st: Rc<State>, unavailable: Option<String>) -> Element {
 /// 一个常驻词典真正要让用户调的东西。
 fn settings_page(st: Rc<State>) -> Element {
     let page = st.page;
+    let confirm = st.confirm_clear;
     Element::col()
         .fill()
         .child(
@@ -840,7 +1062,11 @@ fn settings_page(st: Rc<State>) -> Element {
                         .cross(Align::Center)
                         .corner(8.0)
                         .clickable()
-                        .on_click(move |_ctx| page.set(PAGE_DICT))
+                        .on_click(move |_ctx| {
+                            // 离开即撤销确认态：回来时不该还举着「确认清空」等人误触。
+                            confirm.set(false);
+                            page.set(PAGE_DICT);
+                        })
                         .child(
                             Element::label("←")
                                 .width_match()
@@ -878,7 +1104,48 @@ fn settings_body(st: Rc<State>) -> Element {
         .child(group("唤起", hotkey_row(st.clone())))
         .child(group("启动", autostart_row(st.clone())))
         .child(group("词库", dict_rows(st.clone())))
-        .child(group("释义显示", expand_en_row(st)))
+        .child(group("释义显示", expand_en_row(st.clone())))
+        .child(group("数据", data_rows(st)))
+}
+
+/// 数据管理：条数如实展示 + 清空历史。
+///
+/// **只清历史、不清收藏**：历史是系统被动记录的事实，攒多了是噪音，批量清理是正当
+/// 需求；收藏是用户一条条主动标记的意图，批量抹掉的破坏性完全不同量级，且没有对应
+/// 的存储层接口——真要做也该是另一套更谨慎的交互，不是并排放一个同样的按钮。
+fn data_rows(st: Rc<State>) -> Element {
+    let (hist, favs) = st.counts();
+    let confirming = st.confirm_clear.get();
+    let st2 = st.clone();
+    let clear_btn = if confirming {
+        Element::button("确认清空")
+            .on_click(move |_ctx| {
+                st2.clear_history();
+                st2.confirm_clear.set(false);
+                st2.bump_settings();
+            })
+            .fg_role(Role::Danger)
+    } else {
+        Element::button("清空").on_click(move |_ctx| {
+            st2.confirm_clear.set(true);
+            st2.bump_settings();
+        })
+    };
+    let sub = if confirming {
+        "此操作不可撤销。再点一次确认，或切走本页取消".to_string()
+    } else {
+        format!("已记录 {hist} 条")
+    };
+    card(vec![
+        row("历史记录", Some(&sub), clear_btn),
+        row(
+            "收藏",
+            Some(&format!("已收藏 {favs} 条")),
+            Element::label("在侧栏逐条取消")
+                .font_size(12.5)
+                .fg_role(Role::TextMuted),
+        ),
+    ])
 }
 
 /// 一个设置分组：小标题 + 内容卡片。
@@ -902,7 +1169,6 @@ fn card(rows: Vec<Element>) -> Element {
         .bg_role(Role::Surface)
         .border_role(Role::Border, 1)
         .corner(12.0);
-    let last = rows.len().saturating_sub(1);
     for (i, r) in rows.into_iter().enumerate() {
         // 行间分隔线交给上边框，末行不画——比在行之间插色块少一层节点。
         let r = if i == 0 {
@@ -910,7 +1176,6 @@ fn card(rows: Vec<Element>) -> Element {
         } else {
             r.border_role(Role::Divider, 1).border_edges(Edges::TOP)
         };
-        let _ = last;
         col = col.child(r);
     }
     col
@@ -1018,23 +1283,54 @@ fn hotkey_row(st: Rc<State>) -> Element {
 
 /// 开机自启。
 fn autostart_row(st: Rc<State>) -> Element {
-    let on = signal(st.settings.borrow().autostart);
-    let st2 = st.clone();
-    card(vec![row(
+    // 初值取**注册表**而非库：用户可能在别处禁掉了自启。
+    toggle_row(
+        st,
         "开机时启动",
-        Some("登录后自动在托盘常驻，等待热键唤起"),
-        Element::switch(on).on_toggle(move |_ctx| st2.set_autostart(on.get())),
-    )])
+        "登录后自动在托盘常驻，等待热键唤起",
+        |st| st.autostart_now(),
+        |st, v| st.set_autostart(v),
+    )
 }
 
 /// 释义显示。
 fn expand_en_row(st: Rc<State>) -> Element {
-    let on = signal(st.settings.borrow().expand_en);
-    let st2 = st.clone();
-    card(vec![row(
+    toggle_row(
+        st,
         "默认展开英英释义",
-        Some("关闭时英英释义仍在，只是需要点开"),
-        Element::switch(on).on_toggle(move |_ctx| st2.set_expand_en(on.get())),
+        "关闭时英英释义仍在，只是需要点开",
+        |st| st.settings.borrow().expand_en,
+        |st, v| st.set_expand_en(v),
+    )
+}
+
+/// 一行开关设置：初值由 `init` 取，翻转由 `apply` 落实（失败则自动拨回）。
+fn toggle_row(
+    st: Rc<State>,
+    title: &str,
+    subtitle: &str,
+    init: fn(&State) -> bool,
+    apply: fn(&State, bool) -> bool,
+) -> Element {
+    let on = signal(init(&st));
+    card(vec![row(
+        title,
+        Some(subtitle),
+        Element::row()
+            .cross(Align::Center)
+            // 监听器：零尺寸、不可见，须先于开关注册（on_update 按注册顺序广播）。
+            .child(
+                Element::leaf()
+                    .reactive()
+                    .widget(SettingToggle {
+                        st,
+                        on,
+                        last_version: on.version(),
+                        apply,
+                    })
+                    .size(0, 0),
+            )
+            .child(Element::switch(on)),
     )])
 }
 
@@ -1053,27 +1349,33 @@ fn dict_row(st: Rc<State>, is_ec: bool) -> Element {
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "（默认：程序同目录）".into());
-    row(
-        title,
-        Some(&shown),
-        Element::button("选择…").on_click(move |ctx| {
-            let st = st.clone();
-            ctx.request_pick_file(
-                PickDialog::new()
-                    .title(if is_ec {
-                        "选择英汉词库"
-                    } else {
-                        "选择汉英词库"
-                    })
-                    .filter("SQLite 词库", &["db"]),
-                move |picked| {
-                    if let Some(p) = picked {
-                        st.set_dict_path(is_ec, p);
-                    }
-                },
-            );
-        }),
-    )
+    let mut right = Element::row().cross(Align::Center).spacing(8);
+    // 有自定义路径时才给「恢复默认」——本来就是默认值时这个按钮点了没意义。缺了它，
+    // 用户一旦选错就再也回不到默认，只能去手改数据库。
+    if cur.is_some() {
+        let st2 = st.clone();
+        right = right.child(
+            Element::button("恢复默认").on_click(move |_ctx| st2.set_dict_path(is_ec, None)),
+        );
+    }
+    right = right.child(Element::button("选择…").on_click(move |ctx| {
+        let st = st.clone();
+        ctx.request_pick_file(
+            PickDialog::new()
+                .title(if is_ec {
+                    "选择英汉词库"
+                } else {
+                    "选择汉英词库"
+                })
+                .filter("SQLite 词库", &["db"]),
+            move |picked| {
+                if let Some(p) = picked {
+                    st.set_dict_path(is_ec, Some(p));
+                }
+            },
+        );
+    }));
+    row(title, Some(&shown), right)
 }
 
 /// 需当场告知的消息条。空串时零高度、不占位。
@@ -1191,6 +1493,10 @@ fn card_view(c: Card, st: Rc<State>) -> Element {
             )
             .child(star(c.fav, hw.clone(), st.clone())),
     );
+    // 备注只在已收藏时出现：它是书签的附加信息，没收藏就没有可附着的东西。
+    if c.fav {
+        col = col.child(note_field(hw.clone(), st.clone()));
+    }
     for (i, e) in c.entries.into_iter().enumerate() {
         // 键带序号：同一词头下可能有多条词条（多音字），各自的折叠区应能分别开合。
         let expanded = st
@@ -1199,6 +1505,33 @@ fn card_view(c: Card, st: Rc<State>) -> Element {
         col = col.child(entry_view(e, expanded));
     }
     col
+}
+
+/// 收藏备注输入框。
+fn note_field(hw: Headword, st: Rc<State>) -> Element {
+    let text = signal(st.note_of(&hw));
+    Element::row()
+        .width_match()
+        .cross(Align::Center)
+        .spacing(8)
+        // 保存器：零尺寸、不可见，须先于输入框注册（on_update 按注册顺序广播）。
+        .child(
+            Element::leaf()
+                .reactive()
+                .widget(NoteSaver {
+                    st,
+                    headword: hw,
+                    text,
+                    last_version: text.version(),
+                })
+                .size(0, 0),
+        )
+        .child(
+            Element::text_input(text, "备注…")
+                .font_size(13.0)
+                .width_match()
+                .weight(1.0),
+        )
 }
 
 /// 收藏星标。实心 = 已收藏。

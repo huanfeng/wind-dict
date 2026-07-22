@@ -25,6 +25,7 @@ mod imp {
     use super::VALUE_NAME;
     use anyhow::{bail, Context, Result};
     use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
     use windows::Win32::System::Registry::{
         RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
         HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_SZ,
@@ -85,10 +86,15 @@ mod imp {
     }
 
     pub fn set(on: bool) -> Result<()> {
+        // 先取路径再开键：`quoted_exe()` 的 `?` 若在开键之后早退，句柄就漏了。
+        let value = if on {
+            Some(HSTRING::from(quoted_exe()?))
+        } else {
+            None
+        };
         let key = open_run(true)?;
         let name = HSTRING::from(VALUE_NAME);
-        let r = if on {
-            let value = HSTRING::from(quoted_exe()?);
+        let r = if let Some(value) = value {
             // 长度含结尾的 NUL，且以**字节**计——REG_SZ 是宽字符，故 ×2。
             let bytes = unsafe {
                 std::slice::from_raw_parts(
@@ -101,12 +107,14 @@ mod imp {
             unsafe { RegDeleteValueW(key, PCWSTR(name.as_ptr())) }
         };
         unsafe { RegCloseKey(key).ok().ok() };
-        // 关闭自启时值本就不存在，视作成功——用户要的结果已经达成。
-        if !on && r.is_err() {
+        // 关闭时「值本就不存在」视作成功——用户要的结果已经达成。但**只放行这一种**：
+        // 若是被组策略拒绝（ACCESS_DENIED），那是真失败，吞掉它就成了静默降级。
+        if !on && r == ERROR_FILE_NOT_FOUND {
             return Ok(());
         }
         if r.is_err() {
-            bail!("写注册表失败（{:?}）", r);
+            // 用系统消息而非裸错误码：用户看到「拒绝访问」比看到 `WIN32_ERROR(5)` 有用。
+            bail!("写注册表失败：{}", r.to_hresult().message());
         }
         Ok(())
     }

@@ -4,7 +4,7 @@
 //! 词典与词库是多对多关系，见术语表。用户认知里只有「离线词典」这一个东西；
 //! 「英汉」「汉英」不是两个词典，只是同一个词典的两个方向（docs/adr/0003）。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::domain::{Candidate, Dictionary, Direction, Lookup, Query, Wordlist};
 use crate::store::cedict::Cedict;
@@ -30,6 +30,27 @@ impl OfflineDictionary {
             cedict: Cedict::open(cedict_path)?,
         })
     }
+}
+
+/// 校验一个文件能否用作**指定方向**的词库。
+///
+/// 只看扩展名等于没校验：文件选择器按 `.db` 过滤，把汉英库选进英汉槽它照收，而两个
+/// 库的表结构完全不同——真正打开一次并试查一个词，才知道选对没有。
+///
+/// 之所以值得为此多写一段：词库设错在 release 下是**静默致命**的（`main` 直接 exit，
+/// 而无控制台构建看不到任何输出），用户只会看到程序打不开。宁可在设置页当场拦住。
+pub fn probe_dict(path: &std::path::Path, is_ec: bool) -> Result<()> {
+    if is_ec {
+        let d = Ecdict::open(path)?;
+        // 试查一次。查不到不代表库坏（可能只是词条少），但**报错**说明表结构不对。
+        let q = Query::new("the").expect("常量查询词非空");
+        d.lookup(&q).context("该文件不是英汉词库（表结构不符）")?;
+    } else {
+        let d = Cedict::open(path)?;
+        let q = Query::new("的").expect("常量查询词非空");
+        d.lookup(&q).context("该文件不是汉英词库（表结构不符）")?;
+    }
+    Ok(())
 }
 
 impl Dictionary for OfflineDictionary {
@@ -66,5 +87,39 @@ impl Wordlist for OfflineDictionary {
             Direction::EnToZh => self.ecdict.complete(q.text(), limit),
             Direction::ZhToEn => self.cedict.complete(q.text(), limit),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_dict;
+
+    /// 把汉英库选进英汉槽必须被拦住。
+    ///
+    /// 这是 `probe_dict` 存在的唯一理由——文件选择器只按 `.db` 过滤，两个库都叫
+    /// `.db`，选反了它照收。而词库设错在 release 下是静默致命的：`main` 直接 exit，
+    /// 无控制台构建看不到任何输出，用户只看到程序打不开。
+    #[test]
+    fn 方向选反的词库被拦住() {
+        let ec = std::path::Path::new(".cache/dict/ecdict.db");
+        let ce = std::path::Path::new(".cache/dict/cedict.db");
+        if !ec.exists() || !ce.exists() {
+            eprintln!("跳过：本机没有词库文件");
+            return;
+        }
+        assert!(probe_dict(ec, true).is_ok(), "英汉库放英汉槽应通过");
+        assert!(probe_dict(ce, false).is_ok(), "汉英库放汉英槽应通过");
+        assert!(probe_dict(ce, true).is_err(), "汉英库放进英汉槽必须被拦住");
+        assert!(probe_dict(ec, false).is_err(), "英汉库放进汉英槽必须被拦住");
+    }
+
+    /// 随便一个不是 SQLite 的文件也要被拦住。
+    #[test]
+    fn 非词库文件被拦住() {
+        let p = std::env::temp_dir().join(format!("wd_notdb_{}.db", std::process::id()));
+        std::fs::write(&p, b"this is not a database").unwrap();
+        assert!(probe_dict(&p, true).is_err());
+        assert!(probe_dict(&p, false).is_err());
+        let _ = std::fs::remove_file(&p);
     }
 }
