@@ -391,6 +391,23 @@ impl State {
         self.lookup(word);
     }
 
+    /// 清空查询框，回到开屏状态。
+    ///
+    /// 常驻词典最高频的一个动作是「唤起 → 查另一个词」，而热键唤起时上次的词还在框里
+    /// （窗口只是被隐藏，状态原样保留）。在没有「唤起即聚焦并全选」之前
+    /// （见 `docs/upstream-keyboard-path.md`），用户得先把光标挪进去再全选删除——
+    /// 一个按钮省掉的正是这一串。
+    ///
+    /// 连结果一起清而不只清输入框：留着上一个词的词条、顶上却是个空框，这个组合不表达
+    /// 任何状态。`candidates` 不必手动清——`complete("")` 走 `Query::new` 的 None 分支
+    /// 返回空表（`source/offline.rs:83`），`Completer` 醒来自会清空。
+    fn clear_query(&self) {
+        self.query.set(String::new());
+        self.rebuild_cards(&[]);
+        self.hint.set("输入一个词开始查询".into());
+        self.notice.set(String::new());
+    }
+
     /// 执行查询。**只在查询词确定时调用**（选中候选），不逐键触发——见术语表「补全」：
     /// 补全回答「我想拼的是哪个词」，查询回答「这个词什么意思」，是两个动作。
     fn lookup(&self, word: &str) {
@@ -1195,13 +1212,7 @@ fn main_column(st: Rc<State>, unavailable: Option<String>) -> Element {
         // Ctrl+Alt+D（`main.rs`），而窗口内并没有 Ctrl+K 这个键位。画一组按了没用的
         // 键帽比不画更糟。
         // 50px 高、12 圆角：查询框是这一屏的主控件，与设计稿一致地给足分量。
-        .child(
-            Element::text_input(st.query, "输入中文或英文…")
-                .width_match()
-                .height(50)
-                .corner(12.0)
-                .font_size(16.0),
-        )
+        .child(query_box(st.clone()))
         .child(notice_bar(st.notice))
         // 此处原有一条分隔线。拿掉了：候选区收起后它就紧贴查询框，把主列切成两截，
         // 而它要分隔的两样东西（候选、结果）本就不会同时是空的。区域感交给留白。
@@ -1626,6 +1637,41 @@ fn unavailable_bar(why: &str) -> Element {
         .corner(6.0)
         .padding(8)
         .width_match()
+}
+
+/// 查询框 + 右端的清除按钮。
+///
+/// 按钮**叠在输入框上**而不是并排：并排会把输入框挤窄，且按钮出现/消失时输入框宽度
+/// 跟着变，光标位置跳一下。叠放则输入框始终定宽。
+///
+/// `Layout::Frame` 用单个 `align` 同时定横纵（windui `core.rs:arrange_frame`），故
+/// 按钮做成与输入框等高（50px）的行，`Align::End` 在纵向偏移为零，横向贴右——
+/// 「右端居中」就是这么凑出来的，不是框架直接支持的对齐方式。
+fn query_box(st: Rc<State>) -> Element {
+    let query = st.query;
+    Element::stack()
+        .width_match()
+        .child(
+            Element::text_input(st.query, "输入中文或英文…")
+                .width_match()
+                .height(50)
+                .corner(12.0)
+                .font_size(16.0),
+        )
+        .child(
+            Element::row()
+                .height(50)
+                .cross(Align::Center)
+                .padding_xy(12, 0)
+                .align(Align::End)
+                .child(
+                    Element::icon_button("×")
+                        .fg_role(Role::TextDisabled)
+                        .on_click(move |_ctx| st.clear_query()),
+                )
+                // 空框上放一个「清空」按钮没有意义，且它会盖住占位符的尾部。
+                .visible_when(move || !query.get().is_empty()),
+        )
 }
 
 /// 候选浮层：点一条即「确定查询词」，触发查询。
