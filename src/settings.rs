@@ -56,6 +56,24 @@ impl HotkeySpec {
     pub fn has_modifier(self) -> bool {
         self.ctrl || self.alt || self.shift
     }
+
+    /// 转成 windui 的注册用类型。
+    ///
+    /// 放在这里而非 `main`：改键时界面也要用它（`ui::State::set_hotkey` 走
+    /// `HotkeyHandle::rebind`），两处各写一遍必然漂移。
+    pub fn to_hotkey(self) -> windui::event::Hotkey {
+        let mut hk = windui::event::Hotkey::new(windui::event::Key::Char(self.key));
+        if self.ctrl {
+            hk = hk.ctrl();
+        }
+        if self.alt {
+            hk = hk.alt();
+        }
+        if self.shift {
+            hk = hk.shift();
+        }
+        hk
+    }
 }
 
 impl fmt::Display for HotkeySpec {

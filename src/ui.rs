@@ -24,7 +24,7 @@ use windui::prelude::*;
 
 use crate::domain::{Candidate, Dictionary, Entry, Headword, Lookup, Query, Sense, Wordlist};
 use crate::settings::Settings;
-use crate::skin::{Skin, SkinKind};
+use crate::skin::SkinKind;
 use crate::source::offline::OfflineDictionary;
 use crate::store::userdata::{now_secs, UserDataState};
 
@@ -92,6 +92,12 @@ const SERIF: &str = "Georgia";
 
 /// 词头字号。比正文大一个数量级——词头是这一屏的主角，其余都是它的注解。
 const HEADWORD_SIZE: f32 = 42.0;
+
+/// 强调色淡底的不透明度。用于列表选中行、已收藏星标的底。
+///
+/// 走 `bg_role_alpha` 而非写死颜色：淡底必须随强调色一起变，写死则换肤后底色与强调
+/// 色对不上。取 0.14 与设计稿三套皮肤的 `--accent-2` 观感相当。
+const ACCENT_SOFT_A: f32 = 0.14;
 
 /// 正文行高倍数。
 ///
@@ -216,6 +222,54 @@ impl Widget for SettingToggle {
     }
 }
 
+/// 监视热键编辑、即时改绑的响应式控件。
+///
+/// **为什么不做「按下新组合键」式的捕获**：windui 的 `KeyEvent` 只带 `ctrl` 与
+/// `shift`，没有 `alt`——而本项目的默认热键正是 Ctrl+Alt+D，捕获式界面根本认不出它。
+/// 勾选修饰键 + 填字母这条路虽朴素，却能如实表达全部可用组合，且不必处理「按下
+/// Escape 算取消还是算热键」这类捕获特有的歧义。
+struct HotkeyEditor {
+    st: Rc<State>,
+    ctrl: Signal<bool>,
+    alt: Signal<bool>,
+    shift: Signal<bool>,
+    key: Signal<String>,
+    last: (u64, u64, u64, u64),
+}
+
+impl Widget for HotkeyEditor {
+    fn on_update(&mut self, _ctx: &mut EventCtx) {
+        let now = (
+            self.ctrl.version(),
+            self.alt.version(),
+            self.shift.version(),
+            self.key.version(),
+        );
+        if now == self.last {
+            return;
+        }
+        self.last = now;
+        let text = self.key.get();
+        let Some(c) = text
+            .trim()
+            .chars()
+            .next()
+            .filter(|c| c.is_ascii_alphanumeric())
+        else {
+            self.st
+                .settings_note
+                .set("热键的主键请填一个字母或数字".into());
+            return;
+        };
+        self.st.set_hotkey(crate::settings::HotkeySpec {
+            ctrl: self.ctrl.get(),
+            alt: self.alt.get(),
+            shift: self.shift.get(),
+            key: c.to_ascii_uppercase(),
+        });
+    }
+}
+
 /// 界面状态。
 struct State {
     dict: Rc<OfflineDictionary>,
@@ -241,9 +295,14 @@ struct State {
     notice: Signal<String>,
     /// 可折叠区（当前只有「英英释义」）的展开态。
     expanded: ExpandedStates,
-    /// 皮肤。界面自绘处（选中淡底等）要用，那些色在 windui 的 `Role` 里没有对应项
-    /// （ADR-0012）。
-    skin: Skin,
+    /// 主题句柄：换肤即 `set` 一份新 `Theme`，下一帧全树跟随。
+    ///
+    /// 界面里**没有一处写死颜色**，全部走 `Role` / `RoleAlpha`，故换肤不需要重建
+    /// 元素树——这正是 ADR-0012 当初判断做不到的那件事，其症结其实不在框架，而在
+    /// 我们把本可用角色表达的颜色写成了具体色值。
+    theme: ThemeHandle,
+    /// 热键句柄：改键即 `rebind`，下一次消息循环生效。
+    hotkey: HotkeyHandle,
     /// 主列当前页：词典 / 设置。
     page: Signal<usize>,
     /// 当前设置。界面上的各个控件绑到它的分量信号，改动经 `save_settings` 落库。
@@ -450,17 +509,37 @@ impl State {
     /// 目前**只能重启生效**：`ThemeHandle::set` 不重建元素树，而本应用的自绘区域色
     /// （标题栏底、侧栏底、卡片底）在 windui 的 `Role` 里没有对应项，解析不出来。
     /// 完整论证见 ADR-0012。这里如实告知用户，而不是让他点完毫无反应。
+    /// 换皮肤。**立即生效**：界面无一处写死颜色，`ThemeHandle::set` 之后下一帧全树
+    /// 按新色板重新解析。
+    ///
+    /// 先换后存：换肤是纯视觉、可随时再换，让用户当场看到结果比「先确保存住」更重要；
+    /// 存失败时如实告知「本次有效、重启后回退」，而不是回滚掉一个用户已经看到的变化。
     fn set_skin(&self, kind: SkinKind) {
-        let prev = self.settings.borrow().skin;
         self.settings.borrow_mut().skin = kind;
+        self.theme.set(kind.skin().theme);
         if self.save_settings() {
-            self.settings_note
-                .set(format!("已选「{}」，重启后生效", kind.name()));
+            self.settings_note.set(String::new());
         } else {
-            // 没落库就把内存改回去，否则选中环会停在一个从未保存的皮肤上——
-            // 看着像选中了，重启后却变回旧的。
-            self.settings.borrow_mut().skin = prev;
-            self.bump_settings();
+            self.settings_note
+                .set("皮肤已切换，但未能保存，重启后会回到原来的皮肤".into());
+        }
+    }
+
+    /// 改唤起热键。**立即生效**：`rebind` 下一次消息循环向系统换注册。
+    ///
+    /// 拦住无修饰键：那会吞掉该字母在**所有程序**里的输入，用户按一下 D 就唤起词典，
+    /// 等于没法打字了——而这个错误一旦犯下，用户很难意识到是词典干的。
+    fn set_hotkey(&self, spec: crate::settings::HotkeySpec) {
+        if !spec.has_modifier() {
+            self.settings_note.set(
+                "热键至少要带一个 Ctrl / Alt / Shift，否则会吞掉该键在所有程序里的输入".into(),
+            );
+            return;
+        }
+        self.settings.borrow_mut().hotkey = spec;
+        self.hotkey.rebind(spec.to_hotkey());
+        if self.save_settings() {
+            self.settings_note.set(format!("唤起热键已改为 {spec}"));
         }
     }
 
@@ -748,7 +827,12 @@ fn headwords_to_record(entries: &[Entry]) -> Vec<Headword> {
 ///
 /// `user` 不可用时顶部常驻一条警示，说明历史记录失效及其原因（收藏有入口后一并
 /// 纳入，见 `unavailable_bar`）。
-pub fn build(dict: OfflineDictionary, user: UserDataState, skin: Skin) -> Element {
+pub fn build(
+    dict: OfflineDictionary,
+    user: UserDataState,
+    theme: ThemeHandle,
+    hotkey: HotkeyHandle,
+) -> Element {
     let dict = Rc::new(dict);
     let unavailable = match &user {
         UserDataState::Ready(_) => None,
@@ -771,7 +855,8 @@ pub fn build(dict: OfflineDictionary, user: UserDataState, skin: Skin) -> Elemen
         revision: signal(0),
         notice: signal(String::new()),
         expanded: ExpandedStates::default(),
-        skin: skin.clone(),
+        theme,
+        hotkey,
         page: signal(PAGE_DICT),
         settings: RefCell::new(settings),
         settings_note: signal(String::new()),
@@ -784,24 +869,26 @@ pub fn build(dict: OfflineDictionary, user: UserDataState, skin: Skin) -> Elemen
     // 无系统标题栏：整窗都是客户区，故顶部这条标题栏由我们自己画（见 `title_bar`）。
     Element::col()
         .fill()
-        .bg(skin.theme.palette.bg)
-        .child(title_bar(&skin))
+        .bg_role(Role::Bg)
+        .child(title_bar())
         .child(Element::divider())
-        .child(body(st, unavailable, &skin).weight(1.0))
+        .child(body(st, unavailable).weight(1.0))
 }
 
 /// 自定义标题栏：应用标识 + 窗口按钮。
 ///
 /// 整条 `window_drag()` 可拖动窗口；落在窗口按钮上不拖、正常点击（windui 按「命中
 /// 可聚焦控件则不拖」处理）。
-fn title_bar(skin: &Skin) -> Element {
+fn title_bar() -> Element {
     Element::row()
         .width_match()
         .height(38)
         .cross(Align::Stretch)
-        .bg(skin.titlebar)
+        // 标题栏底走 `SurfaceAlt` 而非皮肤里那个具体色：三套皮肤的 `titlebar` 恰好
+        // 都等于 `surface_alt`，用角色表达之后换肤能自动跟随，不必重建元素树。
+        .bg_role(Role::SurfaceAlt)
         .window_drag()
-        .child(brand(skin).weight(1.0))
+        .child(brand().weight(1.0))
         // 窗口按钮的宽度（46px，与设计一致）、图标形状与 hover 色均由 windui 硬编码，
         // 只有图标色可调。框架的 `BTN_H = 32` 在这里不生效——本行 `cross(Stretch)`
         // 会把按钮拉到 38 高。
@@ -815,7 +902,7 @@ fn title_bar(skin: &Skin) -> Element {
 }
 
 /// 标题栏左侧的应用标识：图标 + 名称 + 能力副标题。
-fn brand(skin: &Skin) -> Element {
+fn brand() -> Element {
     Element::row()
         .cross(Align::Center)
         .spacing(9)
@@ -845,7 +932,7 @@ fn brand(skin: &Skin) -> Element {
             Element::label("wind-dict")
                 .font_size(12.5)
                 .font_weight(600)
-                .fg(skin.text2),
+                .fg_role(Role::Text),
         )
         .child(
             // 「英汉 · 汉英」说的是**查询方向**，不是两个词典——术语表禁止的是
@@ -866,13 +953,13 @@ fn brand(skin: &Skin) -> Element {
 /// 主体区域：左侧栏 + 右主列。
 ///
 /// 底色由 `build` 的根容器统一铺，此处不再铺一遍——同一块区域填两次纯色是白费。
-fn body(st: Rc<State>, unavailable: Option<String>, skin: &Skin) -> Element {
+fn body(st: Rc<State>, unavailable: Option<String>) -> Element {
     Element::row()
         .fill()
         .cross(Align::Stretch)
         // 栏间那条线是侧栏**自己的右边框**，不再是一个独立节点：单边边框不参与
         // 布局，而 1px 色块要占一列，容器一改间距就得跟着调。
-        .child(sidebar(st.clone(), skin))
+        .child(sidebar(st.clone()))
         .child(pages(st, unavailable).weight(1.0))
 }
 
@@ -880,11 +967,11 @@ fn body(st: Rc<State>, unavailable: Option<String>, skin: &Skin) -> Element {
 ///
 /// 设计稿的侧栏底部还有一个「设置」入口，此处**刻意不做**——设置页是下一阶段的东西，
 /// 现在放个按钮上去，点了没有任何反应。宁可先没有入口，也不放一个骗人的。
-fn sidebar(st: Rc<State>, skin: &Skin) -> Element {
+fn sidebar(st: Rc<State>) -> Element {
     Element::col()
         .width(224)
         .height_match()
-        .bg(skin.panel)
+        .bg_role(Role::SurfaceAlt)
         .border_role(Role::Divider, 1)
         .border_edges(Edges::RIGHT)
         // 列表驱动器：零尺寸、不可见，须先于列表注册（on_update 按注册顺序广播，
@@ -908,9 +995,9 @@ fn sidebar(st: Rc<State>, skin: &Skin) -> Element {
             Element::tabs(
                 st.side_tab,
                 vec![
-                    ("历史", side_list(st.clone(), skin.clone())),
+                    ("历史", side_list(st.clone())),
                     // 术语表弃用「生词本」，见 `TAB_HISTORY` 处的说明。
-                    ("收藏", side_list(st.clone(), skin.clone())),
+                    ("收藏", side_list(st.clone())),
                 ],
             )
             .fill()
@@ -982,11 +1069,11 @@ fn pages(st: Rc<State>, unavailable: Option<String>) -> Element {
 /// 传给 `list_signal` 的 key 函数当前是**死参数**：windui 的形参名为 `_key_fn`，
 /// 内部做全量重建，没有 keyed diff。传它是为将来上游补齐后自动生效，别据此以为
 /// 行有稳定身份（hover / 滚动位置在重建时都会丢）。
-fn side_list(st: Rc<State>, skin: Skin) -> Element {
+fn side_list(st: Rc<State>) -> Element {
     Element::list_signal(
         st.side_rows,
         |r: &SideRow| r.headword.as_str().to_string(),
-        move |r: SideRow| side_row(r, st.clone(), &skin),
+        move |r: SideRow| side_row(r, st.clone()),
     )
     .fill()
 }
@@ -995,7 +1082,7 @@ fn side_list(st: Rc<State>, skin: Skin) -> Element {
 ///
 /// 不用 `Element::nav_row`：它自带的 `›` 是「钻入子页」的语义，而这里点一行的动作是
 /// 「查这个词」，查完人还在原地。图标与语义不符会让人误以为侧边还有一层。
-fn side_row(r: SideRow, st: Rc<State>, skin: &Skin) -> Element {
+fn side_row(r: SideRow, st: Rc<State>) -> Element {
     let word = r.headword.as_str().to_string();
     // 选中态标出「你正在看的是这条」——设计稿的圆点与淡底不是纯装饰，它回答了
     // 「我刚点的是哪个」这个问题，尤其在历史列表里滚动之后。
@@ -1015,7 +1102,7 @@ fn side_row(r: SideRow, st: Rc<State>, skin: &Skin) -> Element {
             pick_st.lookup(&pick_word);
         });
     if active {
-        row = row.bg(skin.accent_soft);
+        row = row.bg_role_alpha(Role::Accent, ACCENT_SOFT_A);
     }
     row.child(
         // 圆点：6px，选中时用强调色。
@@ -1314,18 +1401,43 @@ fn swatch_chip(c: Color) -> Element {
 /// 唤起热键。当前**只读展示**——改键需要框架支持运行时重注册，见下方注释。
 fn hotkey_row(st: Rc<State>) -> Element {
     let spec = st.settings.borrow().hotkey;
+    let ctrl = signal(spec.ctrl);
+    let alt = signal(spec.alt);
+    let shift = signal(spec.shift);
+    let key = signal(spec.key.to_string());
+    let editor = Element::leaf()
+        .reactive()
+        .widget(HotkeyEditor {
+            st,
+            ctrl,
+            alt,
+            shift,
+            key,
+            last: (
+                ctrl.version(),
+                alt.version(),
+                shift.version(),
+                key.version(),
+            ),
+        })
+        .size(0, 0);
     card(vec![row(
         "唤起热键",
-        Some("全局生效。改键需框架支持运行时重注册，暂未开放"),
-        // 键帽样式：与设计稿的 Ctrl/K 同形，但这里显示的是**真实生效**的热键，
-        // 不是装饰——设计稿那组键帽在我们这儿按了没用，故当初没照做。
-        Element::label(spec.to_string())
-            .font_size(12.5)
-            .font_weight(600)
-            .fg_role(Role::TextMuted)
-            .border_role(Role::Border, 1)
-            .corner(6.0)
-            .padding_xy(10, 5),
+        Some("全局生效，改完立即生效。至少要带一个修饰键"),
+        Element::row()
+            .cross(Align::Center)
+            .spacing(10)
+            // 编辑器：零尺寸、不可见，须先于它监视的控件注册。
+            .child(editor)
+            .child(Element::checkbox("Ctrl", ctrl))
+            .child(Element::checkbox("Alt", alt))
+            .child(Element::checkbox("Shift", shift))
+            .child(
+                Element::text_input(key, "键")
+                    .width(48)
+                    .font_size(13.0)
+                    .text_align(Align::Center),
+            ),
     )])
 }
 
@@ -1594,7 +1706,6 @@ fn note_field(hw: Headword, st: Rc<State>) -> Element {
 fn star(fav: bool, hw: Headword, st: Rc<State>) -> Element {
     // 42×42 的带边框方块，而非一个裸图标：收藏是这一屏唯一的写操作，给它一个明确的
     // 可点区域。已收藏时填淡底 + 强调色实心星，未收藏是空心星，两态一眼可辨。
-    let skin = st.skin.clone();
     let mut btn = Element::row()
         .size(42, 42)
         .cross(Align::Center)
@@ -1603,7 +1714,7 @@ fn star(fav: bool, hw: Headword, st: Rc<State>) -> Element {
         .clickable()
         .on_click(move |_ctx| st.toggle_favorite(&hw));
     if fav {
-        btn = btn.bg(skin.accent_soft);
+        btn = btn.bg_role_alpha(Role::Accent, ACCENT_SOFT_A);
     }
     btn.child(
         Element::label(if fav { "★" } else { "☆" })

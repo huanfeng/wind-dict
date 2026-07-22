@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use windui::prelude::*;
 
-use wind_dict::settings::{HotkeySpec, Settings};
+use wind_dict::settings::Settings;
 use wind_dict::source::offline::OfflineDictionary;
 use wind_dict::store::userdata::{UserData, UserDataState};
 use wind_dict::ui;
@@ -58,16 +58,15 @@ fn main() {
             TrayMenuItem::item("退出", |ctx| ctx.quit()),
         ]);
 
-    // 皮肤取自设置。**运行期换肤仍做不到**——`ThemeHandle::set` 不重建元素树，而
-    // 本应用的自绘区域色在 windui 的 `Role` 里没有对应项（ADR-0012）。故设置页改了
-    // 皮肤只写库、提示「重启后生效」，由这里在下次启动时读出来。这正是 ADR-0012
-    // 记下的那条「允许的临时退让」。
+    // 皮肤取自设置，**运行期可换**：界面里没有一处写死颜色，全部走主题角色，故
+    // `ThemeHandle::set` 之后下一帧全树跟随，不必重建元素树。ADR-0012 当初判断
+    // 「接不上」，症结其实不在框架，而在我们把本可用角色表达的颜色写成了具体色值。
     let skin = settings.skin.skin();
 
     // 窗口尺寸按**双栏**定：224px 侧栏是固定开销，主列要装得下词条正文才有意义。
     // 460 宽是单栏时代的遗留，减去侧栏只剩 236px，长释义会挤成一条窄带。
     // 920 让主列拿到约 696px，与设计稿正文限宽 640px 加左右留白正好相当。
-    App::new("wind-dict", 920, 620)
+    let mut app = App::new("wind-dict", 920, 620)
         // 下限也要够双栏：低于此宽度主列会窄到无法阅读，届时该做的是收起侧栏
         // （尚未实现），而不是让用户拖到一个不可用的尺寸。
         .min_size(720, 480)
@@ -82,10 +81,13 @@ fn main() {
         // 常驻：启动不闪窗口，关闭只收起，进程始终活着等热键。见 ADR-0006。
         .start_hidden()
         .hide_on_close()
-        .hotkey(to_hotkey(settings.hotkey), |ctx| ctx.show_window())
-        .screenshot_from_args()
-        .content(ui::build(dict, user, skin))
-        .run();
+        .screenshot_from_args();
+
+    // 两个句柄都必须在 `content` **之前**取到——界面要拿着它们才能即时换肤、改键。
+    let theme = app.theme_handle();
+    let hotkey = app.hotkey_rc(settings.hotkey.to_hotkey(), |ctx| ctx.show_window());
+
+    app.content(ui::build(dict, user, theme, hotkey)).run();
 }
 
 /// 打开用户数据库：`%LOCALAPPDATA%\wind-dict-data\userdata.db`。
@@ -121,21 +123,6 @@ fn userdata_path() -> Result<PathBuf, String> {
     });
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败：{}（{e}）", dir.display()))?;
     Ok(dir.join("userdata.db"))
-}
-
-/// 把设置里的热键转成 windui 的注册用类型。
-fn to_hotkey(spec: HotkeySpec) -> Hotkey {
-    let mut hk = Hotkey::new(Key::Char(spec.key));
-    if spec.ctrl {
-        hk = hk.ctrl();
-    }
-    if spec.alt {
-        hk = hk.alt();
-    }
-    if spec.shift {
-        hk = hk.shift();
-    }
-    hk
 }
 
 /// 词库路径。优先级：命令行参数 > 设置 > exe 同目录。
