@@ -15,7 +15,7 @@
 //!
 //! 整条链只在有输入时才动，空闲时全部静止。
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -28,17 +28,16 @@ use crate::skin::SkinKind;
 use crate::source::offline::OfflineDictionary;
 use crate::store::userdata::{now_secs, UserDataState};
 
-/// 补全候选数量上限。
-///
-/// 单字母前缀（如 `a`）会命中约 5 万行，且 `ORDER BY frq` 用不上索引（索引在
-/// `(sw, word)` 上），SQLite 必须全排一遍——实测约 20ms。LIMIT 不减少排序量，
-/// 但它是唯一能钳住内存与渲染开销的地方。
 /// 候选浮层最多列几条。
 ///
 /// 20 条曾是「反正能滚」的产物，但浮层不带滚动条（高度随内容），且**没有键盘游标**
 /// （↑↓ 传不进来，见 `docs/upstream-keyboard-path.md`），滚动只能靠鼠标——那还不如
-/// 不列。7 条与有道词典的候选条数相当，且 7×38+12 的浮层高度在 620px 窗口里盖不住
-/// 结果区太多。补全是缩小范围的工具，不是穷举词表。
+/// 不列。7 条与有道词典的候选条数相当，且 7×38 + `padding(6)` 上下共 278px 的浮层
+/// 在 620px 窗口里盖不住结果区太多。补全是缩小范围的工具，不是穷举词表。
+///
+/// 另一层理由与显示无关：单字母前缀（如 `a`）会命中约 5 万行，且 `ORDER BY frq`
+/// 用不上索引（索引在 `(sw, word)` 上），SQLite 必须全排一遍——实测约 20ms。
+/// LIMIT 不减少排序量，但它是唯一能钳住内存与渲染开销的地方。
 const MAX_CANDIDATES: usize = 7;
 
 /// 监视查询词、驱动补全的响应式控件。
@@ -50,8 +49,8 @@ struct Completer {
     dict: Rc<OfflineDictionary>,
     query: Signal<String>,
     candidates: Signal<Vec<Candidate>>,
-    /// 查询词是被「选中」改的而非打字改的。见 `State::select`。
-    picked: Rc<Cell<bool>>,
+    /// 最近一次被「选中」写进查询框的词。见 `State::select`。
+    picked: Rc<RefCell<Option<String>>>,
     /// 上次见到的查询词版本。
     last_version: u64,
 }
@@ -64,17 +63,24 @@ impl Widget for Completer {
         }
         self.last_version = v;
 
+        let text = self.query.get();
+
         // 选中而来的改词：收起浮层，不再补全。用户已经确定要哪个词了，此刻还列出
-        // 一串以它为前缀的别的词，只会盖住刚查出来的结果。**标记取一次即清**，
-        // 下一次真打字照常补全。
-        if self.picked.replace(false) {
+        // 一串以它为前缀的别的词，只会盖住刚查出来的结果。
+        //
+        // 标记存的是**那个词**而非一个 bool，为的是能自校验。本方法的入口是纯版本
+        // 比较，而两次 `set` 之间若没有插进一次 layout，它们会**合并成一次**
+        // `on_update`（响应式更新在 layout 期派发——`core.rs:424` → `core.rs:370`，
+        // 而 layout 挂在 render 上，WM_PAINT 在 Win32 队列里优先级最低，可以被
+        // 鼠标消息饿着）。若只是个 bool，合并时它会被后一次（打字）那轮吃掉，
+        // 那一击的候选被静默清空。存了词就对不上，抑制自然失效，打字照常补全。
+        if self.picked.borrow_mut().take().as_deref() == Some(text.as_str()) {
             self.candidates.set(Vec::new());
             return;
         }
 
         // 补全**永远由离线词典驱动**，与用户选中哪个查询源无关——补全需要词表，
         // 而词表只有词典有（译源没有词库，不知道世上存在哪些词）。见术语表「补全」。
-        let text = self.query.get();
         let list = self
             .dict
             .complete(&text, MAX_CANDIDATES)
@@ -293,8 +299,8 @@ struct State {
     user: UserDataState,
     query: Signal<String>,
     candidates: Signal<Vec<Candidate>>,
-    /// 「这次改查询词是**选中**，不是打字」的一次性标记。见 `State::select`。
-    picked: Rc<Cell<bool>>,
+    /// 最近一次被「选中」写进查询框的词。见 `State::select`。
+    picked: Rc<RefCell<Option<String>>>,
     /// 结果区按词头分组的卡片。**结果区唯一的数据源**，见 `rebuild_cards`。
     cards: Signal<Vec<Card>>,
     /// 结果区的提示文案（未收录、请输入等）。
@@ -374,19 +380,19 @@ impl ExpandedStates {
 impl State {
     /// 选中一个词：填进查询框、查询，并**关掉候选浮层**。
     ///
-    /// 候选浮层、侧栏历史行、侧栏收藏行三处都走这里。它们此前各自写「`query.set` 然后
-    /// `lookup`」，于是都带上了同一个毛病：`query.set` 无条件 bump 版本
-    /// （windui `signal.rs:149`），`Completer` 醒来拿新词重算补全，浮层于是又开了——
-    /// 而这次它盖住的正是刚查出来的结果。
+    /// 候选浮层与侧栏行两处都走这里（两个侧栏页签共用同一个 `side_row`）。它们此前
+    /// 各自写「`query.set` 然后 `lookup`」，于是都带上了同一个毛病：`query.set`
+    /// **无条件** bump 版本（windui `signal.rs:163`，没有任何值比较），`Completer`
+    /// 醒来拿新词重算补全，浮层于是又开了——而这次它盖住的正是刚查出来的结果。
     ///
-    /// 修法是给 `Completer` 一个一次性标记：这次改词是「选中」，不是「打字」。用
-    /// `Cell` 而非 `Signal`：它不该触发任何重建，只是同一帧内两段代码之间的一句交代。
+    /// 修法是记下「这次是选中，选的是哪个词」，由 `Completer` 比对后抑制一次补全。
+    /// 用 `RefCell` 而非 `Signal`：它不该触发任何重建，只是两段代码之间的一句交代。
     ///
-    /// 之所以不能靠「点完把 candidates 清空」了事——清空发生在事件回调里，而
-    /// `Completer::on_update` 在其后执行（windui 的响应式更新是事件后成批派发），
-    /// 清完立刻又被填回去。顺序在这里是决定性的。
+    /// 之所以不能靠「点完把 candidates 清空」了事——清空发生在事件回调里，而响应式
+    /// 更新在其后的 layout 期才成批派发（`core.rs:424` → `core.rs:370`），清完立刻
+    /// 又被填回去。顺序在这里是决定性的。
     fn select(&self, word: &str) {
-        self.picked.set(true);
+        *self.picked.borrow_mut() = Some(word.to_string());
         self.query.set(word.to_string());
         self.lookup(word);
     }
@@ -902,7 +908,7 @@ pub fn build(
         user,
         query: signal(String::new()),
         candidates: signal(Vec::new()),
-        picked: Rc::new(Cell::new(false)),
+        picked: Rc::new(RefCell::new(None)),
         cards: signal(Vec::new()),
         hint: signal(String::from("输入一个词开始查询")),
         side_tab: signal(TAB_HISTORY),
@@ -1222,9 +1228,11 @@ fn main_column(st: Rc<State>, unavailable: Option<String>) -> Element {
         // `width_match` 撑满横向、靠默认的 `Align::Start` 贴顶。
         .child(
             Element::stack()
-                .fill()
+                // 不写 `.fill()`：它的高度分量会立刻被 `weight` 覆盖（`weight` 在竖向
+                // 父容器里落到高度维），写了等于留一句死代码。
+                .width_match()
                 .weight(1.0)
-                .child(result_area(st.clone()).fill())
+                .child(result_area(st.clone()))
                 .child(candidate_panel(st)),
         )
 }
@@ -1680,7 +1688,12 @@ fn query_box(st: Rc<State>) -> Element {
 /// 下推 160px——用户正读着某词的释义，多打一个字母，正文就跳走了。补全是「我想拼的是
 /// 哪个词」的辅助，不该打断「这个词什么意思」的阅读。有道词典也是这么处理的。
 ///
-/// 代价是它会盖住结果区顶部。可以接受：候选存在的那一刻，用户的注意力本就在选词上。
+/// 代价不只是视觉遮挡——被盖住的区域**不可点击**（浮层不透明，本就不该穿透），含首张
+/// 卡片的收藏星标与结果区那一段的滚动条命中区；且指针停在浮层上时滚轮无响应，因为
+/// `result_area` 的滚动容器是浮层的**兄弟**而非祖先，冒泡到不了它。
+///
+/// 都可以接受：候选存在的那一刻，用户的注意力本就在选词上，而选中或清空都会立刻收起
+/// 浮层。滚轮那条也正是 `MAX_CANDIDATES` 收到 7 的理由之一——列表短到不需要滚。
 fn candidate_panel(st: Rc<State>) -> Element {
     let candidates = st.candidates;
     Element::col()
@@ -1693,9 +1706,15 @@ fn candidate_panel(st: Rc<State>) -> Element {
         .padding(6)
         // 投影是「浮起来」的唯一视觉依据——没有它，浮层和被盖住的正文会糊成一片。
         .shadow(Shadow::new(0.0, 6.0, 18.0, Color::rgba(0, 0, 0, 38)))
-        // `host_signal` 而非 `list_signal`：后者是 `scroll().fill()`，高度必须写死，
-        // 于是只有 2 条候选时浮层仍是一个 268px 的空盒子。`host_signal` 是普通 col，
-        // 高度随内容——候选几条，浮层就多高。全靠 `MAX_CANDIDATES` 收住上界。
+        // `host_signal` 而非 `list_signal`：后者是 `scroll().fill()`，高度只能写死，
+        // 于是候选少时浮层是个大半截空着的盒子。`host_signal` 是普通 col，高度随内容
+        // ——候选几条，浮层就多高。
+        //
+        // 它的容器虽是 `col().fill()`（高度 `Match`），但线性布局会把**主轴上的
+        // `Match` 降级为 `Wrap`**（`core.rs:547-552`，「避免单个子独占整条主轴」），
+        // 故在竖向父容器里高度确实随内容。这是框架写死并带回归测试的规则，不是巧合。
+        //
+        // 上界全靠 `MAX_CANDIDATES` 收住——浮层自己不设限高。
         .child(Element::host_signal(st.candidates, move |c: Candidate| {
             candidate_row(c, st.clone())
         }))
