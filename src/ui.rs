@@ -15,6 +15,8 @@
 //!
 //! 整条链只在有输入时才动，空闲时全部静止。
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use windui::core::{EventCtx, Widget};
@@ -85,6 +87,19 @@ const SERIF: &str = "Georgia";
 
 /// 词头字号。比正文大一个数量级——词头是这一屏的主角，其余都是它的注解。
 const HEADWORD_SIZE: f32 = 38.0;
+
+/// 正文行高倍数。
+///
+/// 1.7 是中文正文的常用值：CJK 字身方正、笔画密度高，按字体自带行距排出来会显得
+/// 拥挤。只施加在**会换行的多行文字**上（释义、义项）——音标、量词这类单行注解
+/// 用不上，给了反而平白拉高行盒。
+const BODY_LH: f32 = 1.7;
+
+/// 正文最大宽度。
+///
+/// 行太长时，眼睛从行尾回到下一行行首容易串行，长段落尤其明显。窗口拉宽后主列
+/// 会一直变宽，故需要一个上界把正文收在舒适的行长内——多出来的宽度宁可留白。
+const BODY_MAX_W: i32 = 640;
 
 /// 侧栏的一行。
 #[derive(Clone, PartialEq, Eq)]
@@ -160,6 +175,35 @@ struct State {
     revision: Signal<u64>,
     /// 需要**当场**告知用户的消息（目前只有收藏写入失败）。空串 = 无。
     notice: Signal<String>,
+    /// 可折叠区（当前只有「英英释义」）的展开态。
+    expanded: ExpandedStates,
+}
+
+/// 可折叠区的展开态集合，按键长期持有。
+///
+/// **必须活在元素树之外**。结果区的卡片会因收藏状态变化而整棵重建
+/// （`refresh_fav_flags` 写 `cards` → `host_signal` 全量重建），若像从前那样在
+/// `entry_view` 里就地 `signal(false)`，每次重建都新造一个信号、展开态归零——
+/// 用户看到的是「展开英英释义后点一下收藏，它自己收起来了」。
+///
+/// 这类 bug 换个控件是治不好的：无论用 `Element::collapsible` 还是富文本的折叠区，
+/// 只要展开态跟着元素树生灭，重建就会抹掉它。状态得比树活得久。
+///
+/// 单独成一个类型而非直接摊在 `State` 里，是为了能脱开词库单独验证——它的正确性
+/// 全在「同一个键必须拿到同一个信号」这一条上，而那与词典数据无关。
+#[derive(Default)]
+struct ExpandedStates(RefCell<HashMap<String, Signal<bool>>>);
+
+impl ExpandedStates {
+    /// 取某个键的展开态，没有则新建（默认折叠）。**同一键永远返回同一个信号**。
+    fn get(&self, key: &str) -> Signal<bool> {
+        if let Some(s) = self.0.borrow().get(key) {
+            return *s;
+        }
+        let s = signal(false);
+        self.0.borrow_mut().insert(key.to_string(), s);
+        s
+    }
 }
 
 impl State {
@@ -414,6 +458,7 @@ pub fn build(dict: OfflineDictionary, user: UserDataState, skin: Skin) -> Elemen
         side_rows: signal(Vec::new()),
         revision: signal(0),
         notice: signal(String::new()),
+        expanded: ExpandedStates::default(),
     });
     // 开屏即列出历史：侧栏空着会让人以为功能坏了。
     st.reload_side();
@@ -507,14 +552,10 @@ fn body(st: Rc<State>, unavailable: Option<String>, skin: &Skin) -> Element {
     Element::row()
         .fill()
         .cross(Align::Stretch)
+        // 栏间那条线是侧栏**自己的右边框**，不再是一个独立节点：单边边框不参与
+        // 布局，而 1px 色块要占一列，容器一改间距就得跟着调。
         .child(sidebar(st.clone(), skin))
-        .child(vrule(skin.theme.palette.divider))
         .child(main_column(st, unavailable).weight(1.0))
-}
-
-/// 竖直细线。windui 的 `Element::divider()` 只有横向一种，竖向需自己拼。
-fn vrule(color: Color) -> Element {
-    Element::leaf().width(1).height_match().bg(color)
 }
 
 /// 侧栏：历史 / 收藏两个页签 + 列表。
@@ -526,6 +567,8 @@ fn sidebar(st: Rc<State>, skin: &Skin) -> Element {
         .width(224)
         .height_match()
         .bg(skin.panel)
+        .border_role(Role::Divider, 1)
+        .border_edges(Edges::RIGHT)
         // 列表驱动器：零尺寸、不可见，须先于列表注册（on_update 按注册顺序广播，
         // 而注册顺序是 `Element::build` 的深度优先前序，即书写顺序）。
         //
@@ -709,11 +752,14 @@ fn result_area(st: Rc<State>) -> Element {
                 .width_match(),
         )
         .child(
-            Element::scroll()
-                .fill()
-                .child(Element::host_signal(cards, move |c: Card| {
-                    card_view(c, st.clone())
-                })),
+            Element::scroll().fill().child(
+                Element::host_signal(cards, move |c: Card| card_view(c, st.clone()))
+                    .width_match()
+                    // 正文限宽：窗口拉得再宽，行长也收在可读范围内，多出来的
+                    // 宽度留白。限宽在测量前生效，故释义是**在 640 内换行**，
+                    // 不是排完再裁。
+                    .max_width(BODY_MAX_W),
+            ),
         )
 }
 
@@ -733,10 +779,12 @@ fn card_view(c: Card, st: Rc<State>) -> Element {
                     .fg_role(Role::Text)
                     .weight(1.0),
             )
-            .child(star(c.fav, hw, st)),
+            .child(star(c.fav, hw.clone(), st.clone())),
     );
-    for e in c.entries {
-        col = col.child(entry_view(e));
+    for (i, e) in c.entries.into_iter().enumerate() {
+        // 键带序号：同一词头下可能有多条词条（多音字），各自的折叠区应能分别开合。
+        let expanded = st.expanded.get(&format!("{hw}#{i}"));
+        col = col.child(entry_view(e, expanded));
     }
     col
 }
@@ -761,7 +809,7 @@ fn star(fav: bool, hw: Headword, st: Rc<State>) -> Element {
 ///
 /// **不含词头**——词头由 `card_view` 统一呈现在卡片头部，此处重复一遍是噪音；
 /// 多音字（一个词头、多条词条）尤其明显，会把同一个词连打好几遍。
-fn entry_view(e: Entry) -> Element {
+fn entry_view(e: Entry, expanded: Signal<bool>) -> Element {
     match e {
         Entry::English(x) => {
             let mut col = Element::col().spacing(8).width_match();
@@ -793,14 +841,21 @@ fn entry_view(e: Entry) -> Element {
             // 中文释义为主，默认展示（ECDICT 的 translation 字段）。放大一档：它是
             // 用户查词时真正要读的那行字，不该与音标、量词等注解同等大小。
             if let Some(zh) = &x.zh_definition {
-                col = col.child(Element::label(zh.clone()).font_size(16.0).width_match());
+                col = col.child(
+                    Element::label(zh.clone())
+                        .font_size(16.0)
+                        .line_height(BODY_LH)
+                        .width_match(),
+                );
             }
             // 英英释义默认折叠，用户主动展开才可见——这是刻意的产品决定，非偷懒。
             if let Some(en) = &x.en_definition {
                 col = col.child(Element::collapsible(
                     "英英释义",
-                    signal(false),
-                    Element::label(en.clone()).width_match(),
+                    expanded,
+                    Element::label(en.clone())
+                        .width_match()
+                        .line_height(BODY_LH),
                 ));
             }
             col
@@ -828,6 +883,7 @@ fn entry_view(e: Entry) -> Element {
                 col = col.child(
                     Element::label(format!("{}. {}", i + 1, join(s)))
                         .font_size(16.0)
+                        .line_height(BODY_LH)
                         .width_match(),
                 );
             }
@@ -851,7 +907,7 @@ fn join(s: &Sense) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{group_by_headword, headwords_to_record};
+    use super::{group_by_headword, headwords_to_record, ExpandedStates};
     use crate::domain::{ChineseEntry, EnglishEntry, Entry, Headword, Inflections, Sense};
 
     fn 英汉(词头: &str) -> Entry {
@@ -944,5 +1000,29 @@ mod tests {
     #[test]
     fn 一无所获没有卡片() {
         assert!(group_by_headword(&[]).is_empty());
+    }
+
+    /// 展开态的**唯一**要害：同一个键必须拿到同一个信号。
+    ///
+    /// 从前展开态是在 `entry_view` 里就地 `signal(false)` 的，卡片一重建就换新信号、
+    /// 展开态归零——表现为「展开英英释义后点一下收藏，它自己收起来了」。本测试钉住
+    /// 的正是那次重建之后仍能取回同一个信号。
+    #[test]
+    fn 同一键取回同一个展开态() {
+        let states = ExpandedStates::default();
+        let a = states.get("make#0");
+        a.set(true);
+        // 模拟卡片重建：重新取一次。
+        let b = states.get("make#0");
+        assert!(b.get(), "重建后展开态应当保持");
+    }
+
+    /// 不同词条各自开合，互不影响（多音字一个词头、多条词条）。
+    #[test]
+    fn 不同键的展开态互不影响() {
+        let states = ExpandedStates::default();
+        states.get("行#0").set(true);
+        assert!(states.get("行#0").get());
+        assert!(!states.get("行#1").get(), "另一条词条不该被带着展开");
     }
 }
