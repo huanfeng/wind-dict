@@ -15,7 +15,7 @@
 //!
 //! 整条链只在有输入时才动，空闲时全部静止。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -33,7 +33,13 @@ use crate::store::userdata::{now_secs, UserDataState};
 /// 单字母前缀（如 `a`）会命中约 5 万行，且 `ORDER BY frq` 用不上索引（索引在
 /// `(sw, word)` 上），SQLite 必须全排一遍——实测约 20ms。LIMIT 不减少排序量，
 /// 但它是唯一能钳住内存与渲染开销的地方。
-const MAX_CANDIDATES: usize = 20;
+/// 候选浮层最多列几条。
+///
+/// 20 条曾是「反正能滚」的产物，但浮层不带滚动条（高度随内容），且**没有键盘游标**
+/// （↑↓ 传不进来，见 `docs/upstream-keyboard-path.md`），滚动只能靠鼠标——那还不如
+/// 不列。7 条与有道词典的候选条数相当，且 7×38+12 的浮层高度在 620px 窗口里盖不住
+/// 结果区太多。补全是缩小范围的工具，不是穷举词表。
+const MAX_CANDIDATES: usize = 7;
 
 /// 监视查询词、驱动补全的响应式控件。
 ///
@@ -44,6 +50,8 @@ struct Completer {
     dict: Rc<OfflineDictionary>,
     query: Signal<String>,
     candidates: Signal<Vec<Candidate>>,
+    /// 查询词是被「选中」改的而非打字改的。见 `State::select`。
+    picked: Rc<Cell<bool>>,
     /// 上次见到的查询词版本。
     last_version: u64,
 }
@@ -55,6 +63,14 @@ impl Widget for Completer {
             return;
         }
         self.last_version = v;
+
+        // 选中而来的改词：收起浮层，不再补全。用户已经确定要哪个词了，此刻还列出
+        // 一串以它为前缀的别的词，只会盖住刚查出来的结果。**标记取一次即清**，
+        // 下一次真打字照常补全。
+        if self.picked.replace(false) {
+            self.candidates.set(Vec::new());
+            return;
+        }
 
         // 补全**永远由离线词典驱动**，与用户选中哪个查询源无关——补全需要词表，
         // 而词表只有词典有（译源没有词库，不知道世上存在哪些词）。见术语表「补全」。
@@ -277,6 +293,8 @@ struct State {
     user: UserDataState,
     query: Signal<String>,
     candidates: Signal<Vec<Candidate>>,
+    /// 「这次改查询词是**选中**，不是打字」的一次性标记。见 `State::select`。
+    picked: Rc<Cell<bool>>,
     /// 结果区按词头分组的卡片。**结果区唯一的数据源**，见 `rebuild_cards`。
     cards: Signal<Vec<Card>>,
     /// 结果区的提示文案（未收录、请输入等）。
@@ -354,6 +372,25 @@ impl ExpandedStates {
 }
 
 impl State {
+    /// 选中一个词：填进查询框、查询，并**关掉候选浮层**。
+    ///
+    /// 候选浮层、侧栏历史行、侧栏收藏行三处都走这里。它们此前各自写「`query.set` 然后
+    /// `lookup`」，于是都带上了同一个毛病：`query.set` 无条件 bump 版本
+    /// （windui `signal.rs:149`），`Completer` 醒来拿新词重算补全，浮层于是又开了——
+    /// 而这次它盖住的正是刚查出来的结果。
+    ///
+    /// 修法是给 `Completer` 一个一次性标记：这次改词是「选中」，不是「打字」。用
+    /// `Cell` 而非 `Signal`：它不该触发任何重建，只是同一帧内两段代码之间的一句交代。
+    ///
+    /// 之所以不能靠「点完把 candidates 清空」了事——清空发生在事件回调里，而
+    /// `Completer::on_update` 在其后执行（windui 的响应式更新是事件后成批派发），
+    /// 清完立刻又被填回去。顺序在这里是决定性的。
+    fn select(&self, word: &str) {
+        self.picked.set(true);
+        self.query.set(word.to_string());
+        self.lookup(word);
+    }
+
     /// 执行查询。**只在查询词确定时调用**（选中候选），不逐键触发——见术语表「补全」：
     /// 补全回答「我想拼的是哪个词」，查询回答「这个词什么意思」，是两个动作。
     fn lookup(&self, word: &str) {
@@ -848,6 +885,7 @@ pub fn build(
         user,
         query: signal(String::new()),
         candidates: signal(Vec::new()),
+        picked: Rc::new(Cell::new(false)),
         cards: signal(Vec::new()),
         hint: signal(String::from("输入一个词开始查询")),
         side_tab: signal(TAB_HISTORY),
@@ -1098,8 +1136,7 @@ fn side_row(r: SideRow, st: Rc<State>) -> Element {
         .spacing(10)
         .clickable()
         .on_click(move |_ctx| {
-            pick_st.query.set(pick_word.clone());
-            pick_st.lookup(&pick_word);
+            pick_st.select(&pick_word);
         });
     if active {
         row = row.bg_role_alpha(Role::Accent, ACCENT_SOFT_A);
@@ -1144,6 +1181,7 @@ fn main_column(st: Rc<State>, unavailable: Option<String>) -> Element {
                     dict: st.dict.clone(),
                     query: st.query,
                     candidates: st.candidates,
+                    picked: st.picked.clone(),
                     last_version: st.query.version(),
                 })
                 .height(0),
@@ -1165,10 +1203,19 @@ fn main_column(st: Rc<State>, unavailable: Option<String>) -> Element {
                 .font_size(16.0),
         )
         .child(notice_bar(st.notice))
-        .child(candidate_list(st.clone()))
         // 此处原有一条分隔线。拿掉了：候选区收起后它就紧贴查询框，把主列切成两截，
         // 而它要分隔的两样东西（候选、结果）本就不会同时是空的。区域感交给留白。
-        .child(result_area(st))
+        //
+        // 结果与候选叠在一起：结果铺满，候选浮在其上、顶端对齐。`Layout::Frame` 用
+        // 单个 `align` 同时定横纵（windui `core.rs:arrange_frame`），故候选靠
+        // `width_match` 撑满横向、靠默认的 `Align::Start` 贴顶。
+        .child(
+            Element::stack()
+                .fill()
+                .weight(1.0)
+                .child(result_area(st.clone()).fill())
+                .child(candidate_panel(st)),
+        )
 }
 
 /// 设置页。
@@ -1581,34 +1628,75 @@ fn unavailable_bar(why: &str) -> Element {
         .width_match()
 }
 
-/// 候选列表：点一条即「确定查询词」，触发查询。
-fn candidate_list(st: Rc<State>) -> Element {
+/// 候选浮层：点一条即「确定查询词」，触发查询。
+///
+/// **浮在结果之上，不占布局流**。此前它是主列 col 里的一段定高区，出现时把整个结果区
+/// 下推 160px——用户正读着某词的释义，多打一个字母，正文就跳走了。补全是「我想拼的是
+/// 哪个词」的辅助，不该打断「这个词什么意思」的阅读。有道词典也是这么处理的。
+///
+/// 代价是它会盖住结果区顶部。可以接受：候选存在的那一刻，用户的注意力本就在选词上。
+fn candidate_panel(st: Rc<State>) -> Element {
     let candidates = st.candidates;
-    Element::list_signal(
-        st.candidates,
-        |c: &Candidate| c.headword.as_str().to_string(),
-        move |c: Candidate| {
-            let st = st.clone();
-            let word = c.headword.as_str().to_string();
-            let label = match &c.preview {
-                Some(p) => format!("{}   {}", c.headword, p),
-                None => c.headword.to_string(),
-            };
-            Element::nav_row(label).on_click(move |_ctx| {
-                // 选中候选 = 查询词确定 → 此刻才查询源出场。
-                st.query.set(word.clone());
-                st.lookup(&word);
-            })
-        },
-    )
-    .height(160)
-    .width_match()
-    // 没有候选时**整块收起**，而不是留一条 160px 的空白带。
-    //
-    // `visible_when` 会让 `measure` 直接返回 `Size::ZERO`（windui `core.rs` 的
-    // measure 开头就短路），故这里是真的不占位，不是画成透明。开屏时这一条空白
-    // 曾占去窗口近四成高度，是界面显得空荡的主要来源。
-    .visible_when(move || !candidates.get().is_empty())
+    Element::col()
+        .width_match()
+        // 浮层要**不透明**才盖得住下面的正文。用 Surface 而非 Bg：浮层比底板高一层，
+        // 三套皮肤里 surface 都比 bg 略亮（深色皮肤则略浅），正好表达这层高度差。
+        .bg_role(Role::Surface)
+        .border_role(Role::Border, 1)
+        .corner(12.0)
+        .padding(6)
+        // 投影是「浮起来」的唯一视觉依据——没有它，浮层和被盖住的正文会糊成一片。
+        .shadow(Shadow::new(0.0, 6.0, 18.0, Color::rgba(0, 0, 0, 38)))
+        // `host_signal` 而非 `list_signal`：后者是 `scroll().fill()`，高度必须写死，
+        // 于是只有 2 条候选时浮层仍是一个 268px 的空盒子。`host_signal` 是普通 col，
+        // 高度随内容——候选几条，浮层就多高。全靠 `MAX_CANDIDATES` 收住上界。
+        .child(Element::host_signal(st.candidates, move |c: Candidate| {
+            candidate_row(c, st.clone())
+        }))
+        // 没有候选时**整块收起**。`visible_when` 会让 `measure` 直接返回 `Size::ZERO`
+        // （windui `core.rs` 的 measure 开头就短路），故是真的不占位，不是画成透明。
+        .visible_when(move || !candidates.get().is_empty())
+}
+
+/// 候选浮层的一行：词头 + 释义摘要。
+///
+/// 不用 `Element::nav_row`——它是「带 chevron 的钻入行」（windui `ui/nav.rs`），而 `›`
+/// 的语义是「进到下一层去」。点候选并不进入任何子页，只是把词填进查询框并查询，人还在
+/// 原地。这与 `side_row` 那里拒绝 `nav_row` 是同一条理由，此处此前漏了。
+fn candidate_row(c: Candidate, st: Rc<State>) -> Element {
+    let word = c.headword.as_str().to_string();
+    let pick = word.clone();
+    let mut row = Element::row()
+        .width_match()
+        .height(38)
+        .cross(Align::Center)
+        .corner(9.0)
+        .padding_xy(12, 0)
+        .spacing(12)
+        .clickable()
+        .on_click(move |_ctx| {
+            // 选中候选 = 查询词确定 → 此刻才查询源出场，且浮层收起。
+            st.select(&pick);
+        })
+        .child(
+            Element::label(word)
+                .font_size(14.0)
+                .font_weight(500)
+                .fg_role(Role::Text),
+        );
+    // 释义摘要单行截断：它是判断「是不是我要的那个词」的依据，不是正文。让它换行会把
+    // 行高撑开，一屏就列不下几条了——而候选列表的价值恰恰在于一眼扫过多条。
+    if let Some(p) = c.preview {
+        row = row.child(
+            Element::label(p)
+                .font_size(13.0)
+                .fg_role(Role::TextMuted)
+                .max_lines(1)
+                .truncate(Truncate::End)
+                .weight(1.0),
+        );
+    }
+    row
 }
 
 /// 结果区：提示 + 词头卡片。
