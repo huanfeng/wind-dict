@@ -91,7 +91,7 @@ const PAGE_SETTINGS: usize = 1;
 const SERIF: &str = "Georgia";
 
 /// 词头字号。比正文大一个数量级——词头是这一屏的主角，其余都是它的注解。
-const HEADWORD_SIZE: f32 = 38.0;
+const HEADWORD_SIZE: f32 = 42.0;
 
 /// 正文行高倍数。
 ///
@@ -241,6 +241,9 @@ struct State {
     notice: Signal<String>,
     /// 可折叠区（当前只有「英英释义」）的展开态。
     expanded: ExpandedStates,
+    /// 皮肤。界面自绘处（选中淡底等）要用，那些色在 windui 的 `Role` 里没有对应项
+    /// （ADR-0012）。
+    skin: Skin,
     /// 主列当前页：词典 / 设置。
     page: Signal<usize>,
     /// 当前设置。界面上的各个控件绑到它的分量信号，改动经 `save_settings` 落库。
@@ -579,6 +582,14 @@ impl State {
         }
     }
 
+    /// 当前展示的第一个词头，供侧栏标出「你正在看的是这条」。
+    fn current_headword(&self) -> Option<String> {
+        self.cards
+            .get()
+            .first()
+            .map(|c| c.headword.as_str().to_string())
+    }
+
     /// 历史与收藏的条数，供设置页如实显示「要清掉多少」。
     fn counts(&self) -> (usize, usize) {
         let UserDataState::Ready(u) = &self.user else {
@@ -760,6 +771,7 @@ pub fn build(dict: OfflineDictionary, user: UserDataState, skin: Skin) -> Elemen
         revision: signal(0),
         notice: signal(String::new()),
         expanded: ExpandedStates::default(),
+        skin: skin.clone(),
         page: signal(PAGE_DICT),
         settings: RefCell::new(settings),
         settings_note: signal(String::new()),
@@ -896,9 +908,9 @@ fn sidebar(st: Rc<State>, skin: &Skin) -> Element {
             Element::tabs(
                 st.side_tab,
                 vec![
-                    ("历史", side_list(st.clone())),
+                    ("历史", side_list(st.clone(), skin.clone())),
                     // 术语表弃用「生词本」，见 `TAB_HISTORY` 处的说明。
-                    ("收藏", side_list(st.clone())),
+                    ("收藏", side_list(st.clone(), skin.clone())),
                 ],
             )
             .fill()
@@ -922,7 +934,20 @@ fn settings_entry(st: Rc<State>) -> Element {
         .border_edges(Edges::TOP)
         .clickable()
         .on_click(move |_ctx| page.set(PAGE_SETTINGS))
-        .child(Element::label("设置").font_size(13.0).fg_role(Role::Text))
+        .child(
+            Element::label("设置")
+                .font_size(13.0)
+                .font_weight(500)
+                .fg_role(Role::Text)
+                .weight(1.0),
+        )
+        // 收藏计数：设计稿此处是「142 词」。它不只是装饰——收藏是慢慢攒起来的，
+        // 一个数字能让人知道自己攒了多少，也顺带说明这个入口后面有内容。
+        .child(
+            Element::label(format!("{} 词", st.counts().1))
+                .font_size(12.0)
+                .fg_role(Role::TextDisabled),
+        )
 }
 
 /// 主列：词典页与设置页叠在一起，按 `page` 切换。
@@ -957,11 +982,11 @@ fn pages(st: Rc<State>, unavailable: Option<String>) -> Element {
 /// 传给 `list_signal` 的 key 函数当前是**死参数**：windui 的形参名为 `_key_fn`，
 /// 内部做全量重建，没有 keyed diff。传它是为将来上游补齐后自动生效，别据此以为
 /// 行有稳定身份（hover / 滚动位置在重建时都会丢）。
-fn side_list(st: Rc<State>) -> Element {
+fn side_list(st: Rc<State>, skin: Skin) -> Element {
     Element::list_signal(
         st.side_rows,
         |r: &SideRow| r.headword.as_str().to_string(),
-        move |r: SideRow| side_row(r, st.clone()),
+        move |r: SideRow| side_row(r, st.clone(), &skin),
     )
     .fill()
 }
@@ -970,32 +995,48 @@ fn side_list(st: Rc<State>) -> Element {
 ///
 /// 不用 `Element::nav_row`：它自带的 `›` 是「钻入子页」的语义，而这里点一行的动作是
 /// 「查这个词」，查完人还在原地。图标与语义不符会让人误以为侧边还有一层。
-fn side_row(r: SideRow, st: Rc<State>) -> Element {
+fn side_row(r: SideRow, st: Rc<State>, skin: &Skin) -> Element {
     let word = r.headword.as_str().to_string();
+    // 选中态标出「你正在看的是这条」——设计稿的圆点与淡底不是纯装饰，它回答了
+    // 「我刚点的是哪个」这个问题，尤其在历史列表里滚动之后。
+    let active = st.current_headword().as_deref() == Some(word.as_str());
     let (pick_st, del_st) = (st.clone(), st);
     let (pick_word, del_hw) = (word.clone(), r.headword.clone());
-    Element::row()
+    let mut row = Element::row()
         .width_match()
         .height(36)
         .cross(Align::Center)
-        .corner(8.0)
-        .padding_xy(10, 0)
+        .corner(9.0)
+        .padding_xy(12, 0)
+        .spacing(10)
         .clickable()
         .on_click(move |_ctx| {
             pick_st.query.set(pick_word.clone());
             pick_st.lookup(&pick_word);
-        })
-        .child(
-            Element::label(word)
-                .font_size(13.5)
-                .fg_role(Role::Text)
-                .weight(1.0),
-        )
-        .child(
-            Element::icon_button("×")
-                .fg_role(Role::TextMuted)
-                .on_click(move |_ctx| del_st.remove_side_row(&del_hw)),
-        )
+        });
+    if active {
+        row = row.bg(skin.accent_soft);
+    }
+    row.child(
+        // 圆点：6px，选中时用强调色。
+        Element::leaf().size(6, 6).corner(3.0).bg_role(if active {
+            Role::Accent
+        } else {
+            Role::TextDisabled
+        }),
+    )
+    .child(
+        Element::label(word)
+            .font_size(14.0)
+            .font_weight(if active { 600 } else { 500 })
+            .fg_role(if active { Role::Text } else { Role::TextMuted })
+            .weight(1.0),
+    )
+    .child(
+        Element::icon_button("×")
+            .fg_role(Role::TextDisabled)
+            .on_click(move |_ctx| del_st.remove_side_row(&del_hw)),
+    )
 }
 
 /// 主列：查询框 + 补全候选 + 结果。
@@ -1028,7 +1069,14 @@ fn main_column(st: Rc<State>, unavailable: Option<String>) -> Element {
         // 设计稿此处的查询框右侧有一组 `Ctrl` `K` 键帽，未照做：本项目的唤起热键是
         // Ctrl+Alt+D（`main.rs`），而窗口内并没有 Ctrl+K 这个键位。画一组按了没用的
         // 键帽比不画更糟。
-        .child(Element::text_input(st.query, "输入中文或英文…").width_match())
+        // 50px 高、12 圆角：查询框是这一屏的主控件，与设计稿一致地给足分量。
+        .child(
+            Element::text_input(st.query, "输入中文或英文…")
+                .width_match()
+                .height(50)
+                .corner(12.0)
+                .font_size(16.0),
+        )
         .child(notice_bar(st.notice))
         .child(candidate_list(st.clone()))
         // 此处原有一条分隔线。拿掉了：候选区收起后它就紧贴查询框，把主列切成两截，
@@ -1257,8 +1305,8 @@ fn skin_cards(st: Rc<State>) -> Element {
 /// 皮肤预览色块。
 fn swatch_chip(c: Color) -> Element {
     Element::leaf()
-        .size(18, 18)
-        .corner(4.0)
+        .size(22, 22)
+        .corner(6.0)
         .bg(c)
         .border_role(Role::Border, 1)
 }
@@ -1482,8 +1530,11 @@ fn card_view(c: Card, st: Rc<State>) -> Element {
     let mut col = Element::col().spacing(10).width_match().padding_xy(0, 10);
     col = col.child(
         Element::row()
-            .cross(Align::Center)
+            // 顶对齐而非居中：星标是 42px 方块，与 42px 的词头居中对齐会让它掉到
+            // 词头视觉重心之下（词头有下伸部，实际占位高于字面）。
+            .cross(Align::Start)
             .width_match()
+            .spacing(14)
             .child(
                 Element::label(hw.to_string())
                     .font_size(HEADWORD_SIZE)
@@ -1493,16 +1544,21 @@ fn card_view(c: Card, st: Rc<State>) -> Element {
             )
             .child(star(c.fav, hw.clone(), st.clone())),
     );
-    // 备注只在已收藏时出现：它是书签的附加信息，没收藏就没有可附着的东西。
-    if c.fav {
-        col = col.child(note_field(hw.clone(), st.clone()));
-    }
+    // 词头区与释义区之间的分隔线，与设计稿一致。两者是不同层次的信息——上面回答
+    // 「这是哪个词」，下面回答「它什么意思」，一条线比单纯拉开间距更能说明这件事。
+    col = col.child(Element::divider());
     for (i, e) in c.entries.into_iter().enumerate() {
         // 键带序号：同一词头下可能有多条词条（多音字），各自的折叠区应能分别开合。
         let expanded = st
             .expanded
             .get(&format!("{hw}#{i}"), st.settings.borrow().expand_en);
         col = col.child(entry_view(e, expanded));
+    }
+    // 备注排在最后：它是用户**附加**给这个词的东西，不该插进词典自身的内容里打断
+    // 「词头 → 音标 → 释义」这条阅读顺序。只在已收藏时出现——没收藏就没有可附着的
+    // 书签。
+    if c.fav {
+        col = col.child(note_field(hw, st));
     }
     col
 }
@@ -1536,9 +1592,30 @@ fn note_field(hw: Headword, st: Rc<State>) -> Element {
 
 /// 收藏星标。实心 = 已收藏。
 fn star(fav: bool, hw: Headword, st: Rc<State>) -> Element {
-    Element::icon_button(if fav { "★" } else { "☆" })
-        .fg_role(if fav { Role::Accent } else { Role::TextMuted })
-        .on_click(move |_ctx| st.toggle_favorite(&hw))
+    // 42×42 的带边框方块，而非一个裸图标：收藏是这一屏唯一的写操作，给它一个明确的
+    // 可点区域。已收藏时填淡底 + 强调色实心星，未收藏是空心星，两态一眼可辨。
+    let skin = st.skin.clone();
+    let mut btn = Element::row()
+        .size(42, 42)
+        .cross(Align::Center)
+        .corner(11.0)
+        .border_role(if fav { Role::Accent } else { Role::Border }, 1)
+        .clickable()
+        .on_click(move |_ctx| st.toggle_favorite(&hw));
+    if fav {
+        btn = btn.bg(skin.accent_soft);
+    }
+    btn.child(
+        Element::label(if fav { "★" } else { "☆" })
+            .font_size(19.0)
+            .width_match()
+            .text_align(Align::Center)
+            .fg_role(if fav {
+                Role::Accent
+            } else {
+                Role::TextDisabled
+            }),
+    )
 }
 
 /// 词条视图。
@@ -1588,7 +1665,8 @@ fn entry_view(e: Entry, expanded: Signal<bool>) -> Element {
             if let Some(zh) = &x.zh_definition {
                 col = col.child(
                     Element::label(zh.clone())
-                        .font_size(16.0)
+                        .font_size(18.0)
+                        .font_weight(500)
                         .line_height(BODY_LH)
                         .width_match(),
                 );
@@ -1627,7 +1705,8 @@ fn entry_view(e: Entry, expanded: Signal<bool>) -> Element {
             for (i, s) in x.senses.iter().enumerate() {
                 col = col.child(
                     Element::label(format!("{}. {}", i + 1, join(s)))
-                        .font_size(16.0)
+                        .font_size(18.0)
+                        .font_weight(500)
                         .line_height(BODY_LH)
                         .width_match(),
                 );
