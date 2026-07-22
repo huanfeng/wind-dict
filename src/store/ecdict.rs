@@ -9,7 +9,9 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, Row};
 
-use crate::domain::{Candidate, EnglishEntry, Entry, Headword, Inflections, Lookup, Query};
+use crate::domain::{
+    Candidate, EnglishEntry, Entry, Headword, InflectionKind, Inflections, Lookup, Query,
+};
 
 /// 自建英汉词库的表结构。**构建工具与测试共用此定义**。
 ///
@@ -217,14 +219,13 @@ fn parse_exchange(s: &str) -> Inflections {
         if value.is_empty() {
             continue;
         }
-        match code {
-            "0" => out.base_form = Some(Headword::from_store(value)),
-            "p" | "d" | "i" | "3" | "r" | "t" | "s" => {
-                out.derived.push(Headword::from_store(value));
-            }
-            // "1" 及未知码：丢弃。
-            _ => {}
+        if code == "0" {
+            out.base_form = Some(Headword::from_store(value));
+        } else if let Some(kind) = InflectionKind::from_code(code) {
+            // 种类随词一起留下：界面要说的是「made 是过去式」，只留词说不出这句话。
+            out.derived.push((kind, Headword::from_store(value)));
         }
+        // "1"（变换类型标记）及未知码：丢弃。
     }
     out
 }
@@ -387,7 +388,11 @@ mod tests {
     fn 忽略畸形与未知码() {
         let inf = parse_exchange("garbage/9:x/0:/p:ran");
         assert!(inf.base_form.is_none(), "0 的值为空应被丢弃");
-        assert_eq!(inf.derived, vec![Headword::from_store("ran")]);
+        assert_eq!(
+            inf.derived,
+            vec![(InflectionKind::Past, Headword::from_store("ran"))],
+            "形态种类须随词保留"
+        );
     }
 
     // ── 补全 ──────────────────────────────────────────────

@@ -1660,16 +1660,18 @@ fn entry_view(e: Entry, expanded: Signal<bool>) -> Element {
                 }
                 col = col.child(meta);
             }
-            // 中文释义为主，默认展示（ECDICT 的 translation 字段）。放大一档：它是
-            // 用户查词时真正要读的那行字，不该与音标、量词等注解同等大小。
+            // 词形变化：made / making / makes 这些数据一直躺在库里，界面上却一个字
+            // 都没有。ADR-0001 当初选 ECDICT，理由之一正是它自带 `exchange`——只用在
+            // 查询路径（查 tried 跟随到 try）而不展示，等于这份数据只兑现了一半。
+            if !x.inflections.derived.is_empty() {
+                col = col.child(inflection_row(&x.inflections.derived));
+            }
+            // 中文释义按词性分节呈现。整块塞进一个 label 会让 `vt.` `n.` 沦为混在
+            // 中文里的普通字符，所有信息挤在同一层次——那正是「看着像一坨文本」的来源。
             if let Some(zh) = &x.zh_definition {
-                col = col.child(
-                    Element::label(zh.clone())
-                        .font_size(18.0)
-                        .font_weight(500)
-                        .line_height(BODY_LH)
-                        .width_match(),
-                );
+                for g in crate::domain::parse_glosses(zh) {
+                    col = col.child(gloss_row(&g));
+                }
             }
             // 英英释义默认折叠，用户主动展开才可见——这是刻意的产品决定，非偷懒。
             if let Some(en) = &x.en_definition {
@@ -1722,6 +1724,62 @@ fn entry_view(e: Entry, expanded: Signal<bool>) -> Element {
             col
         }
     }
+}
+
+/// 一组同词性的释义：词性胶囊 + 释义正文。
+fn gloss_row(g: &crate::domain::Gloss) -> Element {
+    let mut row = Element::row().width_match().cross(Align::Start).spacing(10);
+    if let Some(pos) = &g.pos {
+        row = row.child(pos_chip(pos));
+    }
+    row.child(
+        // 释义之间用顿号而非原文的逗号：中文并列用顿号，且与释义内部可能出现的
+        // 逗号区分得开。
+        Element::label(g.senses.join("、"))
+            .font_size(18.0)
+            .font_weight(500)
+            .line_height(BODY_LH)
+            .weight(1.0),
+    )
+}
+
+/// 词性胶囊。
+fn pos_chip(pos: &str) -> Element {
+    Element::label(pos)
+        .font_size(12.5)
+        .font_weight(600)
+        .font_family(SERIF)
+        .fg_role(Role::Accent)
+        .border_role(Role::Border, 1)
+        .corner(6.0)
+        .padding_xy(8, 3)
+}
+
+/// 词形变化一排。
+fn inflection_row(derived: &[(crate::domain::InflectionKind, Headword)]) -> Element {
+    let mut row = Element::row().width_match().cross(Align::Center).spacing(8);
+    for (kind, hw) in derived {
+        row = row.child(
+            Element::row()
+                .cross(Align::Center)
+                .spacing(5)
+                .bg_role(Role::SurfaceAlt)
+                .corner(6.0)
+                .padding_xy(9, 4)
+                .child(
+                    Element::label(kind.label())
+                        .font_size(11.5)
+                        .fg_role(Role::TextMuted),
+                )
+                .child(
+                    Element::label(hw.to_string())
+                        .font_size(13.0)
+                        .font_weight(500)
+                        .fg_role(Role::Text),
+                ),
+        );
+    }
+    row
 }
 
 /// 义项内的多种措辞用 `;` 连回去——它们是同一含义的不同说法，不是不同义项。
