@@ -135,9 +135,9 @@ fn userdata_path() -> Result<PathBuf, String> {
 ///
 /// exe 同目录而非工作目录：常驻工具从托盘/热键启动时，工作目录是什么完全不可控。
 fn dict_paths(settings: &Settings) -> (PathBuf, PathBuf) {
-    let mut args = std::env::args().skip(1).filter(|a| !a.starts_with("--"));
-    if let (Some(a), Some(b)) = (args.next(), args.next()) {
-        return (PathBuf::from(a), PathBuf::from(b));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(pair) = positional_dicts(&args) {
+        return pair;
     }
     let dir = std::env::current_exe()
         .ok()
@@ -154,7 +154,63 @@ fn dict_paths(settings: &Settings) -> (PathBuf, PathBuf) {
     (ec, ce)
 }
 
+/// 命令行里那对词库路径。**命令行含任何开关时一律不认**，返回 `None`。
+///
+/// 此前是「滤掉 `--` 开头的项、剩下的头两个当词库」，而开关的**取值**长得与位置参数
+/// 一模一样：`--screenshot out.png --click 28 596` 剩下的是 `out.png`、`28`、`596`，
+/// 于是程序去把 `out.png` 当 SQLite 库打开，报「打开英汉词库失败：out.png」——症状与
+/// 起因隔了十万八千里，是最难认的那种。
+///
+/// 修法不采「逐个跳过带值开关」：那要求 wind-dict 记住上游有哪些开关、各带几个值
+/// （windui 的 `--click` 还可重复出现），上游每加一个开关这里就悄悄失效一次，而失效
+/// 的表现又是上面那条谜语。改判「有开关就整体不认」则与上游的开关表无关。
+///
+/// 两种用法本就不会同时出现：位置参数是开发期临时指定词库（`wind-dict a.db b.db`），
+/// 开关全都走截图与调试路径。
+fn positional_dicts(args: &[String]) -> Option<(PathBuf, PathBuf)> {
+    if args.iter().any(|a| a.starts_with("--")) {
+        return None;
+    }
+    match args {
+        [a, b, ..] => Some((PathBuf::from(a), PathBuf::from(b))),
+        _ => None,
+    }
+}
+
 /// 托盘图标：16×16 纯色 RGBA8（占位，免捆绑资源文件）。
 fn icon() -> Vec<u8> {
     [0x4C, 0x8B, 0xF5, 0xFF].repeat(16 * 16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::positional_dicts;
+
+    fn 参数(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn 两个位置参数即一对词库() {
+        let got = positional_dicts(&参数(&["ec.db", "ce.db"]));
+        let (ec, ce) = got.expect("两个位置参数该认");
+        assert_eq!(ec.to_str(), Some("ec.db"));
+        assert_eq!(ce.to_str(), Some("ce.db"));
+    }
+
+    /// 只给一个不成对——宁可回退默认，也不拿它当英汉库、汉英库悬空。
+    #[test]
+    fn 单个位置参数不成对() {
+        assert!(positional_dicts(&参数(&["ec.db"])).is_none());
+    }
+
+    /// 这条是本函数存在的理由：截图开关的取值此前会被当成词库路径。
+    #[test]
+    fn 带开关时不认位置参数() {
+        assert!(positional_dicts(&参数(&["--screenshot", "out.png"])).is_none());
+        assert!(
+            positional_dicts(&参数(&["--screenshot", "out.png", "--click", "28", "596"])).is_none(),
+            "--click 的坐标不该被当成词库路径"
+        );
+    }
 }
