@@ -49,6 +49,11 @@ struct Completer {
     dict: Rc<OfflineDictionary>,
     query: Signal<String>,
     candidates: Signal<Vec<Candidate>>,
+    /// 键盘游标。换一批候选就归零——游标指的是「第几条」，而那批候选已经换人了，
+    /// 留着旧下标会让高亮停在一个与上次毫不相干的词上。
+    cursor: Signal<usize>,
+    /// 候选区重建计数。见 `State::bump_cands`。
+    cand_rev: Signal<Vec<u64>>,
     /// 最近一次被「选中」写进查询框的词。见 `State::select`。
     picked: Rc<RefCell<Option<String>>>,
     /// 上次见到的查询词版本。
@@ -76,6 +81,7 @@ impl Widget for Completer {
         // 那一击的候选被静默清空。存了词就对不上，抑制自然失效，打字照常补全。
         if self.picked.borrow_mut().take().as_deref() == Some(text.as_str()) {
             self.candidates.set(Vec::new());
+            self.reset_cursor();
             return;
         }
 
@@ -86,6 +92,16 @@ impl Widget for Completer {
             .complete(&text, MAX_CANDIDATES)
             .unwrap_or_default();
         self.candidates.set(list);
+        self.reset_cursor();
+    }
+}
+
+impl Completer {
+    /// 游标归零并让候选区重建。两件事必须一起做：游标是构建期读的，只改信号不重建，
+    /// 高亮会停在上一批候选的位置上。
+    fn reset_cursor(&self) {
+        self.cursor.set(0);
+        bump(self.cand_rev);
     }
 }
 
@@ -290,6 +306,16 @@ impl Widget for HotkeyEditor {
     }
 }
 
+/// 让绑在这个信号上的 `host_signal` 整体重建一次。
+///
+/// windui 的 `host_signal` 收 `Signal<Vec<T>>`、对**每个元素**调一次构建回调，故拿一个
+/// **单元素** Vec 装计数即可表达「整体重建一次」。设置页与候选区共用这个手法：两处都有
+/// 构建期求值的东西（选中环、词库路径 / 候选高亮），信号一改就得整块重来。
+fn bump(rev: Signal<Vec<u64>>) {
+    let n = rev.get().first().copied().unwrap_or(0);
+    rev.set(vec![n.wrapping_add(1)]);
+}
+
 /// 写一条消息条：语气与文本**同写**。
 ///
 /// 语气就是文字角色本身（`Role::Success` / `Role::Danger`），不再另立一个 `Tone` 枚举
@@ -314,6 +340,10 @@ struct State {
     user: UserDataState,
     query: Signal<String>,
     candidates: Signal<Vec<Candidate>>,
+    /// 候选列表的键盘游标（下标）。候选非空时恒指向其中一条。
+    cursor: Signal<usize>,
+    /// 候选区重建计数。游标是构建期读的，改了游标必须让这块整体重来，见 `bump`。
+    cand_rev: Signal<Vec<u64>>,
     /// 最近一次被「选中」写进查询框的词。见 `State::select`。
     picked: Rc<RefCell<Option<String>>>,
     /// 结果区按词头分组的卡片。**结果区唯一的数据源**，见 `rebuild_cards`。
@@ -418,6 +448,63 @@ impl State {
         *self.picked.borrow_mut() = Some(word.to_string());
         self.query.set(word.to_string());
         self.lookup(word);
+    }
+
+    /// 回车：确定查询词。
+    ///
+    /// 有候选就取游标那条，没有就直接查输入框里的字。两者都是术语表说的「查询词确定
+    /// 下来」——它明确列了「回车、选中候选、切换查询源」三种，回车在列。
+    ///
+    /// 空输入不查：`lookup` 对空串会走 `Query::new` 的 None 分支，把结果区清成
+    /// 「输入一个词开始查询」，等于用户按一下回车就把正在读的词条弄没了。
+    fn submit(&self) {
+        if let Some(c) = self.candidate_at_cursor() {
+            self.select(c.headword.as_str());
+            return;
+        }
+        let text = self.query.get();
+        if !text.trim().is_empty() {
+            self.lookup(&text);
+        }
+    }
+
+    /// 移动候选游标。`down` 为真下移，否则上移。
+    ///
+    /// **不环绕**。列表最多 7 条、全在眼前，环绕买不到什么；而在顶上按 ↑ 直接跳到末条
+    /// 是种惊吓——尤其它同时意味着「再按一下就选中最后那个词」。
+    fn move_cursor(&self, down: bool) {
+        let n = self.candidates.get().len();
+        if n == 0 {
+            return;
+        }
+        let i = self.cursor.get();
+        let next = if down {
+            (i + 1).min(n - 1)
+        } else {
+            i.saturating_sub(1)
+        };
+        if next != i {
+            self.cursor.set(next);
+            bump(self.cand_rev);
+        }
+    }
+
+    /// Tab：把游标那条候选填进查询框，**不查询**。
+    ///
+    /// 这是 shell 的补全语义——Tab 补全词，回车才执行。对词典而言尤其顺：把词补全整了
+    /// 再接着改（`make` → `maker`），比先查一次再回来改省一步。
+    fn accept_completion(&self) {
+        let Some(c) = self.candidate_at_cursor() else {
+            return;
+        };
+        // 不走 `select`：那会连查询一起做掉，且抑制掉后续补全。这里只改字，补全照常
+        // 跟上——补完的词往往还要再接着打（`make` 之后接 `r`）。
+        self.query.set(c.headword.as_str().to_string());
+    }
+
+    /// 游标当前指向的候选。候选为空、或游标越界时为 `None`。
+    fn candidate_at_cursor(&self) -> Option<Candidate> {
+        self.candidates.get().get(self.cursor.get()).cloned()
     }
 
     /// 清空查询框，回到开屏状态。
@@ -600,8 +687,7 @@ impl State {
     }
 
     fn bump_settings(&self) {
-        let n = self.settings_rev.get().first().copied().unwrap_or(0);
-        self.settings_rev.set(vec![n.wrapping_add(1)]);
+        bump(self.settings_rev);
     }
 
     fn save_settings(&self) -> bool {
@@ -965,6 +1051,8 @@ pub fn build(
         user,
         query: signal(String::new()),
         candidates: signal(Vec::new()),
+        cursor: signal(0),
+        cand_rev: signal(vec![0]),
         picked: Rc::new(RefCell::new(None)),
         cards: signal(Vec::new()),
         hint: signal(String::from("输入一个词开始查询")),
@@ -1307,6 +1395,8 @@ fn main_column(st: Rc<State>, unavailable: Option<String>) -> Element {
             Element::leaf()
                 .reactive()
                 .widget(Completer {
+                    cursor: st.cursor,
+                    cand_rev: st.cand_rev,
                     dict: st.dict.clone(),
                     query: st.query,
                     candidates: st.candidates,
@@ -1781,6 +1871,7 @@ fn unavailable_bar(why: &str) -> Element {
 /// 「右端居中」就是这么凑出来的，不是框架直接支持的对齐方式。
 fn query_box(st: Rc<State>) -> Element {
     let query = st.query;
+    let (submit_st, nav_st) = (st.clone(), st.clone());
     Element::stack()
         .width_match()
         .child(
@@ -1788,7 +1879,34 @@ fn query_box(st: Rc<State>) -> Element {
                 .width_match()
                 .height(50)
                 .corner(12.0)
-                .font_size(16.0),
+                .font_size(16.0)
+                // 唤起后焦点落在这里，并全选旧内容——常驻词典最高频的动作是「唤起 →
+                // 查另一个词」，而窗口只是被隐藏、上次的词原样还在框里。全选让下一个词
+                // 直接覆盖打上去，不用先删。
+                //
+                // 只在节点首次进入焦点环那一帧兑现（语义同 HTML 的 autofocus），故这是
+                // **进程起来后第一次唤起**的行为。第二次唤起若焦点从未离开过查询框，
+                // 不会重新全选——那需要一个 per-wake 钩子，windui 侧尚无，见
+                // `docs/upstream-windui-reply.md` 的「下一步」。
+                .autofocus_select_all()
+                .on_submit(move |_ctx| submit_st.submit())
+                .on_nav_key(move |_ctx, ev| match ev.key {
+                    Key::Down => {
+                        nav_st.move_cursor(true);
+                        true
+                    }
+                    Key::Up => {
+                        nav_st.move_cursor(false);
+                        true
+                    }
+                    // **Shift+Tab 必须放过**：吞掉它，用户除了鼠标就没有任何办法把焦点
+                    // 移出查询框了。只认裸 Tab。
+                    Key::Tab if !ev.shift => {
+                        nav_st.accept_completion();
+                        true
+                    }
+                    _ => false,
+                }),
         )
         .child(
             Element::row()
@@ -1839,8 +1957,19 @@ fn candidate_panel(st: Rc<State>) -> Element {
         // 故在竖向父容器里高度确实随内容。这是框架写死并带回归测试的规则，不是巧合。
         //
         // 上界全靠 `MAX_CANDIDATES` 收住——浮层自己不设限高。
-        .child(Element::host_signal(st.candidates, move |c: Candidate| {
-            candidate_row(c, st.clone())
+        // 绑重建计数而非 `candidates` 本身：行要知道自己的下标才能比对键盘游标，而
+        // windui 的列表回调只给 item 不给位置。改用「单元素 Vec 当触发器」这个手法
+        // （设置页同款，见 `bump`），一次回调里自己 `enumerate` 整张表。
+        //
+        // 游标一动也走这条重建：高亮底是构建期定的，只改信号不重建，高亮不会动。
+        // 候选最多 7 条，重建成本可忽略。
+        .child(Element::host_signal(st.cand_rev, move |_rev: u64| {
+            let mut col = Element::col().width_match();
+            let at = st.cursor.get();
+            for (i, c) in st.candidates.get().into_iter().enumerate() {
+                col = col.child(candidate_row(c, i == at, st.clone()));
+            }
+            col
         }))
         // 没有候选时**整块收起**。`visible_when` 会让 `measure` 直接返回 `Size::ZERO`
         // （windui `core.rs` 的 measure 开头就短路），故是真的不占位，不是画成透明。
@@ -1852,7 +1981,7 @@ fn candidate_panel(st: Rc<State>) -> Element {
 /// 不用 `Element::nav_row`——它是「带 chevron 的钻入行」（windui `ui/nav.rs`），而 `›`
 /// 的语义是「进到下一层去」。点候选并不进入任何子页，只是把词填进查询框并查询，人还在
 /// 原地。这与 `side_row` 那里拒绝 `nav_row` 是同一条理由，此处此前漏了。
-fn candidate_row(c: Candidate, st: Rc<State>) -> Element {
+fn candidate_row(c: Candidate, at_cursor: bool, st: Rc<State>) -> Element {
     let word = c.headword.as_str().to_string();
     let pick = word.clone();
     let mut row = Element::row()
@@ -1866,13 +1995,18 @@ fn candidate_row(c: Candidate, st: Rc<State>) -> Element {
         .on_click(move |_ctx| {
             // 选中候选 = 查询词确定 → 此刻才查询源出场，且浮层收起。
             st.select(&pick);
-        })
-        .child(
-            Element::label(word)
-                .font_size(14.0)
-                .font_weight(500)
-                .fg_role(Role::Text),
-        );
+        });
+    // 键盘游标所在的那条。与侧栏选中行同一套视觉（强调色淡底），因为回答的是同一个
+    // 问题：「回车会选中哪一条」。
+    if at_cursor {
+        row = row.bg_role_alpha(Role::Accent, ACCENT_SOFT_A);
+    }
+    row = row.child(
+        Element::label(word)
+            .font_size(14.0)
+            .font_weight(if at_cursor { 600 } else { 500 })
+            .fg_role(Role::Text),
+    );
     // 释义摘要单行截断：它是判断「是不是我要的那个词」的依据，不是正文。让它换行会把
     // 行高撑开，一屏就列不下几条了——而候选列表的价值恰恰在于一眼扫过多条。
     if let Some(p) = c.preview {
