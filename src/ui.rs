@@ -278,9 +278,7 @@ impl Widget for HotkeyEditor {
             .next()
             .filter(|c| c.is_ascii_alphanumeric())
         else {
-            self.st
-                .settings_note
-                .set("热键的主键请填一个字母或数字".into());
+            self.st.note_err("热键的主键请填一个字母或数字");
             return;
         };
         self.st.set_hotkey(crate::settings::HotkeySpec {
@@ -289,6 +287,52 @@ impl Widget for HotkeyEditor {
             shift: self.shift.get(),
             key: c.to_ascii_uppercase(),
         });
+    }
+}
+
+/// 设置页消息条的语气。
+///
+/// 与文本分两个信号存，但**必须同写**——此前整条消息条恒为 `Role::Danger`，于是
+/// 「历史记录已清空」「唤起热键已改为 Ctrl+D」这类成功回执也染成红色，看着像出错了。
+/// 故 `State` 内不直接写 `settings_note`，一律经 `note_ok` / `note_err` / `note_clear`：
+/// 靠 API 面保证语气跟着文本走，而不是靠每个调用点自己记得改两处。
+// Debug 是给断言用的：`assert_eq!(tone.get(), Tone::Ok)` 没有它编译不过。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tone {
+    /// 操作成功的回执。
+    Ok,
+    /// 失败、拒绝、需要用户改正。
+    Bad,
+}
+
+/// 写一条消息条：语气与文本**同写**。
+///
+/// 抽成自由函数是为了能测。`State` 的那三个方法要一个完整的 `State`，而它持有
+/// `ThemeHandle` 与 `HotkeyHandle`——两者在 windui 里只能从 `App` 拿，构造面是私有的，
+/// 下游的测试造不出来。收两个信号则在测试里随手可建。
+///
+/// 先写语气再写文本不是随意的：文本是可见性的开关（空串 = 收起），反过来写会有一瞬
+/// 消息条已按新文本显示、语气还停在上一条上。同一次事件内两次写入之间不会插进绘制，
+/// 故今天看不出差别——但这个顺序不需要依赖那个前提。
+fn write_note(text: Signal<String>, tone: Signal<Tone>, t: Tone, s: impl Into<String>) {
+    tone.set(t);
+    text.set(s.into());
+}
+
+/// 消息条某一行是否该显示。
+///
+/// `want` 是这一行认领的语气，`tone` 是当前语气（`None` = 这条消息条不分语气）。
+///
+/// 抽成纯函数同样是为了能测：`visible_when` 收的闭包在下游没有触发途径——要有宿主、
+/// 有布局、有真实的一帧。这里钉住的是「任一时刻至多一行可见」，判定写反的症状是两行
+/// 文字重叠着画，或者两行都不显示、消息静默丢失。
+fn note_line_visible(text: &str, want: Option<Tone>, tone: Option<Tone>) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    match (want, tone) {
+        (Some(w), Some(t)) => t == w,
+        _ => true,
     }
 }
 
@@ -325,7 +369,7 @@ struct State {
     /// 元素树——这正是 ADR-0012 当初判断做不到的那件事，其症结其实不在框架，而在
     /// 我们把本可用角色表达的颜色写成了具体色值。
     theme: ThemeHandle,
-    /// 热键句柄：改键即 `rebind`，下一次消息循环生效。
+    /// 热键句柄：改键即 `HotkeyHandle::set`，下一次消息循环生效。
     hotkey: HotkeyHandle,
     /// 主列当前页：词典 / 设置。
     page: Signal<usize>,
@@ -333,6 +377,9 @@ struct State {
     settings: RefCell<Settings>,
     /// 设置页的即时反馈（保存失败、需重启生效等）。空串 = 无。
     settings_note: Signal<String>,
+    /// 上一条 `settings_note` 的语气。初值取 `Bad` 是保守选择：新写入若漏了语气，
+    /// 一条被染红的成功回执比一条被染绿的失败提示要好收场。
+    settings_note_tone: Signal<Tone>,
     /// 「清空历史」是否已进入确认态。
     ///
     /// 用两步确认而非弹模态框：清空不可撤销，但为它拉起一个系统模态框在常驻小工具上
@@ -537,6 +584,22 @@ impl State {
     ///
     /// 返回是否成功，供调用方决定要不要接着做别的（如改注册表）。
     /// 宣告设置有变，令设置页重建。
+    /// 报一条成功回执。
+    fn note_ok(&self, text: impl Into<String>) {
+        write_note(self.settings_note, self.settings_note_tone, Tone::Ok, text);
+    }
+
+    /// 报一条失败/拒绝消息。
+    fn note_err(&self, text: impl Into<String>) {
+        write_note(self.settings_note, self.settings_note_tone, Tone::Bad, text);
+    }
+
+    /// 收起消息条。不动语气——空串本就不显示，留着上一条的语气无人可见，而多写一次
+    /// 信号会多触发一轮重绘。
+    fn note_clear(&self) {
+        self.settings_note.set(String::new());
+    }
+
     fn bump_settings(&self) {
         let n = self.settings_rev.get().first().copied().unwrap_or(0);
         self.settings_rev.set(vec![n.wrapping_add(1)]);
@@ -544,8 +607,7 @@ impl State {
 
     fn save_settings(&self) -> bool {
         let UserDataState::Ready(u) = &self.user else {
-            self.settings_note
-                .set("设置无法保存：用户数据未能打开".into());
+            self.note_err("设置无法保存：用户数据未能打开");
             return false;
         };
         // 先落成一句再 match：`match` 的 scrutinee 里的 `Ref` 会活到整个 match 结束，
@@ -558,7 +620,7 @@ impl State {
                 true
             }
             Err(e) => {
-                self.settings_note.set(format!("保存设置失败：{e}"));
+                self.note_err(format!("保存设置失败：{e}"));
                 false
             }
         }
@@ -578,28 +640,25 @@ impl State {
         self.settings.borrow_mut().skin = kind;
         self.theme.set(kind.skin().theme);
         if self.save_settings() {
-            self.settings_note.set(String::new());
+            self.note_clear();
         } else {
-            self.settings_note
-                .set("皮肤已切换，但未能保存，重启后会回到原来的皮肤".into());
+            self.note_err("皮肤已切换，但未能保存，重启后会回到原来的皮肤");
         }
     }
 
-    /// 改唤起热键。**立即生效**：`rebind` 下一次消息循环向系统换注册。
+    /// 改唤起热键。**立即生效**：`HotkeyHandle::set` 下一次消息循环向系统换注册。
     ///
     /// 拦住无修饰键：那会吞掉该字母在**所有程序**里的输入，用户按一下 D 就唤起词典，
     /// 等于没法打字了——而这个错误一旦犯下，用户很难意识到是词典干的。
     fn set_hotkey(&self, spec: crate::settings::HotkeySpec) {
         if !spec.has_modifier() {
-            self.settings_note.set(
-                "热键至少要带一个 Ctrl / Alt / Shift，否则会吞掉该键在所有程序里的输入".into(),
-            );
+            self.note_err("热键至少要带一个 Ctrl / Alt / Shift，否则会吞掉该键在所有程序里的输入");
             return;
         }
         self.settings.borrow_mut().hotkey = spec;
         self.hotkey.set(spec.to_hotkey());
         if self.save_settings() {
-            self.settings_note.set(format!("唤起热键已改为 {spec}"));
+            self.note_ok(format!("唤起热键已改为 {spec}"));
         }
     }
 
@@ -609,7 +668,7 @@ impl State {
     /// 只是界面初值。反过来先落库的话，注册表写失败时库里就留下了一个假状态。
     fn set_autostart(&self, on: bool) -> bool {
         if let Err(e) = crate::autostart::set(on) {
-            self.settings_note.set(format!("设置开机启动失败：{e}"));
+            self.note_err(format!("设置开机启动失败：{e}"));
             return false;
         }
         self.settings.borrow_mut().autostart = on;
@@ -618,7 +677,7 @@ impl State {
             // 只是这次没能记进库里——如实报出，不谎称成功。
             return false;
         }
-        self.settings_note.set(String::new());
+        self.note_clear();
         true
     }
 
@@ -636,7 +695,7 @@ impl State {
         if !self.save_settings() {
             return false;
         }
-        self.settings_note.set(String::new());
+        self.note_clear();
         true
     }
 
@@ -649,8 +708,7 @@ impl State {
         // 文件选择器只按扩展名过滤，把汉英库选进英汉槽它照收——非校验不可。
         if let Some(p) = &path {
             if let Err(e) = crate::source::offline::probe_dict(p, is_ec) {
-                self.settings_note
-                    .set(format!("这个文件不能用作词库：{e:#}"));
+                self.note_err(format!("这个文件不能用作词库：{e:#}"));
                 return;
             }
         }
@@ -664,10 +722,10 @@ impl State {
             }
         }
         if self.save_settings() {
-            self.settings_note.set(if has {
-                "词库已更改，重启后生效".into()
+            self.note_ok(if has {
+                "词库已更改，重启后生效"
             } else {
-                "已恢复默认词库路径，重启后生效".into()
+                "已恢复默认词库路径，重启后生效"
             });
         }
     }
@@ -709,15 +767,15 @@ impl State {
     /// 清空全部历史记录。破坏性且不可撤销，故调用方须先做二次确认。
     fn clear_history(&self) {
         let UserDataState::Ready(u) = &self.user else {
-            self.settings_note.set("用户数据未能打开，无法清空".into());
+            self.note_err("用户数据未能打开，无法清空");
             return;
         };
         match u.clear_history() {
             Ok(()) => {
-                self.settings_note.set("历史记录已清空".into());
+                self.note_ok("历史记录已清空");
                 self.bump();
             }
-            Err(e) => self.settings_note.set(format!("清空历史失败：{e}")),
+            Err(e) => self.note_err(format!("清空历史失败：{e}")),
         }
     }
 
@@ -921,6 +979,7 @@ pub fn build(
         page: signal(PAGE_DICT),
         settings: RefCell::new(settings),
         settings_note: signal(String::new()),
+        settings_note_tone: signal(Tone::Bad),
         confirm_clear: signal(false),
         settings_rev: signal(vec![0]),
     });
@@ -1219,7 +1278,7 @@ fn main_column(st: Rc<State>, unavailable: Option<String>) -> Element {
         // 键帽比不画更糟。
         // 50px 高、12 圆角：查询框是这一屏的主控件，与设计稿一致地给足分量。
         .child(query_box(st.clone()))
-        .child(notice_bar(st.notice))
+        .child(notice_bar(st.notice, None))
         // 此处原有一条分隔线。拿掉了：候选区收起后它就紧贴查询框，把主列切成两截，
         // 而它要分隔的两样东西（候选、结果）本就不会同时是空的。区域感交给留白。
         //
@@ -1300,7 +1359,7 @@ fn settings_body(st: Rc<State>) -> Element {
         .max_width(620)
         .padding_xy(40, 26)
         .spacing(28)
-        .child(notice_bar(st.settings_note))
+        .child(notice_bar(st.settings_note, Some(st.settings_note_tone)))
         .child(group("外观", skin_cards(st.clone())))
         .child(group("唤起", hotkey_row(st.clone())))
         .child(group("启动", autostart_row(st.clone())))
@@ -1608,12 +1667,36 @@ fn dict_row(st: Rc<State>, is_ec: bool) -> Element {
 ///
 /// 与 `unavailable_bar` 分开：那条讲的是启动时就已知的**持续状态**，这条讲的是
 /// 刚刚那一次操作的**结果**。混在一起会让用户分不清「一直不能用」和「这次没成」。
-fn notice_bar(notice: Signal<String>) -> Element {
-    Element::label_signal(notice)
-        .font_size(13.0)
-        .fg_role(Role::Danger)
-        .width_match()
-        .visible_when(move || !notice.get().is_empty())
+///
+/// `tone` 为 `None` 时恒按失败着色——词典页那条消息条只报失败（收藏写不进、
+/// 删除失败），没有成功回执要报，给它配一个恒为 `Bad` 的信号纯属多余。
+///
+/// 两级着色为什么要靠两个叠着的 label：`fg_role` 是**构建期**定死的，而 windui
+/// 既没有 `fg_role_signal` 也没有派生信号，颜色没法跟着信号走。两个 label 绑同一
+/// 份文本、按语气各自 `visible_when`，任一时刻只有一个可见——不可见的那个零占位，
+/// 故消息条高度与单个 label 时一致。包着它们的 col 也带同一个可见性判定，理由见内联。
+fn notice_bar(notice: Signal<String>, tone: Option<Signal<Tone>>) -> Element {
+    let line = move |role: Role, want: Option<Tone>| {
+        Element::label_signal(notice)
+            .font_size(13.0)
+            .fg_role(role)
+            .width_match()
+            .visible_when(move || {
+                note_line_visible(&notice.get(), want, tone.map(|t| t.get()))
+            })
+    };
+    match tone {
+        None => line(Role::Danger, None),
+        Some(_) => Element::col()
+            .width_match()
+            // 外层这个 col **也**要跟着收。布局按 `effective_visible` 过滤子项，故它
+            // 内部两行都不可见时自身高度为 0——但它对父容器而言仍是个**可见**子项，
+            // 那 28px 的 spacing 照计不误，空消息时设置页顶上就凭空多出一道间隙。
+            // 原先这里是单个 label，不可见即整个消失，这道缝是改成两行叠放才有的。
+            .visible_when(move || note_line_visible(&notice.get(), None, None))
+            .child(line(Role::Danger, Some(Tone::Bad)))
+            .child(line(Role::Success, Some(Tone::Ok))),
+    }
 }
 
 /// 用户数据不可用时的警示条。
@@ -2053,7 +2136,10 @@ fn join(s: &Sense) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{group_by_headword, headwords_to_record, ExpandedStates};
+    use super::{
+        group_by_headword, headwords_to_record, note_line_visible, signal, write_note,
+        ExpandedStates, Tone,
+    };
     use crate::domain::{ChineseEntry, EnglishEntry, Entry, Headword, Inflections, Sense};
 
     fn 英汉(词头: &str) -> Entry {
@@ -2183,5 +2269,59 @@ mod tests {
         states.get("行#0", false).set(true);
         assert!(states.get("行#0", false).get());
         assert!(!states.get("行#1", false).get(), "另一条词条不该被带着展开");
+    }
+
+    // ── 设置页消息条 ──────────────────────────────────────────────────
+    //
+    // 真正想测的是「点了清空历史，那条回执是绿的不是红的」，但那要 State（持有
+    // ThemeHandle / HotkeyHandle，windui 侧构造面私有）与一帧真实绘制，下游都拿不到。
+    // 退而钉住这两个纯函数——语气写入与可见性判定是这套逻辑里全部会出错的地方。
+
+    /// 语气与文本必须同写。漏写语气的症状是「历史记录已清空」沿用上一条失败消息的
+    /// 红色，看着像操作没成。
+    #[test]
+    fn 写消息条时语气跟着文本走() {
+        let text = signal(String::new());
+        let tone = signal(Tone::Bad);
+
+        write_note(text, tone, Tone::Ok, "历史记录已清空");
+        assert_eq!(text.get(), "历史记录已清空");
+        assert_eq!(tone.get(), Tone::Ok, "成功回执该是 Ok 语气");
+
+        // 反向也要跟得上：上一条是成功，这一条失败，语气不能停在绿色上。
+        write_note(text, tone, Tone::Bad, "清空历史失败：库已锁定");
+        assert_eq!(text.get(), "清空历史失败：库已锁定");
+        assert_eq!(tone.get(), Tone::Bad, "失败消息该是 Bad 语气");
+    }
+
+    /// 空文本收起整条消息条——两行都不显示，不留一条空白占位。
+    #[test]
+    fn 空消息不显示任何一行() {
+        for want in [None, Some(Tone::Ok), Some(Tone::Bad)] {
+            for tone in [None, Some(Tone::Ok), Some(Tone::Bad)] {
+                assert!(!note_line_visible("", want, tone));
+            }
+        }
+    }
+
+    /// 分语气的消息条上，任一时刻**恰好**一行可见。
+    ///
+    /// 两行都可见 = 两段文字重叠着画；都不可见 = 消息静默丢失。判定写反时这两种
+    /// 症状各占一半，故正反都断言。
+    #[test]
+    fn 分语气的消息条只亮一行() {
+        for (tone, 该亮, 该灭) in [
+            (Tone::Ok, Tone::Ok, Tone::Bad),
+            (Tone::Bad, Tone::Bad, Tone::Ok),
+        ] {
+            assert!(note_line_visible("有话要说", Some(该亮), Some(tone)));
+            assert!(!note_line_visible("有话要说", Some(该灭), Some(tone)));
+        }
+    }
+
+    /// 不分语气的消息条（词典页那条，只报失败）：有文本就显示，不受语气影响。
+    #[test]
+    fn 不分语气的消息条有文本就显示() {
+        assert!(note_line_visible("收藏不可用：用户数据未能打开", None, None));
     }
 }
