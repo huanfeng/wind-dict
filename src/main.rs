@@ -73,9 +73,12 @@ fn main() {
         // 无系统标题栏：标题栏由 `ui::title_bar` 自绘，才能与整体配色一致。
         .frameless()
         // GPU 渲染（Direct2D）。本项目不以「后台内存尽可能小」为目标——见 ADR-0006
-        // 的修订，需求已改为优先响应与渲染质量。无 GPU、RDP 远程会话、离屏截图等
-        // 情形 windui 会自动回退软渲染，不会失败。
-        .accelerated(true)
+        // 的修订，需求已改为优先响应与渲染质量。
+        //
+        // 取 `Auto` 而非 `Gpu`：无 GPU、RDP 远程会话、离屏截图等情形前者自动回退软
+        // 渲染，后者是**报错终止**——那条语义是给排障用的（静默回退会让人拿两张软渲染
+        // 的截图得出「软硬一致」），交付给用户的构建不该带。
+        .renderer(Renderer::Auto)
         .theme(skin.theme.clone())
         .tray(tray)
         // 常驻：启动不闪窗口，关闭只收起，进程始终活着等热键。见 ADR-0006。
@@ -85,7 +88,7 @@ fn main() {
 
     // 两个句柄都必须在 `content` **之前**取到——界面要拿着它们才能即时换肤、改键。
     let theme = app.theme_handle();
-    let hotkey = app.hotkey_rc(settings.hotkey.to_hotkey(), |ctx| ctx.show_window());
+    let hotkey = app.hotkey_handle(settings.hotkey.to_hotkey(), |ctx| ctx.show_window());
 
     app.content(ui::build(dict, user, theme, hotkey)).run();
 }

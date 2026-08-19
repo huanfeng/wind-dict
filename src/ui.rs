@@ -597,7 +597,7 @@ impl State {
             return;
         }
         self.settings.borrow_mut().hotkey = spec;
-        self.hotkey.rebind(spec.to_hotkey());
+        self.hotkey.set(spec.to_hotkey());
         if self.save_settings() {
             self.settings_note.set(format!("唤起热键已改为 {spec}"));
         }
@@ -1609,7 +1609,7 @@ fn dict_row(st: Rc<State>, is_ec: bool) -> Element {
 /// 与 `unavailable_bar` 分开：那条讲的是启动时就已知的**持续状态**，这条讲的是
 /// 刚刚那一次操作的**结果**。混在一起会让用户分不清「一直不能用」和「这次没成」。
 fn notice_bar(notice: Signal<String>) -> Element {
-    Element::label_rc(notice)
+    Element::label_signal(notice)
         .font_size(13.0)
         .fg_role(Role::Danger)
         .width_match()
@@ -1771,7 +1771,7 @@ fn result_area(st: Rc<State>) -> Element {
         .fill()
         .spacing(6)
         .child(
-            Element::label_rc(st.hint)
+            Element::label_signal(st.hint)
                 .fg_role(Role::TextMuted)
                 .height(20)
                 .width_match(),
