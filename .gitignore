@@ -11,6 +11,9 @@
 # 截图/临时产物
 /artifacts/
 
+# 竞品参考截图等临时素材（操作性，不入库）
+/temp/
+
 # 本机部署配置覆盖（各人机器不同）
 /scripts/deploy.local.ps1
 
