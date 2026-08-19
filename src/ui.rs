@@ -373,6 +373,11 @@ struct State {
     hotkey: HotkeyHandle,
     /// 主列当前页：词典 / 设置。
     page: Signal<usize>,
+    /// 召回抽屉是否展开。
+    ///
+    /// 默认关着（`build` 里初始化为 false）：DESIGN.md 的「Search is home」讲的正是
+    /// 这件事——默认可见的界面该服务下一次查询，而不是回顾上一次。
+    drawer_open: Signal<bool>,
     /// 当前设置。界面上的各个控件绑到它的分量信号，改动经 `save_settings` 落库。
     settings: RefCell<Settings>,
     /// 设置页的即时反馈（保存失败、需重启生效等）。空串 = 无。
@@ -598,6 +603,19 @@ impl State {
     /// 信号会多触发一轮重绘。
     fn note_clear(&self) {
         self.settings_note.set(String::new());
+    }
+
+    /// 点 rail 上的召回按钮：开抽屉并切到该页签；已经停在这一页则收起。
+    ///
+    /// 「再点一次收起」这条是刻意的：入口就那一个，若只负责打开，关抽屉就只剩头部
+    /// 那个 ×，而人手已经在 rail 上了。
+    fn toggle_drawer(&self, tab: usize) {
+        if self.drawer_open.get() && self.side_tab.get() == tab {
+            self.drawer_open.set(false);
+            return;
+        }
+        self.side_tab.set(tab);
+        self.drawer_open.set(true);
     }
 
     fn bump_settings(&self) {
@@ -977,6 +995,7 @@ pub fn build(
         theme,
         hotkey,
         page: signal(PAGE_DICT),
+        drawer_open: signal(false),
         settings: RefCell::new(settings),
         settings_note: signal(String::new()),
         settings_note_tone: signal(Tone::Bad),
@@ -990,7 +1009,7 @@ pub fn build(
     Element::col()
         .fill()
         .bg_role(Role::Bg)
-        .child(title_bar())
+        .child(title_bar(st.clone()))
         .child(Element::divider())
         .child(body(st, unavailable).weight(1.0))
 }
@@ -999,7 +1018,7 @@ pub fn build(
 ///
 /// 整条 `window_drag()` 可拖动窗口；落在窗口按钮上不拖、正常点击（windui 按「命中
 /// 可聚焦控件则不拖」处理）。
-fn title_bar() -> Element {
+fn title_bar(st: Rc<State>) -> Element {
     Element::row()
         .width_match()
         .height(38)
@@ -1009,6 +1028,15 @@ fn title_bar() -> Element {
         .bg_role(Role::SurfaceAlt)
         .window_drag()
         .child(brand().weight(1.0))
+        // 设置入口。DESIGN.md 把设置归在 title/toolbar controls；它此前在侧栏底部，
+        // 而侧栏已经不存在了。
+        //
+        // 用文字而非齿轮图标：U+2699 在 Windows 上会被 Segoe UI Emoji 接管，画出来是
+        // 一个彩色齿轮，与这一屏的单色符号格格不入（变体选择符 U+FE0E 无效，windui
+        // 的文本渲染不处理它）。走 SVG 又要 `ImageContent::tint` 定一个具体颜色，
+        // 换肤时它不会跟着变——ADR-0012 结案段刚把「界面无一处写死颜色」这条挣回来。
+        // 两条路都不通，而「设置」二字本来就比任何图标都准确。
+        .child(settings_entry(st))
         // 窗口按钮的宽度（46px，与设计一致）、图标形状与 hover 色均由 windui 硬编码，
         // 只有图标色可调。框架的 `BTN_H = 32` 在这里不生效——本行 `cross(Stretch)`
         // 会把按钮拉到 38 高。
@@ -1019,6 +1047,25 @@ fn title_bar() -> Element {
         .child(Element::window_button(WindowButtonKind::Minimize).fg_role(Role::TextMuted))
         .child(Element::window_button(WindowButtonKind::Maximize).fg_role(Role::TextMuted))
         .child(Element::window_button(WindowButtonKind::Close).fg_role(Role::TextMuted))
+}
+
+/// 标题栏上的设置入口。
+///
+/// 落在 `window_drag` 区域内仍可点：windui 按「命中可聚焦控件则不拖」处理，窗口按钮
+/// 走的是同一条规则（见 `title_bar` 的说明）。
+fn settings_entry(st: Rc<State>) -> Element {
+    let page = st.page;
+    Element::row()
+        .cross(Align::Center)
+        .padding_xy(12, 0)
+        .height_match()
+        .clickable()
+        .on_click(move |_ctx| page.set(PAGE_SETTINGS))
+        .child(
+            Element::label("设置")
+                .font_size(12.5)
+                .fg_role(Role::TextMuted),
+        )
 }
 
 /// 标题栏左侧的应用标识：图标 + 名称 + 能力副标题。
@@ -1070,91 +1117,111 @@ fn brand() -> Element {
         )
 }
 
-/// 主体区域：左侧栏 + 右主列。
+/// 主体区域：主列 + 召回抽屉 + 图标 rail。
 ///
-/// 底色由 `build` 的根容器统一铺，此处不再铺一遍——同一块区域填两次纯色是白费。
+/// 召回从常驻侧栏改成按需抽屉，依据是 DESIGN.md 的「Search is home / Recall is a
+/// drawer」：默认可见的界面该服务**下一次**查询，而 224px 的历史列表是在回顾上一次。
+/// 抽屉收起时主列独占整个宽度，只留 44px 的 rail 作入口。
 fn body(st: Rc<State>, unavailable: Option<String>) -> Element {
     Element::row()
         .fill()
         .cross(Align::Stretch)
-        // 栏间那条线是侧栏**自己的右边框**，不再是一个独立节点：单边边框不参与
-        // 布局，而 1px 色块要占一列，容器一改间距就得跟着调。
-        .child(sidebar(st.clone()))
-        .child(pages(st, unavailable).weight(1.0))
+        // 列表驱动器提到这一层，且排在**所有消费者之前**。
+        //
+        // 它此前挂在侧栏内部，靠「侧栏在主列左边、故先建」才赶得上——`on_update` 按
+        // `Element::build` 的前序（即书写顺序）派发，而它除了重载列表还要刷新结果区
+        // 卡片的星标，落在主列之后就慢一帧。召回移到右侧之后那个前提不再成立，故提到
+        // 这里：位置由「必须先于所有消费者」这条约束决定，不再是左右布局的副产品。
+        .child(side_loader(st.clone()))
+        .child(pages(st.clone(), unavailable).weight(1.0))
+        .child(drawer(st.clone()))
+        .child(rail(st))
 }
 
-/// 侧栏：历史 / 收藏两个页签 + 列表。
+/// 列表驱动器：零尺寸、不可见，重载召回列表并刷新结果区星标。位置约束见 `body`。
+fn side_loader(st: Rc<State>) -> Element {
+    Element::leaf()
+        .reactive()
+        .widget(SideLoader {
+            last_tab: st.side_tab.version(),
+            last_rev: st.revision.version(),
+            st,
+        })
+        .size(0, 0)
+}
+
+/// 召回抽屉：历史 / 收藏，按需展开，挤压主列而非盖住它。
 ///
-/// 设计稿的侧栏底部还有一个「设置」入口，此处**刻意不做**——设置页是下一阶段的东西，
-/// 现在放个按钮上去，点了没有任何反应。宁可先没有入口，也不放一个骗人的。
-fn sidebar(st: Rc<State>) -> Element {
+/// 挤压而非覆盖：抽屉里点一个词，结果就出现在它左边，两者要同时可见。覆盖式抽屉
+/// 得先关掉才能读结果，而「点一个词 → 读 → 再点下一个」正是召回的主要用法。
+fn drawer(st: Rc<State>) -> Element {
+    let open = st.drawer_open;
     Element::col()
-        .width(224)
+        .width(280)
         .height_match()
         .bg_role(Role::SurfaceAlt)
         .border_role(Role::Divider, 1)
-        .border_edges(Edges::RIGHT)
-        // 列表驱动器：零尺寸、不可见，须先于列表注册（on_update 按注册顺序广播，
-        // 而注册顺序是 `Element::build` 的深度优先前序，即书写顺序）。
-        //
-        // 还有一层**跨子树**的依赖：`SideLoader` 也会重建结果区的卡片，故它必须先于
-        // 主列的 `cards` 列表注册，否则卡片会慢一帧。当前成立仅仅因为 `body` 里侧栏
-        // 排在主列之前——**若把侧栏挪到右边，这里会静默退化**，届时需把驱动器提到
-        // `body` 层级，而不是靠左右顺序碰巧对。
-        .child(
-            Element::leaf()
-                .reactive()
-                .widget(SideLoader {
-                    last_tab: st.side_tab.version(),
-                    last_rev: st.revision.version(),
-                    st: st.clone(),
-                })
-                .height(0),
-        )
-        .child(
-            Element::tabs(
-                st.side_tab,
-                vec![
-                    ("历史", side_list(st.clone())),
-                    // 术语表弃用「生词本」，见 `TAB_HISTORY` 处的说明。
-                    ("收藏", side_list(st.clone())),
-                ],
-            )
-            .fill()
-            .padding_xy(8, 8)
-            .weight(1.0),
-        )
-        // 设置入口。此前刻意不做，因为「点了没地方去」；现在设置页有了，它才该出现。
-        .child(settings_entry(st))
+        .border_edges(Edges::LEFT)
+        .visible_when(move || open.get())
+        .child(drawer_head(st.clone()))
+        .child(side_list(st).fill().padding_xy(8, 8).weight(1.0))
 }
 
-/// 侧栏底部的设置入口。
-fn settings_entry(st: Rc<State>) -> Element {
-    let page = st.page;
+/// 抽屉头部：历史 / 收藏分段 + 关闭。
+///
+/// **不放收藏计数**。它原先在侧栏底部的设置入口上（「142 词」），那里的理由是「让人
+/// 知道这个入口后面有内容」——抽屉一打开列表就在眼前，这个理由没了。而它是构建期
+/// 快照，收藏之后不会自己更新，留着就是个会过期的数字。
+fn drawer_head(st: Rc<State>) -> Element {
+    let open = st.drawer_open;
     Element::row()
         .width_match()
         .height(46)
         .cross(Align::Center)
-        .padding_xy(16, 0)
-        .spacing(10)
+        .padding_xy(10, 0)
+        .spacing(8)
         .border_role(Role::Divider, 1)
-        .border_edges(Edges::TOP)
-        .clickable()
-        .on_click(move |_ctx| page.set(PAGE_SETTINGS))
+        .border_edges(Edges::BOTTOM)
+        // 分段控件而非页签：两者都表达单选，但页签的语义是「切换到另一个页面」，
+        // 而这里两页是同一个列表的两种来源，切过去人还在抽屉里。
+        .child(Element::segmented(vec!["历史", "收藏"], st.side_tab).weight(1.0))
         .child(
-            Element::label("设置")
-                .font_size(13.0)
-                .font_weight(500)
-                .fg_role(Role::Text)
-                .weight(1.0),
+            Element::icon_button("×")
+                .fg_role(Role::TextDisabled)
+                .on_click(move |_ctx| open.set(false)),
         )
-        // 收藏计数：设计稿此处是「142 词」。它不只是装饰——收藏是慢慢攒起来的，
-        // 一个数字能让人知道自己攒了多少，也顺带说明这个入口后面有内容。
-        .child(
-            Element::label(format!("{} 词", st.counts().1))
-                .font_size(12.0)
-                .fg_role(Role::TextDisabled),
-        )
+}
+
+/// 右侧 rail：召回入口，44px 常驻。
+///
+/// 常驻而非悬浮：抽屉可以收起，但「怎么把它叫出来」必须一直看得见。DESIGN.md 的
+/// 组件清单里这条叫 Collapsed recall rail。
+///
+/// **只放召回**。设置去了标题栏——DESIGN.md 把设置归在 title/toolbar controls，而
+/// 这条 rail 按定义是 recall rail；把两类东西摞在一列里，那道分隔线就没法解释。
+fn rail(st: Rc<State>) -> Element {
+    Element::col()
+        .width(44)
+        .height_match()
+        .cross(Align::Center)
+        .padding_xy(0, 8)
+        .spacing(4)
+        .bg_role(Role::SurfaceAlt)
+        .border_role(Role::Divider, 1)
+        .border_edges(Edges::LEFT)
+        .child(rail_button("↺", TAB_HISTORY, st.clone()))
+        .child(rail_button("☆", TAB_FAVORITES, st))
+}
+
+/// rail 上的一个召回按钮：开抽屉并切到该页签；已经停在这一页则收起。
+///
+/// **不画激活态**。抽屉开着时头部的分段控件已经写明当前是哪一页，rail 再标一次是
+/// 重复；而 windui 的 `bg_role` 是构建期定死的，要让它跟着信号变得叠两个节点——
+/// 为一份冗余信息付这个代价不值。
+fn rail_button(glyph: &str, tab: usize, st: Rc<State>) -> Element {
+    Element::icon_button(glyph)
+        .fg_role(Role::TextMuted)
+        .on_click(move |_ctx| st.toggle_drawer(tab))
 }
 
 /// 主列：词典页与设置页叠在一起，按 `page` 切换。
@@ -1177,14 +1244,12 @@ fn pages(st: Rc<State>, unavailable: Option<String>) -> Element {
         )
 }
 
-/// 侧栏列表。两个页签共用一份数据信号。
+/// 召回列表。历史与收藏共用一份数据信号，由 `SideLoader` 按当前页签重载。
 ///
-/// 这样不会串，但**理由不是「只有一个页签存在」**：`Element::tabs` 把两页都建进树，
-/// 只给未选中的挂 `visible_when`；而 `on_update` 的派发只看 `enabled` 不看 `visible`，
-/// 所以隐藏那一页的列表照样在重建。不串的真实理由是两页绑同一信号、内容本就相同。
-///
-/// 代价是每次列表变更有一倍的节点重建。可接受，但若将来两个页签要显示不同内容，
-/// 必须先解决这件事——那时「共用一份信号」这个前提本身就没了。
+/// 改抽屉时顺带修掉了一处浪费：此前用 `Element::tabs` 把两页都建进树、只给未选中的
+/// 挂 `visible_when`，而 `on_update` 的派发只看 `enabled` 不看 `visible`，隐藏那页的
+/// 列表照样跟着重建——每次列表变更都是一倍的节点。现在抽屉里只有一个列表，页签切换
+/// 只换数据不换结构。
 ///
 /// 传给 `list_signal` 的 key 函数当前是**死参数**：windui 的形参名为 `_key_fn`，
 /// 内部做全量重建，没有 keyed diff。传它是为将来上游补齐后自动生效，别据此以为
@@ -1247,8 +1312,9 @@ fn side_row(r: SideRow, st: Rc<State>) -> Element {
 
 /// 主列：查询框 + 补全候选 + 结果。
 fn main_column(st: Rc<State>, unavailable: Option<String>) -> Element {
-    // 左右 28px 而非 16：查询框与词条正文都靠这份留白与侧栏拉开距离。设计稿此处是
-    // 40px，但那是在更宽的画布上；920px 窗口减去侧栏后按 28 收，观感相当。
+    // 左右 28px 而非 16。原先的理由是「与侧栏拉开距离」，侧栏已经不在了，但这个值仍
+    // 该保留：现在它管的是正文与窗口边缘、与右侧 rail 的距离——贴边的正文比挤在一起
+    // 的两栏更难读。设计稿此处是 40px，那是在更宽的画布上。
     let mut root = Element::col().fill().padding_xy(28, 16).spacing(12);
     // 不可用时才占这一行：正常情况下不该为一个不会发生的故障留白。
     if let Some(why) = unavailable {
@@ -1356,16 +1422,23 @@ fn settings_page(st: Rc<State>) -> Element {
 fn settings_body(st: Rc<State>) -> Element {
     Element::col()
         .width_match()
-        .max_width(620)
-        .padding_xy(40, 26)
-        .spacing(28)
-        .child(notice_bar(st.settings_note, Some(st.settings_note_tone)))
-        .child(group("外观", skin_cards(st.clone())))
-        .child(group("唤起", hotkey_row(st.clone())))
-        .child(group("启动", autostart_row(st.clone())))
-        .child(group("词库", dict_rows(st.clone())))
-        .child(group("释义显示", expand_en_row(st.clone())))
-        .child(group("数据", data_rows(st)))
+        // 内容居中。此前主列左边有 224px 的侧栏顶着，620 的限宽靠左也还平衡；召回移到
+        // 右侧抽屉之后主列宽了 200 多，再靠左就是一边贴边、一边空一大片。
+        .cross(Align::Center)
+        .child(
+            Element::col()
+                .width_match()
+                .max_width(620)
+                .padding_xy(40, 26)
+                .spacing(28)
+                .child(notice_bar(st.settings_note, Some(st.settings_note_tone)))
+                .child(group("外观", skin_cards(st.clone())))
+                .child(group("唤起", hotkey_row(st.clone())))
+                .child(group("启动", autostart_row(st.clone())))
+                .child(group("词库", dict_rows(st.clone())))
+                .child(group("释义显示", expand_en_row(st.clone())))
+                .child(group("数据", data_rows(st))),
+        )
 }
 
 /// 数据管理：条数如实展示 + 清空历史。
