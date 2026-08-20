@@ -423,6 +423,14 @@ struct State {
     settings_rev: Signal<Vec<u64>>,
 }
 
+/// 展开态的键：词头 + 该词头下的词条序号（多音字一个词头、多条词条，各自开合）。
+///
+/// 抽成函数是因为它有**两个**调用方——预建（`State::rebuild_cards`）与构建期取用
+/// （`card_view`），两处拼不出同一个键，预建就等于没做，而症状是下面那个 panic。
+fn expand_key(hw: &Headword, i: usize) -> String {
+    format!("{hw}#{i}")
+}
+
 /// 可折叠区的展开态集合，按键长期持有。
 ///
 /// **必须活在元素树之外**。结果区的卡片会因收藏状态变化而整棵重建
@@ -433,23 +441,57 @@ struct State {
 /// 这类 bug 换个控件是治不好的：无论用 `Element::collapsible` 还是富文本的折叠区，
 /// 只要展开态跟着元素树生灭，重建就会抹掉它。状态得比树活得久。
 ///
+/// ## 信号本身也必须在重建之外创建（血的教训）
+///
+/// 「活在树之外」还有一半：光把**句柄**存在树外不够，`signal()` 那一下**在哪儿调**
+/// 同样决定生死。windui 的 `host_signal` 用一个 `SignalScope` 圈住 `build_fn`，重建时
+/// 先整批回收上一轮在其中创建的信号（`ui/mod.rs::host_signal`）——那是对的，否则每重建
+/// 一次就永久漏一代。但它意味着：**在构建期调 `signal()` 拿到的句柄，只活到下一次
+/// 重建**。
+///
+/// 从前 `get` 是「没有就地建一个并存进表里」，而它的调用点在 `card_view`，也就是
+/// 重建作用域**内**。于是表里存的是一个到期就作废的句柄，下一次重建取回它、
+/// `Element::collapsible` 一读就 panic：「signal 句柄已失效：槽位已被回收」。而 panic
+/// 落在 Win32 窗口过程里跨 C ABI 不能展开，运行时直接 abort——进程凭空消失，
+/// 事件查看器只留一条 `0xc0000409`。
+///
+/// 实机复现：查一个**带英英释义**的词（输入 `misc` → 候选 → 回车）。`rebuild_cards`
+/// 写一次 `cards` 触发重建 #1，随后 `SideLoader` 的 `refresh_fav_flags` 又写一次，
+/// 重建 #2 取回失效句柄。没有英英释义的词根本不读那个信号（`entry_view` 里 `collapsible`
+/// 才读），所以不崩——这就是它看起来偶发、追了两天没头绪的原因。
+///
+/// 故信号一律由 [`prepare`](Self::prepare) 在**事件回调里**建好，`get` 只查表。
+///
 /// 单独成一个类型而非直接摊在 `State` 里，是为了能脱开词库单独验证——它的正确性
-/// 全在「同一个键必须拿到同一个信号」这一条上，而那与词典数据无关。
+/// 全在「同一个键必须拿到同一个、且不会失效的信号」这一条上，而那与词典数据无关。
 #[derive(Default)]
 struct ExpandedStates(RefCell<HashMap<String, Signal<bool>>>);
 
 impl ExpandedStates {
-    /// 取某个键的展开态，没有则按 `default_open` 新建。**同一键永远返回同一个信号**。
+    /// 为这批键备好信号。**只能在元素树重建之外调用**（事件回调里），理由见类型头注释。
     ///
-    /// 默认值由调用方给（来自设置里的「默认展开英英释义」），而不是写死 false——
-    /// 但只对**尚未出现过**的键生效：用户手动折叠过的，不该因为改了设置又被展开。
+    /// 已有的键不动：`or_insert_with` 而非 `insert`——重查同一个词不该把用户手动展开的
+    /// 那条又合上。这也正是 `default_open` 只对**尚未出现过**的键生效的地方：用户折叠过
+    /// 的，不该因为改了设置又被展开。
+    fn prepare(&self, keys: impl IntoIterator<Item = String>, default_open: bool) {
+        let mut map = self.0.borrow_mut();
+        for k in keys {
+            map.entry(k).or_insert_with(|| signal(default_open));
+        }
+    }
+
+    /// 取某个键的展开态。**同一键永远返回同一个信号**。
+    ///
+    /// 未命中时就地新建，但**不入表**：这条是退路，走到这里说明 `prepare` 漏了一个键。
+    /// 新建的句柄同样活不过下一次重建，可它没进表、不会被第二次取用，故只会让这一条
+    /// 折叠区的展开态归零，不会 panic。dev 构建下当场断言，免得这条退路把漏建悄悄
+    /// 变成「偶尔自己收起来」那种最难查的毛病。
     fn get(&self, key: &str, default_open: bool) -> Signal<bool> {
         if let Some(s) = self.0.borrow().get(key) {
             return *s;
         }
-        let s = signal(default_open);
-        self.0.borrow_mut().insert(key.to_string(), s);
-        s
+        debug_assert!(false, "展开态 `{key}` 未预建：`rebuild_cards` 与 `card_view` 的键对不上了");
+        signal(default_open)
     }
 }
 
@@ -595,7 +637,7 @@ impl State {
     /// 漏在那三条失败路径上）。既然卡片里本就装着全部词条，那个信号纯属冗余，删掉它
     /// 之后两份数据失同步这件事就无从发生了。
     fn rebuild_cards(&self, entries: &[Entry]) {
-        let cards = group_by_headword(entries)
+        let cards: Vec<Card> = group_by_headword(entries)
             .into_iter()
             .map(|(hw, entries)| Card {
                 fav: self.is_favorite(&hw),
@@ -603,6 +645,17 @@ impl State {
                 entries,
             })
             .collect();
+        // 展开态的信号必须在这里建，**不能等到 `card_view` 里**——那是重建作用域内，
+        // 建出来的句柄下次重建就作废，取回来一读整个进程 abort。原委见 `ExpandedStates`。
+        //
+        // 位置在 `cards.set` 之前：这一行才是重建的触发点，先备好再放它走。
+        let default_open = self.settings.borrow().expand_en;
+        self.expanded.prepare(
+            cards.iter().flat_map(|c| {
+                (0..c.entries.len()).map(|i| expand_key(&c.headword, i))
+            }),
+            default_open,
+        );
         self.cards.set(cards);
     }
 
@@ -2113,10 +2166,9 @@ fn card_view(c: Card, st: Rc<State>) -> Element {
     // 「这是哪个词」，下面回答「它什么意思」，一条线比单纯拉开间距更能说明这件事。
     col = col.child(Element::divider());
     for (i, e) in c.entries.into_iter().enumerate() {
-        // 键带序号：同一词头下可能有多条词条（多音字），各自的折叠区应能分别开合。
-        let expanded = st
-            .expanded
-            .get(&format!("{hw}#{i}"), st.settings.borrow().expand_en);
+        // 只查表，不新建：本函数跑在重建作用域内，在这里 `signal()` 出来的句柄活不过
+        // 下一次重建。信号由 `rebuild_cards` 预先备好，详见 `ExpandedStates`。
+        let expanded = st.expanded.get(&expand_key(&hw, i), st.settings.borrow().expand_en);
         col = col.child(entry_view(e, expanded));
     }
     // 备注排在最后：它是用户**附加**给这个词的东西，不该插进词典自身的内容里打断
@@ -2397,7 +2449,10 @@ fn join(s: &Sense) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{group_by_headword, headwords_to_record, signal, write_note, ExpandedStates, Role};
+    use super::{
+        expand_key, group_by_headword, headwords_to_record, signal, write_note, ExpandedStates,
+        Role,
+    };
     use crate::domain::{ChineseEntry, EnglishEntry, Entry, Headword, Inflections, Sense};
 
     fn 英汉(词头: &str) -> Entry {
@@ -2492,10 +2547,13 @@ mod tests {
     fn 默认展开只对新键生效() {
         let states = ExpandedStates::default();
         // 先以「默认折叠」建键，再手动展开。
+        states.prepare(["a#0".into()], false);
         states.get("a#0", false).set(true);
-        // 此后即便传入 default_open=false，已有的键也保持原状。
+        // 此后即便再以 default_open=false 备一次，已有的键也保持原状。
+        states.prepare(["a#0".into()], false);
         assert!(states.get("a#0", false).get(), "已存在的键不受默认值影响");
         // 新键才吃默认值。
+        states.prepare(["b#0".into()], true);
         assert!(states.get("b#0", true).get(), "新键应按默认值展开");
     }
 
@@ -2513,6 +2571,7 @@ mod tests {
     #[test]
     fn 同一键取回同一个展开态() {
         let states = ExpandedStates::default();
+        states.prepare(["make#0".into()], false);
         let a = states.get("make#0", false);
         a.set(true);
         // 模拟卡片重建：重新取一次。
@@ -2520,13 +2579,53 @@ mod tests {
         assert!(b.get(), "重建后展开态应当保持");
     }
 
+    /// **崩溃回归**（2026-08-20 实机：输入 `misc` → 候选 → 回车 → 进程 abort）。
+    ///
+    /// 上面那条测试模拟的「重建」只有一半——真实的重建还包含**回收上一轮的构建期
+    /// 信号**：windui 的 `host_signal` 用一个 `SignalScope` 圈住 `build_fn`，重建时
+    /// 先整批 dispose。缺了这一半，就漏掉了真正的失败模式：信号若在重建作用域**内**
+    /// 创建，表里存的句柄到期作废，下一次重建取回它、`collapsible` 一读就
+    /// 「signal 句柄已失效」，而这条 panic 落在 Win32 窗口过程里不能展开，直接 abort。
+    ///
+    /// 故本测试必须用真的 `SignalScope` 包住取用，并在作用域外 `prepare`——那正是
+    /// `rebuild_cards` 与 `card_view` 各自所处的位置。
+    #[test]
+    fn 展开态活过带回收的重建() {
+        use windui::signal::SignalScope;
+        let states = ExpandedStates::default();
+        // 事件回调（`rebuild_cards`）：在任何重建作用域之外备好信号。
+        states.prepare(["misc#0".into()], false);
+
+        // 重建 #1：宿主在自己的作用域里构建卡片，其中取用展开态。
+        let mut scope = SignalScope::new();
+        let first = scope.collect(|| states.get("misc#0", false));
+        first.set(true);
+
+        // 重建 #2：宿主先回收上一轮的构建期信号，再造新的一批。
+        scope.dispose();
+        let mut next = SignalScope::new();
+        let again = next.collect(|| states.get("misc#0", false));
+
+        assert!(again.get(), "展开态该活过重建，且句柄不该随作用域一起被回收");
+    }
+
     /// 不同词条各自开合，互不影响（多音字一个词头、多条词条）。
     #[test]
     fn 不同键的展开态互不影响() {
         let states = ExpandedStates::default();
+        states.prepare(["行#0".into(), "行#1".into()], false);
         states.get("行#0", false).set(true);
         assert!(states.get("行#0", false).get());
         assert!(!states.get("行#1", false).get(), "另一条词条不该被带着展开");
+    }
+
+    /// 预建与构建期取用**必须拼出同一个键**，否则预建等于没做，而症状是上面那条
+    /// abort。两处都走 `expand_key`，这里钉住它的形状。
+    #[test]
+    fn 展开态的键带词条序号() {
+        let hw = Headword::from_store("行");
+        assert_eq!(expand_key(&hw, 0), "行#0");
+        assert_eq!(expand_key(&hw, 1), "行#1");
     }
 
     // ── 设置页消息条 ──────────────────────────────────────────────────
