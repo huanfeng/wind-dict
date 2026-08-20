@@ -17,6 +17,7 @@ use wind_dict::store::userdata::{UserData, UserDataState};
 use wind_dict::ui;
 
 fn main() {
+    install_panic_log();
     // 用户数据先开：设置存在其中，而词库路径、热键、皮肤都要由设置决定。
     //
     // 用户数据打不开**不致命**：查询是主体功能，收藏与历史是其增益，为后者让整个
@@ -93,6 +94,72 @@ fn main() {
     app.content(ui::build(dict, user, theme, hotkey)).run();
 }
 
+/// 把 panic 追加写到 `<用户数据目录>\panic.log`，写完仍交回默认钩子。
+///
+/// **没有它时用户看到的是什么**：release 构建带 `windows_subsystem = "windows"`
+/// （无控制台）且 `panic = "abort"`，一次 panic 的全部表现就是**进程凭空消失**——
+/// 没有窗口、没有提示、没有退出码可看。而 panic 若发生在 Win32 的窗口过程里，
+/// 它甚至不是「Rust 崩溃」的样子：跨 C ABI 不能展开，运行时直接 `__fastfail`，
+/// 事件查看器里只留下一条 `0xc0000409`，故障模块是 exe 自身、偏移落在 panic 机制
+/// 内部——既指不出出错的代码，也读不到 panic 的消息。
+///
+/// 落一份文件把这条信息链接回来：消息 + `file:line` 是排障真正需要的东西，而它在
+/// panic 发生的那一刻本来就在手上，只是没人写下来。
+///
+/// 写在用户数据目录而非部署目录：后者会被 `dev.ps1` 卸载时整个删除（ADR-0011），
+/// 而崩溃日志的价值恰恰在于**卸载重装之后还在**。
+///
+/// 一切失败都静默忽略：日志写不下去是排障能力的损失，不是产品故障，为它再 panic
+/// 一次（在 panic 钩子里！）只会把现场彻底毁掉。
+fn install_panic_log() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Ok(dir) = userdata_dir() {
+            let where_ = match info.location() {
+                Some(l) => format!("{}:{}:{}", l.file(), l.line(), l.column()),
+                None => "位置未知".to_string(),
+            };
+            // payload 取两种最常见的形状；其余类型的 panic 载荷本就无法转成文字。
+            let msg = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "（无消息）".to_string());
+            append_panic_log(&dir, &where_, &msg);
+        }
+        // 交回默认钩子：dev 构建有控制台，那条输出仍然是最快的反馈。
+        prev(info);
+    }));
+}
+
+/// 往 `dir/panic.log` 追加一条记录。失败静默——理由见 `install_panic_log`。
+///
+/// **追加而非覆盖**：偶发崩溃的价值在于攒够几条才看得出共性，写一次盖一次等于只留
+/// 最后一次。
+///
+/// 从钩子里抽出来是为了能测：`PanicHookInfo` 在下游造不出来，混在闭包里这段写盘逻辑
+/// 就只能靠「真崩一次」来验证——而它恰恰是崩溃时唯一还在跑的代码，不能靠运气。
+fn append_panic_log(dir: &std::path::Path, location: &str, msg: &str) {
+    use std::io::Write;
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("panic.log"))
+    else {
+        return;
+    };
+    let _ = writeln!(
+        f,
+        "---- wind-dict panic ----\n构建: {}\n位置: {location}\n消息: {msg}\n",
+        if cfg!(debug_assertions) {
+            "dev"
+        } else {
+            "release"
+        },
+    );
+}
+
 /// 打开用户数据库：`%LOCALAPPDATA%\wind-dict-data\userdata.db`。
 ///
 /// 位置由两条否定性约束确定——**不在部署目录内**（`dev.ps1` 卸载会
@@ -112,6 +179,11 @@ fn open_userdata() -> UserDataState {
 
 /// 用户数据库路径，必要时建目录。
 fn userdata_path() -> Result<PathBuf, String> {
+    Ok(userdata_dir()?.join("userdata.db"))
+}
+
+/// 用户数据目录，必要时建出来。库与崩溃日志都落在这里。
+fn userdata_dir() -> Result<PathBuf, String> {
     let base = std::env::var_os("LOCALAPPDATA").ok_or("环境变量 LOCALAPPDATA 未设置")?;
     // `wind-dict-data` 而非 `wind-dict`：后者是部署目录，卸载时会被整个删除。
     //
@@ -125,7 +197,7 @@ fn userdata_path() -> Result<PathBuf, String> {
         "wind-dict-data"
     });
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败：{}（{e}）", dir.display()))?;
-    Ok(dir.join("userdata.db"))
+    Ok(dir)
 }
 
 /// 词库路径。优先级：命令行参数 > 设置 > exe 同目录。
@@ -184,10 +256,43 @@ fn icon() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::positional_dicts;
+    use super::{append_panic_log, positional_dicts};
 
     fn 参数(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 崩溃日志是**排查偶发崩溃的唯一线索**：release 无控制台，panic 落在窗口过程里
+    /// 时连 Rust 的错误消息都到不了任何地方。若这段写盘悄悄失灵，下一次崩溃仍然什么
+    /// 都留不下——而那正是它存在的全部意义。故它必须有测试。
+    #[test]
+    fn 崩溃日志写得下位置与消息() {
+        let dir = std::env::temp_dir().join(format!("wind-dict-panic-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        append_panic_log(&dir, "src/ui.rs:42:7", "候选下标越界");
+
+        let got = std::fs::read_to_string(dir.join("panic.log")).expect("日志该已写出");
+        assert!(got.contains("src/ui.rs:42:7"), "位置该在日志里：{got}");
+        assert!(got.contains("候选下标越界"), "消息该在日志里：{got}");
+
+        // 第二次崩溃不该把第一次冲掉——偶发问题要攒够几条才看得出共性。
+        append_panic_log(&dir, "src/ui.rs:99:1", "第二次");
+        let got = std::fs::read_to_string(dir.join("panic.log")).expect("日志该仍在");
+        assert!(got.contains("候选下标越界"), "首条不该被覆盖：{got}");
+        assert!(got.contains("第二次"), "次条该已追加：{got}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 目录不存在时**不得 panic**：这段代码是在 panic 钩子里跑的，它自己再 panic
+    /// 会把现场彻底毁掉（双重 panic 直接 abort，连默认钩子的输出都没有）。
+    #[test]
+    fn 日志写不下去也不会再崩一次() {
+        append_panic_log(
+            std::path::Path::new("Z:/绝不存在的盘/也不存在的目录"),
+            "src/x.rs:1:1",
+            "无处可写",
+        );
     }
 
     #[test]
