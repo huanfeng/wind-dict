@@ -174,7 +174,11 @@ function Do-Run {
 function Set-AutoStart ([string]$dir, [string]$name) {
     $exe = Join-Path $dir "wind-dict.exe"
     try {
-        Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name $name -Value "`"$exe`"" -Force
+        # 末尾的 --tray 必须带: 程序按它区分"开机自启"与"用户双击图标"——不带就会
+        # 显示窗口 (见 src/autostart.rs 的 TRAY_ARG)。这里与 autostart::command()
+        # 写的是同一条命令行, 两边必须一致, 否则程序每次启动都会把它改回去
+        # (repair_if_stale)。
+        Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name $name -Value "`"$exe`" --tray" -Force
         Gray "  - 已配置开机自启 ($name)"
     } catch { Warn "  - 配置开机自启失败: $($_.Exception.Message)" }
 }

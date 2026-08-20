@@ -18,6 +18,10 @@ use wind_dict::ui;
 
 fn main() {
     install_panic_log();
+    // 自启项若还是旧格式（没有 `--tray`）或指着旧路径，就地改写。静默忽略失败：
+    // 这是一次**修复**，不是用户此刻要求的动作，为它弹错不成比例；真要改自启，
+    // 设置页那个开关会如实报错。
+    let _ = wind_dict::autostart::repair_if_stale();
     // 用户数据先开：设置存在其中，而词库路径、热键、皮肤都要由设置决定。
     //
     // 用户数据打不开**不致命**：查询是主体功能，收藏与历史是其增益，为后者让整个
@@ -82,10 +86,21 @@ fn main() {
         .renderer(Renderer::Auto)
         .theme(skin.theme.clone())
         .tray(tray)
-        // 常驻：启动不闪窗口，关闭只收起，进程始终活着等热键。见 ADR-0006。
-        .start_hidden()
+        // 常驻：关闭只收起，进程始终活着等热键。见 ADR-0006。
         .hide_on_close()
         .screenshot_from_args();
+
+    // **只有开机自启才收进托盘**，手动运行照常显示窗口。
+    //
+    // 此前 `start_hidden()` 是无条件的，依据是 ADR-0006 的「常驻工具启动不该闪窗口」。
+    // 那条只对**开机自启**成立：开机时弹一个词典窗口是打扰。但同一段代码也管住了用户
+    // **双击图标**的情形，而那时他刚刚亲手表达了「我要用它」——却什么也没发生。除非
+    // 他知道去按热键或翻托盘，否则这个程序看起来就是坏的。
+    //
+    // 判据是命令行开关（见 `autostart::TRAY_ARG`），由自启项自己带上。
+    if launched_for_tray() {
+        app = app.start_hidden();
+    }
 
     // 两个句柄都必须在 `content` **之前**取到——界面要拿着它们才能即时换肤、改键。
     let theme = app.theme_handle();
@@ -249,6 +264,20 @@ fn positional_dicts(args: &[String]) -> Option<(PathBuf, PathBuf)> {
     }
 }
 
+/// 本次启动是否该直接收进托盘。见 `autostart::TRAY_ARG`。
+fn launched_for_tray() -> bool {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    wants_tray(&args)
+}
+
+/// 参数里是否带托盘开关。
+///
+/// 与 `launched_for_tray` 分开是为了能测：直接读 `std::env::args()` 的函数在单测里
+/// 没法喂参数，而「带不带这个开关」正是决定用户双击图标后有没有窗口的那一下。
+fn wants_tray(args: &[String]) -> bool {
+    args.iter().any(|a| a == wind_dict::autostart::TRAY_ARG)
+}
+
 /// 托盘图标：16×16 纯色 RGBA8（占位，免捆绑资源文件）。
 fn icon() -> Vec<u8> {
     [0x4C, 0x8B, 0xF5, 0xFF].repeat(16 * 16)
@@ -256,7 +285,7 @@ fn icon() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_panic_log, positional_dicts};
+    use super::{append_panic_log, positional_dicts, wants_tray};
 
     fn 参数(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -316,6 +345,35 @@ mod tests {
         assert!(
             positional_dicts(&参数(&["--screenshot", "out.png", "--click", "28", "596"])).is_none(),
             "--click 的坐标不该被当成词库路径"
+        );
+    }
+
+    /// 自启项现在会带 `--tray`（见 `autostart::TRAY_ARG`）。它是无值开关，本不该影响
+    /// 位置参数，但「有开关就整体不认」这条把它也一并挡了——挡对了：开机自启的命令行
+    /// 里本就没有词库路径，认与不认结果相同，而放宽规则去逐个识别开关正是那条注释
+    /// 拒绝的做法。这里把它钉住，免得日后有人为了 `--tray` 去动那条规则。
+    #[test]
+    fn 托盘开关不被当成词库路径() {
+        assert!(positional_dicts(&参数(&[wind_dict::autostart::TRAY_ARG])).is_none());
+        assert!(
+            positional_dicts(&参数(&["ec.db", "ce.db", wind_dict::autostart::TRAY_ARG])).is_none(),
+            "混入开关时整体不认，位置参数也不该生效"
+        );
+    }
+
+    /// `--tray` 在与不在，决定的是「收进托盘」还是「显示窗口」。这条判定错了，用户
+    /// 双击图标会毫无反应（此前正是如此），或者开机时被弹一个窗口。
+    #[test]
+    fn 仅带托盘开关时才收进托盘() {
+        assert!(!wants_tray(&参数(&[])), "手动双击（无参数）应显示窗口");
+        assert!(
+            wants_tray(&参数(&[wind_dict::autostart::TRAY_ARG])),
+            "自启（带开关）应收进托盘"
+        );
+        assert!(!wants_tray(&参数(&["--traylike"])), "不该按前缀匹配");
+        assert!(
+            wants_tray(&参数(&["ec.db", "ce.db", "--tray"])),
+            "开关出现在任意位置都算"
         );
     }
 }

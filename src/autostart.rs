@@ -20,9 +20,20 @@
 /// **一经发布不得更改**。
 const VALUE_NAME: &str = "wind-dict";
 
+/// 开机自启时附加的命令行开关：**带它才收进托盘，不带就正常显示窗口**。
+///
+/// 起因是「双击图标什么也不发生」。此前 `main` 无条件 `start_hidden()`，因为常驻工具
+/// 开机时不该弹窗——但那个理由只对**开机自启**成立。用户手动双击 exe 时同样不弹窗，
+/// 表现就是「点了没反应」，除非他知道要去按热键或找托盘图标。
+///
+/// 判据放在命令行而不是别处，是因为只有它能区分这两种启动：自启项由本程序自己写入
+/// （`set`），我们完全掌握它带什么参数；用户手动运行则不会带。环境变量、父进程名
+/// 之类都是间接推断，且用户手动跑一次带参数的命令时会失灵。
+pub const TRAY_ARG: &str = "--tray";
+
 #[cfg(windows)]
 mod imp {
-    use super::VALUE_NAME;
+    use super::{TRAY_ARG, VALUE_NAME};
     use anyhow::{bail, Context, Result};
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
@@ -57,18 +68,22 @@ mod imp {
         Ok(key)
     }
 
-    /// 当前 exe 路径，带引号。
+    /// 自启项该写入的完整命令行：`"<exe 路径>" --tray`。
     ///
-    /// **必须带引号**：路径含空格时（`C:\Program Files\...`）不加引号会被解析成
+    /// **路径必须带引号**：含空格时（`C:\Program Files\...`）不加引号会被解析成
     /// 「运行 C:\Program，参数 Files\...」，开机时静默失败，而用户只会看到「自启没生效」。
-    fn quoted_exe() -> Result<String> {
+    ///
+    /// 末尾的 `--tray` 见 [`super::TRAY_ARG`]：开机自启要收进托盘，手动运行要显示窗口。
+    pub fn command() -> Result<String> {
         let exe = std::env::current_exe().context("取当前程序路径失败")?;
-        Ok(format!("\"{}\"", exe.display()))
+        Ok(format!("\"{}\" {}", exe.display(), TRAY_ARG))
     }
 
-    pub fn is_enabled() -> Result<bool> {
+    /// 读回 Run 键里我们那一项的值。不存在返回 `None`（正常状态，不是错误）。
+    fn read_value() -> Result<Option<String>> {
         let key = open_run(false)?;
         let name = HSTRING::from(VALUE_NAME);
+        // 两趟：先问长度，再按长度取。REG_SZ 的长度以**字节**计，宽字符故 /2。
         let mut size: u32 = 0;
         let r = unsafe {
             RegQueryValueExW(
@@ -80,15 +95,61 @@ mod imp {
                 Some(&mut size as *mut u32),
             )
         };
+        if r.is_err() {
+            unsafe { RegCloseKey(key).ok().ok() };
+            return Ok(None);
+        }
+        let mut buf = vec![0u16; (size as usize).div_ceil(2)];
+        let r = unsafe {
+            RegQueryValueExW(
+                key,
+                PCWSTR(name.as_ptr()),
+                None,
+                None,
+                Some(buf.as_mut_ptr() as *mut u8),
+                Some(&mut size as *mut u32),
+            )
+        };
         unsafe { RegCloseKey(key).ok().ok() };
-        // 值不存在是正常状态（未开启自启），不是错误。
-        Ok(r.is_ok())
+        if r.is_err() {
+            return Ok(None);
+        }
+        // REG_SZ 存的字符串**可能**带结尾 NUL，也可能不带（写入方决定）。两种都要收。
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        Ok(Some(String::from_utf16_lossy(&buf[..end])))
+    }
+
+    /// 自启已开启、但记的命令行不是现在该写的那条时，就地改写。返回是否改写过。
+    ///
+    /// 两种情况会走到这里，都是真实的：
+    /// 1. **旧版本写的值没有 `--tray`**。不修的话，老用户升级后开机会突然弹出窗口——
+    ///    而他当初打开这个开关要的正是「安静地待在托盘里」。
+    /// 2. **程序被挪了地方**。`dev.ps1` 部署到别处、或用户手动搬目录之后，注册表里
+    ///    还指着旧路径，开机自启静默失效。这个缺陷此前一直在，只是没人发现。
+    ///
+    /// **只在已开启时修**：关着的时候什么都不做，绝不因为「路径对不上」就替用户打开
+    /// 自启——那是在替他做决定。
+    pub fn repair_if_stale() -> Result<bool> {
+        let Some(current) = read_value()? else {
+            return Ok(false);
+        };
+        let want = command()?;
+        if current == want {
+            return Ok(false);
+        }
+        set(true)?;
+        Ok(true)
+    }
+
+    pub fn is_enabled() -> Result<bool> {
+        // 值不存在是正常状态（未开启自启），不是错误——`read_value` 已按这条返回 `None`。
+        Ok(read_value()?.is_some())
     }
 
     pub fn set(on: bool) -> Result<()> {
-        // 先取路径再开键：`quoted_exe()` 的 `?` 若在开键之后早退，句柄就漏了。
+        // 先取命令行再开键：`command()` 的 `?` 若在开键之后早退，句柄就漏了。
         let value = if on {
-            Some(HSTRING::from(quoted_exe()?))
+            Some(HSTRING::from(command()?))
         } else {
             None
         };
@@ -131,6 +192,11 @@ mod imp {
     pub fn set(_on: bool) -> Result<()> {
         bail!("当前平台不支持开机自启")
     }
+
+    /// 没有自启项可修——非 Windows 上本模块整体不支持自启（见模块头）。
+    pub fn repair_if_stale() -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// 当前是否已设置开机自启。
@@ -144,4 +210,11 @@ pub fn is_enabled() -> anyhow::Result<bool> {
 /// 才发现没生效。与收藏写入失败的处理是同一条原则。
 pub fn set(on: bool) -> anyhow::Result<()> {
     imp::set(on)
+}
+
+/// 自启已开启但记的命令行过时（缺 [`TRAY_ARG`]、或程序已挪位）时就地改写。
+///
+/// 返回是否改写过。启动时调一次即可，见 `main`。
+pub fn repair_if_stale() -> anyhow::Result<bool> {
+    imp::repair_if_stale()
 }
