@@ -128,8 +128,23 @@ const PAGE_SETTINGS: usize = 1;
 /// Windows 自带的中文衬线只有宋体，大字号下笔画细弱、观感陈旧，回退反而更好。
 const SERIF: &str = "Georgia";
 
-/// 词头字号。比正文大一个数量级——词头是这一屏的主角，其余都是它的注解。
-const HEADWORD_SIZE: f32 = 42.0;
+/// 词头字号。
+///
+/// 从 42 收到 30。42 是配那版「右边挂一个 42px 描边星标方块」的词头行定的，两者互相
+/// 撑着，看久了整块像一张招牌而不是一个词条标题。星标收到 32、去掉描边之后（见
+/// `star`），词头再占 42 就成了孤立的大字。30 仍是全屏最大的字号，主角地位不变。
+///
+/// 另一层理由与设备有关：本项目的日常使用环境是 200% 缩放的屏幕，42 逻辑像素在那儿
+/// 落成 84 物理像素——纸质词典里没有这么大的词头。定字号时只看 1x 截图会漏掉这件事。
+const HEADWORD_SIZE: f32 = 30.0;
+
+/// 查询框高度。输入框与叠在其上的清除按钮共用（见 `query_box`）。
+///
+/// 从 50 收到 42。50 那版的理由是「查询框是这一屏的主控件，给足分量」，但那句话只在
+/// **开屏**成立：查完之后主角是词条，而一条 50px 高、横贯整屏的输入框仍是画面最重的
+/// 元素，把注意力钉在一个已经用完的控件上。42 仍明显高于普通输入框（windui 默认 32），
+/// 开屏时的分量够用，读词条时不再压场。
+const QUERY_H: i32 = 42;
 
 /// 强调色淡底的不透明度。用于列表选中行、已收藏星标的底。
 ///
@@ -144,11 +159,17 @@ const ACCENT_SOFT_A: f32 = 0.14;
 /// 用不上，给了反而平白拉高行盒。
 const BODY_LH: f32 = 1.7;
 
-/// 正文最大宽度。
+/// 英英释义的最大宽度。
 ///
-/// 行太长时，眼睛从行尾回到下一行行首容易串行，长段落尤其明显。窗口拉宽后主列
-/// 会一直变宽，故需要一个上界把正文收在舒适的行长内——多出来的宽度宁可留白。
-const BODY_MAX_W: i32 = 640;
+/// 这里曾是一条 `BODY_MAX_W = 640` 的**整段正文**限宽，已经撤掉：920 宽的窗口配 640
+/// 的正文，右侧空出近三百像素，收藏星标孤零零地挂在 640 处离窗口右缘还有一大截，
+/// 整个画面左重右空。「限宽护住行长」这条道理没错，但它只对**长句成段**的文字成立，
+/// 而这一屏的正文九成是中文释义的顿号并列（「制造、安排、创造、构成…」）——那是词条
+/// 列表，不是段落，一行排满反而少占两行、密度更高。
+///
+/// 真正需要它的只有英英释义：那是成句的英文散文，且默认折叠、展开才出现。故限宽从
+/// 「所有正文」收缩到「只有这一段」，两边的道理都保住了。
+const EN_DEF_MAX_W: i32 = 720;
 
 /// 侧栏的一行。
 #[derive(Clone, PartialEq, Eq)]
@@ -391,6 +412,8 @@ struct State {
     /// 用两步确认而非弹模态框：清空不可撤销，但为它拉起一个系统模态框在常驻小工具上
     /// 过重；而「点一次变成『确认清空』，再点才真清」既拦得住误触，又不打断心流。
     confirm_clear: Signal<bool>,
+    /// 换肤重建计数。图标的颜色是构建期解析的，换肤后必须重建整树才会跟上，见 `build`。
+    skin_rev: Signal<Vec<u64>>,
     /// 设置页的重建计数。
     ///
     /// 设置页上有若干**构建时求值**的显示——皮肤卡片的选中环、词库路径文字。它们
@@ -673,10 +696,10 @@ impl State {
         self.settings_note.set(String::new());
     }
 
-    /// 点 rail 上的召回按钮：开抽屉并切到该页签；已经停在这一页则收起。
+    /// 点标题栏上的召回入口：开抽屉并切到该页签；已经停在这一页则收起。
     ///
     /// 「再点一次收起」这条是刻意的：入口就那一个，若只负责打开，关抽屉就只剩头部
-    /// 那个 ×，而人手已经在 rail 上了。
+    /// 那个 ×，而人手已经在标题栏上了。
     fn toggle_drawer(&self, tab: usize) {
         if self.drawer_open.get() && self.side_tab.get() == tab {
             self.drawer_open.set(false);
@@ -724,6 +747,9 @@ impl State {
     fn set_skin(&self, kind: SkinKind) {
         self.settings.borrow_mut().skin = kind;
         self.theme.set(kind.skin().theme);
+        // 文字与色块靠 `Role` 每帧自己跟上，图标不行——它的颜色在构建期就解析成了具体
+        // 色值（见 `crate::icon`）。重建整树是唯一能让图标跟上的办法，理由见 `build`。
+        bump(self.skin_rev);
         if self.save_settings() {
             self.note_clear();
         } else {
@@ -1070,10 +1096,34 @@ pub fn build(
         settings_note_tone: signal(Role::Danger),
         confirm_clear: signal(false),
         settings_rev: signal(vec![0]),
+        skin_rev: signal(vec![0]),
     });
     // 开屏即列出历史：侧栏空着会让人以为功能坏了。
     st.reload_side();
 
+    // 整棵树挂在 `skin_rev` 上：换肤时重建一次。
+    //
+    // **为什么又要重建了**。ADR-0012 结案时的结论是「界面无一处写死颜色，全部走 `Role`，
+    // 故换肤只需 `ThemeHandle::set`，下一帧全树按新色板重新解析」——那条对**文字与色块**
+    // 至今成立。图标不成立：windui 的 `ImageContent::tint` 收 `Color` 而非 `Role`，
+    // 且按钮画图标时用的是图标自带的 tint、不套用按钮前景色，故图标的颜色只能在**构建期**
+    // 解析（见 `crate::icon` 的模块头）。构建期取的值不会自己更新，只能重建。
+    //
+    // 取舍：要么图标换肤后颜色不跟（深色皮肤下一个深灰的 × 等于看不见），要么换肤重建
+    // 一次。选后者。换肤是用户主动、低频的动作，而重建的代价这里几乎为零——查询词、
+    // 候选、结果卡片、展开态全都活在元素树**之外**的信号里（这正是 `ExpandedStates`
+    // 当初被搬出树的理由），重建后原样还在。会丢的只有滚动位置与 hover 态。
+    //
+    // 只包一层、不逐处细分：漏掉任何一处含图标的子树，就会出现「有的跟了有的没跟」，
+    // 那是最难查的一类不一致。整树重建换来的是「不可能漏」。
+    Element::host_signal(st.skin_rev, move |_rev: u64| {
+        // `host_signal` 的回调是 `Fn`，会被反复调用，故每次都得拿一份自己的。
+        window_root(st.clone(), unavailable.clone())
+    })
+}
+
+/// 窗口根：标题栏 + 分隔线 + 主体。每次换肤重建一次，见 `build`。
+fn window_root(st: Rc<State>, unavailable: Option<String>) -> Element {
     // 无系统标题栏：整窗都是客户区，故顶部这条标题栏由我们自己画（见 `title_bar`）。
     Element::col()
         .fill()
@@ -1097,14 +1147,25 @@ fn title_bar(st: Rc<State>) -> Element {
         .bg_role(Role::SurfaceAlt)
         .window_drag()
         .child(brand().weight(1.0))
-        // 设置入口。DESIGN.md 把设置归在 title/toolbar controls；它此前在侧栏底部，
-        // 而侧栏已经不存在了。
+        // 召回与设置三个入口并列在这里。
         //
-        // 用文字而非齿轮图标：U+2699 在 Windows 上会被 Segoe UI Emoji 接管，画出来是
-        // 一个彩色齿轮，与这一屏的单色符号格格不入（变体选择符 U+FE0E 无效，windui
-        // 的文本渲染不处理它）。走 SVG 又要 `ImageContent::tint` 定一个具体颜色，
-        // 换肤时它不会跟着变——ADR-0012 结案段刚把「界面无一处写死颜色」这条挣回来。
-        // 两条路都不通，而「设置」二字本来就比任何图标都准确。
+        // 召回入口此前是右侧一条 44px 常驻 rail 上的两个字形（`↺` `☆`）。撤掉它有两
+        // 条独立的理由：
+        //
+        // 1. **认不出来**。使用者把 `↺` 读成了「刷新」——这不是他看得不够仔细，而是
+        //    U+21BA 本来就是通用的循环/重载符号，把它当「历史」用是我们一厢情愿。
+        //    图标要么用公认字形，要么就别用；`历史` 二字没有第二种读法。
+        // 2. **它吃掉了正文右边的一条**。rail 常驻 44px + 左边框，正文永远够不到窗口
+        //    右缘。而正文限宽撤掉之后（见 `EN_DEF_MAX_W`），铺满右侧正是这次重排要的
+        //    效果，留一条灰带在那儿等于白撤。
+        //
+        // 用文字而非图标同样适用于设置：U+2699 在 Windows 上会被 Segoe UI Emoji 接管，
+        // 画出来是一个彩色齿轮，与这一屏的单色格调格格不入（变体选择符 U+FE0E 无效，
+        // windui 的文本渲染不处理它）。走 SVG 又要 `ImageContent::tint` 定一个具体
+        // 颜色，换肤时它不会跟着变——ADR-0012 结案段刚把「界面无一处写死颜色」这条
+        // 挣回来。
+        .child(recall_entry("历史", TAB_HISTORY, st.clone()))
+        .child(recall_entry("收藏", TAB_FAVORITES, st.clone()))
         .child(settings_entry(st))
         // 窗口按钮的宽度（46px，与设计一致）、图标形状与 hover 色均由 windui 硬编码，
         // 只有图标色可调。框架的 `BTN_H = 32` 在这里不生效——本行 `cross(Stretch)`
@@ -1124,14 +1185,34 @@ fn title_bar(st: Rc<State>) -> Element {
 /// 走的是同一条规则（见 `title_bar` 的说明）。
 fn settings_entry(st: Rc<State>) -> Element {
     let page = st.page;
+    bar_entry("设置", move |_ctx| page.set(PAGE_SETTINGS))
+}
+
+/// 标题栏上的一个召回入口：开抽屉并切到该页签；已经停在这一页则收起。
+///
+/// 「再点一次收起」这条是刻意的：入口就这一个，若它只负责打开，关抽屉就只剩抽屉头部
+/// 那个 ×，而人手已经在这儿了。
+fn recall_entry(text: &str, tab: usize, st: Rc<State>) -> Element {
+    bar_entry(text, move |_ctx| st.toggle_drawer(tab))
+}
+
+/// 标题栏上的一个文字入口。
+///
+/// 落在 `window_drag` 区域内仍可点：windui 按「命中可聚焦控件则不拖」处理，窗口按钮
+/// 走的是同一条规则（见 `title_bar` 的说明）。
+///
+/// **不画激活态**。抽屉开着时它头部的分段控件已经写明当前停在哪一页，标题栏再标一次
+/// 是重复；而 windui 的 `bg_role` 是构建期定死的，要让它跟着信号变得多叠一个节点——
+/// 为一份冗余信息付这个代价不值。
+fn bar_entry(text: &str, on_click: impl FnMut(&mut EventCtx) + 'static) -> Element {
     Element::row()
         .cross(Align::Center)
-        .padding_xy(12, 0)
+        .padding_xy(11, 0)
         .height_match()
         .clickable()
-        .on_click(move |_ctx| page.set(PAGE_SETTINGS))
+        .on_click(on_click)
         .child(
-            Element::label("设置")
+            Element::label(text.to_string())
                 .font_size(12.5)
                 .fg_role(Role::TextMuted),
         )
@@ -1144,25 +1225,18 @@ fn brand() -> Element {
         .spacing(9)
         .padding_xy(14, 0)
         .child(
-            // 图标：强调色圆角块 + 一个「词」字。用汉字而非拉丁字母首字母，
-            // 因为这是个中英双向的词典，汉字比 "W" 更说明它是什么。
+            // 应用标识。**与托盘、任务栏是同一份产物**（`scripts/gen-icon.ps1`），
+            // 三处必然一致。
             //
-            // 居中靠**外层容器**而非 `text_align`：后者只管水平（见 windui
-            // `Element::text_align` 的文档），单靠它会让 12px 的字顶在 20px 块的
-            // 上沿。这是 windui 自己 `badge_intent` 的写法。
-            Element::row()
-                .cross(Align::Center)
-                .size(20, 20)
-                .bg_role(Role::Accent)
-                .corner(5.0)
-                .child(
-                    Element::label("词")
-                        .font_size(12.0)
-                        .font_weight(600)
-                        .fg_role(Role::OnAccent)
-                        .width_match()
-                        .text_align(Align::Center),
-                ),
+            // 此前是「`Role::Accent` 圆角块 + 一个 12px 的『词』字」，靠容器
+            // `cross(Center)` + `text_align(Center)` 凑居中——而实机上它明显偏左上：
+            // 汉字的字面框比 GDI/DirectWrite 的行盒窄且不对称，两个方向的居中都是按
+            // **行盒**算的，字面自然落不到正中。这类偏移调不出来，因为可调的量
+            // （字号、padding）都不是它的成因。
+            //
+            // 换成图片就没有「让字居中」这个问题了——居中在设计期由绘制脚本一次性
+            // 解决，运行期只是贴一张图。
+            crate::icon::app(20),
         )
         .child(
             Element::label("wind-dict")
@@ -1186,11 +1260,13 @@ fn brand() -> Element {
         )
 }
 
-/// 主体区域：主列 + 召回抽屉 + 图标 rail。
+/// 主体区域：主列 + 召回抽屉。
 ///
 /// 召回从常驻侧栏改成按需抽屉，依据是 DESIGN.md 的「Search is home / Recall is a
 /// drawer」：默认可见的界面该服务**下一次**查询，而 224px 的历史列表是在回顾上一次。
-/// 抽屉收起时主列独占整个宽度，只留 44px 的 rail 作入口。
+///
+/// 抽屉收起时主列独占**整个**宽度——一像素也不留。入口已经移到标题栏（见
+/// `recall_entry`），此处不再有 rail，「怎么把抽屉叫出来」仍然一直看得见。
 fn body(st: Rc<State>, unavailable: Option<String>) -> Element {
     Element::row()
         .fill()
@@ -1203,8 +1279,7 @@ fn body(st: Rc<State>, unavailable: Option<String>) -> Element {
         // 这里：位置由「必须先于所有消费者」这条约束决定，不再是左右布局的副产品。
         .child(side_loader(st.clone()))
         .child(pages(st.clone(), unavailable).weight(1.0))
-        .child(drawer(st.clone()))
-        .child(rail(st))
+        .child(drawer(st))
 }
 
 /// 列表驱动器：零尺寸、不可见，重载召回列表并刷新结果区星标。位置约束见 `body`。
@@ -1255,42 +1330,9 @@ fn drawer_head(st: Rc<State>) -> Element {
         // 而这里两页是同一个列表的两种来源，切过去人还在抽屉里。
         .child(Element::segmented(vec!["历史", "收藏"], st.side_tab).weight(1.0))
         .child(
-            Element::icon_button("×")
-                .fg_role(Role::TextDisabled)
+            crate::icon::button(crate::icon::CLOSE, 26, Role::TextDisabled)
                 .on_click(move |_ctx| open.set(false)),
         )
-}
-
-/// 右侧 rail：召回入口，44px 常驻。
-///
-/// 常驻而非悬浮：抽屉可以收起，但「怎么把它叫出来」必须一直看得见。DESIGN.md 的
-/// 组件清单里这条叫 Collapsed recall rail。
-///
-/// **只放召回**。设置去了标题栏——DESIGN.md 把设置归在 title/toolbar controls，而
-/// 这条 rail 按定义是 recall rail；把两类东西摞在一列里，那道分隔线就没法解释。
-fn rail(st: Rc<State>) -> Element {
-    Element::col()
-        .width(44)
-        .height_match()
-        .cross(Align::Center)
-        .padding_xy(0, 8)
-        .spacing(4)
-        .bg_role(Role::SurfaceAlt)
-        .border_role(Role::Divider, 1)
-        .border_edges(Edges::LEFT)
-        .child(rail_button("↺", TAB_HISTORY, st.clone()))
-        .child(rail_button("☆", TAB_FAVORITES, st))
-}
-
-/// rail 上的一个召回按钮：开抽屉并切到该页签；已经停在这一页则收起。
-///
-/// **不画激活态**。抽屉开着时头部的分段控件已经写明当前是哪一页，rail 再标一次是
-/// 重复；而 windui 的 `bg_role` 是构建期定死的，要让它跟着信号变得叠两个节点——
-/// 为一份冗余信息付这个代价不值。
-fn rail_button(glyph: &str, tab: usize, st: Rc<State>) -> Element {
-    Element::icon_button(glyph)
-        .fg_role(Role::TextMuted)
-        .on_click(move |_ctx| st.toggle_drawer(tab))
 }
 
 /// 主列：词典页与设置页叠在一起，按 `page` 切换。
@@ -1373,17 +1415,15 @@ fn side_row(r: SideRow, st: Rc<State>) -> Element {
             .weight(1.0),
     )
     .child(
-        Element::icon_button("×")
-            .fg_role(Role::TextDisabled)
+        crate::icon::button(crate::icon::CLOSE, 24, Role::TextDisabled)
             .on_click(move |_ctx| del_st.remove_side_row(&del_hw)),
     )
 }
 
 /// 主列：查询框 + 补全候选 + 结果。
 fn main_column(st: Rc<State>, unavailable: Option<String>) -> Element {
-    // 左右 28px 而非 16。原先的理由是「与侧栏拉开距离」，侧栏已经不在了，但这个值仍
-    // 该保留：现在它管的是正文与窗口边缘、与右侧 rail 的距离——贴边的正文比挤在一起
-    // 的两栏更难读。设计稿此处是 40px，那是在更宽的画布上。
+    // 左右 28px。rail 撤掉之后这个值管的是**正文与窗口边缘**的距离，两侧对称——正文
+    // 铺满不等于顶到窗框上，那样读起来局促。设计稿此处是 40px，那是在更宽的画布上。
     let mut root = Element::col().fill().padding_xy(28, 16).spacing(12);
     // 不可用时才占这一行：正常情况下不该为一个不会发生的故障留白。
     if let Some(why) = unavailable {
@@ -1413,7 +1453,6 @@ fn main_column(st: Rc<State>, unavailable: Option<String>) -> Element {
         // 设计稿此处的查询框右侧有一组 `Ctrl` `K` 键帽，未照做：本项目的唤起热键是
         // Ctrl+Alt+D（`main.rs`），而窗口内并没有 Ctrl+K 这个键位。画一组按了没用的
         // 键帽比不画更糟。
-        // 50px 高、12 圆角：查询框是这一屏的主控件，与设计稿一致地给足分量。
         .child(query_box(st.clone()))
         .child(notice_bar(st.notice, None))
         // 此处原有一条分隔线。拿掉了：候选区收起后它就紧贴查询框，把主列切成两截，
@@ -1454,23 +1493,11 @@ fn settings_page(st: Rc<State>) -> Element {
                 .border_role(Role::Divider, 1)
                 .border_edges(Edges::BOTTOM)
                 .child(
-                    Element::row()
-                        .size(32, 32)
-                        .cross(Align::Center)
-                        .corner(8.0)
-                        .clickable()
-                        .on_click(move |_ctx| {
-                            // 离开即撤销确认态：回来时不该还举着「确认清空」等人误触。
-                            confirm.set(false);
-                            page.set(PAGE_DICT);
-                        })
-                        .child(
-                            Element::label("←")
-                                .width_match()
-                                .text_align(Align::Center)
-                                .font_size(18.0)
-                                .fg_role(Role::Text),
-                        ),
+                    crate::icon::button(crate::icon::BACK, 32, Role::Text).on_click(move |_ctx| {
+                        // 离开即撤销确认态：回来时不该还举着「确认清空」等人误触。
+                        confirm.set(false);
+                        page.set(PAGE_DICT);
+                    }),
                 )
                 .child(
                     Element::label("设置")
@@ -1545,7 +1572,9 @@ fn data_rows(st: Rc<State>) -> Element {
         row(
             "收藏",
             Some(&format!("已收藏 {favs} 条")),
-            Element::label("在侧栏逐条取消")
+            // 「侧栏」这个词在界面上已经没有对应物很久了——先改成抽屉，这次连抽屉的
+            // 入口也移到了标题栏。指路的文案必须指得到，否则不如不写。
+            Element::label("在「收藏」里逐条取消")
                 .font_size(12.5)
                 .fg_role(Role::TextMuted),
         ),
@@ -1867,8 +1896,9 @@ fn unavailable_bar(why: &str) -> Element {
 /// 跟着变，光标位置跳一下。叠放则输入框始终定宽。
 ///
 /// `Layout::Frame` 用单个 `align` 同时定横纵（windui `core.rs:arrange_frame`），故
-/// 按钮做成与输入框等高（50px）的行，`Align::End` 在纵向偏移为零，横向贴右——
-/// 「右端居中」就是这么凑出来的，不是框架直接支持的对齐方式。
+/// 按钮做成与输入框**等高**（`QUERY_H`）的行，`Align::End` 在纵向偏移为零，横向贴右
+/// ——「右端居中」就是这么凑出来的，不是框架直接支持的对齐方式。两处高度必须一起改，
+/// 故抽成常量：写死成两个 50 时，改一处另一处就悄悄错位了。
 fn query_box(st: Rc<State>) -> Element {
     let query = st.query;
     let (submit_st, nav_st) = (st.clone(), st.clone());
@@ -1877,9 +1907,9 @@ fn query_box(st: Rc<State>) -> Element {
         .child(
             Element::text_input(st.query, "输入中文或英文…")
                 .width_match()
-                .height(50)
-                .corner(12.0)
-                .font_size(16.0)
+                .height(QUERY_H)
+                .corner(10.0)
+                .font_size(15.0)
                 // 唤起后焦点落在这里，并全选旧内容——常驻词典最高频的动作是「唤起 →
                 // 查另一个词」，而窗口只是被隐藏、上次的词原样还在框里。全选让下一个词
                 // 直接覆盖打上去，不用先删。
@@ -1912,13 +1942,12 @@ fn query_box(st: Rc<State>) -> Element {
         )
         .child(
             Element::row()
-                .height(50)
+                .height(QUERY_H)
                 .cross(Align::Center)
-                .padding_xy(12, 0)
+                .padding_xy(10, 0)
                 .align(Align::End)
                 .child(
-                    Element::icon_button("×")
-                        .fg_role(Role::TextDisabled)
+                    crate::icon::button(crate::icon::CLOSE, 26, Role::TextDisabled)
                         .on_click(move |_ctx| st.clear_query()),
                 )
                 // 空框上放一个「清空」按钮没有意义，且它会盖住占位符的尾部。
@@ -2007,7 +2036,13 @@ fn candidate_row(c: Candidate, at_cursor: bool, st: Rc<State>) -> Element {
         Element::label(word)
             .font_size(14.0)
             .font_weight(if at_cursor { 600 } else { 500 })
-            .fg_role(Role::Text),
+            .fg_role(Role::Text)
+            // 定宽让释义摘要对齐成一栏。词头长短不一（`make` 与 `makeshift` 差一倍），
+            // 不定宽的话每行的摘要起点各不相同，一列候选读下来是锯齿状的——而候选列表
+            // 的用法正是**竖着快速扫**，对不齐直接抵消它的价值。
+            //
+            // 超长词头照常把摘要推开，不截断：认出这是不是我要的那个词，靠的是词头本身。
+            .min_width(120),
     );
     // 释义摘要单行截断：它是判断「是不是我要的那个词」的依据，不是正文。让它换行会把
     // 行高撑开，一屏就列不下几条了——而候选列表的价值恰恰在于一眼扫过多条。
@@ -2036,16 +2071,9 @@ fn result_area(st: Rc<State>) -> Element {
                 .height(20)
                 .width_match(),
         )
-        .child(
-            Element::scroll().fill().child(
-                Element::host_signal(cards, move |c: Card| card_view(c, st.clone()))
-                    .width_match()
-                    // 正文限宽：窗口拉得再宽，行长也收在可读范围内，多出来的
-                    // 宽度留白。限宽在测量前生效，故释义是**在 640 内换行**，
-                    // 不是排完再裁。
-                    .max_width(BODY_MAX_W),
-            ),
-        )
+        .child(Element::scroll().fill().child(
+            Element::host_signal(cards, move |c: Card| card_view(c, st.clone())).width_match(),
+        ))
 }
 
 /// 一张词头卡片：大字词头 + 收藏星标 + 该词头下的全部词条。
@@ -2055,9 +2083,10 @@ fn card_view(c: Card, st: Rc<State>) -> Element {
     let mut col = Element::col().spacing(10).width_match().padding_xy(0, 10);
     col = col.child(
         Element::row()
-            // 顶对齐而非居中：星标是 42px 方块，与 42px 的词头居中对齐会让它掉到
-            // 词头视觉重心之下（词头有下伸部，实际占位高于字面）。
-            .cross(Align::Start)
+            // 改回居中对齐。此前是顶对齐，理由是「42px 的星标方块与 42px 的词头居中
+            // 会掉到词头视觉重心之下」——词头收到 30、星标收到 32 之后这条不再成立，
+            // 两者高度相当，居中就是对的。
+            .cross(Align::Center)
             .width_match()
             .spacing(14)
             .child(
@@ -2108,37 +2137,59 @@ fn note_field(hw: Headword, st: Rc<State>) -> Element {
                 .size(0, 0),
         )
         .child(
+            // 限宽：备注是一句自己写给自己的短话，不是正文。正文限宽撤掉之后它会跟着
+            // 横贯整屏，一个 1800px 宽的输入框在暗示「这里该写很多字」——与它的用途
+            // 相反。这是撤限宽时唯一需要单独兜住的控件。
             Element::text_input(text, "备注…")
                 .font_size(13.0)
                 .width_match()
+                .max_width(520)
                 .weight(1.0),
         )
 }
 
 /// 收藏星标。实心 = 已收藏。
 fn star(fav: bool, hw: Headword, st: Rc<State>) -> Element {
-    // 42×42 的带边框方块，而非一个裸图标：收藏是这一屏唯一的写操作，给它一个明确的
-    // 可点区域。已收藏时填淡底 + 强调色实心星，未收藏是空心星，两态一眼可辨。
-    let mut btn = Element::row()
-        .size(42, 42)
-        .cross(Align::Center)
-        .corner(11.0)
-        .border_role(if fav { Role::Accent } else { Role::Border }, 1)
+    // 32×32，**未收藏时不画边框**。
+    //
+    // 此前是 42×42 且两态都描边，于是它在整屏上比词头还抢眼——一个淡蓝描边的圆角方块
+    // 压在词头旁边，眼睛先看到的是按钮而不是词。收藏确实是这一屏唯一的写操作，需要
+    // 一个明确的可点区域，但「明确」由尺寸（32px 已远超指尖/指针的命中要求）和位置
+    // （词头行最右）负责，不必再叠一圈边框。
+    //
+    // 已收藏时才上淡底 + 强调色实心星：那时它承载状态，值得被看见；未收藏时它只是
+    // 一个待命的动作，空心星足够。
+    //
+    // 星形走 SVG 而非 `★`/`☆` 字形：后者在 Windows 上被 emoji 字体接管，画出来带彩色
+    // 描边且**在方块里明显偏左上**——那不是对齐没调好，是字面框与行盒对不上，调不出来。
+    // 详见 `crate::icon`。
+    // 用 `stack` 而非 `row`：线性容器只有交叉轴对齐（`cross`），没有主轴对齐，18px 的
+    // 图标在 32px 的行里只能靠算 padding 顶到中间——那是把「居中」写成了一个减法，
+    // 图标尺寸一改就错位。`Layout::Frame` 的 `align` 同时定横纵（windui
+    // `core.rs:arrange_frame`），`Align::Center` 就是两轴都居中。
+    let mut btn = Element::stack()
+        .size(32, 32)
+        .corner(9.0)
         .clickable()
         .on_click(move |_ctx| st.toggle_favorite(&hw));
     if fav {
         btn = btn.bg_role_alpha(Role::Accent, ACCENT_SOFT_A);
     }
     btn.child(
-        Element::label(if fav { "★" } else { "☆" })
-            .font_size(19.0)
-            .width_match()
-            .text_align(Align::Center)
-            .fg_role(if fav {
+        crate::icon::view(
+            if fav {
+                crate::icon::STAR_FILLED
+            } else {
+                crate::icon::STAR
+            },
+            18,
+            if fav {
                 Role::Accent
             } else {
                 Role::TextDisabled
-            }),
+            },
+        )
+        .align(Align::Center),
     )
 }
 
@@ -2202,8 +2253,11 @@ fn entry_view(e: Entry, expanded: Signal<bool>) -> Element {
                 col = col.child(Element::collapsible(
                     "英英释义",
                     expanded,
+                    // 这一段单独限宽，理由见 `EN_DEF_MAX_W`：整屏正文里只有它是成句的
+                    // 英文散文，行长失控的风险是真的。
                     Element::label(en.clone())
                         .width_match()
+                        .max_width(EN_DEF_MAX_W)
                         .line_height(BODY_LH),
                 ));
             }
@@ -2268,15 +2322,34 @@ fn gloss_row(g: &crate::domain::Gloss) -> Element {
 }
 
 /// 词性胶囊。
+///
+/// 改成淡底无边框，并与词形变化那排（`inflection_row`）用同一套底色与圆角——两者都是
+/// 「挂在释义旁边的小标记」，此前一个描边、一个填底，同屏并列时像两套不相干的控件。
+///
+/// **定宽**：`vt.` `vi.` `n.` `adj.` 宽度各不相同，不定宽的话每一节的释义正文起始位置
+/// 都错开，读下来左边缘是锯齿状的。给一个够装 `adj.` 的下限，释义便对齐成一栏。
+///
+/// 保留强调色：词性是查词典时的主要扫视目标（「我要的是动词那一条」），它值得一个
+/// 与正文不同的颜色。去掉的只是衬线——那份「典籍感」由词头独自承担就够了，散在
+/// 小胶囊上只是把界面搅得字族杂乱。
 fn pos_chip(pos: &str) -> Element {
     Element::label(pos)
         .font_size(12.5)
         .font_weight(600)
-        .font_family(SERIF)
         .fg_role(Role::Accent)
-        .border_role(Role::Border, 1)
+        .bg_role(Role::SurfaceAlt)
         .corner(6.0)
-        .padding_xy(8, 3)
+        .padding_xy(8, 4)
+        .min_width(42)
+        .text_align(Align::Center)
+        // 往下挪 4px 与释义首行对齐。
+        //
+        // 释义带 `BODY_LH`（1.7）行高，18px 的字排在一个约 31px 的行盒里、上下各留一段
+        // 空隙；胶囊只有约 23px 高且没有行高加成。父行是 `Align::Start`，两者**顶边**
+        // 对齐，于是胶囊的视觉中心比释义首行的高出约 4px——看起来像浮在字的上方。
+        // 差值补在这里，而不是去动 `cross`：改成 `Center` 会让多行释义把胶囊拽到段落
+        // 正中，那比偏上更糟。
+        .margin_xy(0, 4)
 }
 
 /// 词形变化一排。
@@ -2313,9 +2386,7 @@ fn join(s: &Sense) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        group_by_headword, headwords_to_record, signal, write_note, ExpandedStates, Role,
-    };
+    use super::{group_by_headword, headwords_to_record, signal, write_note, ExpandedStates, Role};
     use crate::domain::{ChineseEntry, EnglishEntry, Entry, Headword, Inflections, Sense};
 
     fn 英汉(词头: &str) -> Entry {

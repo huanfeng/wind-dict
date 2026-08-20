@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use windui::prelude::*;
 
+use wind_dict::icon;
 use wind_dict::settings::Settings;
 use wind_dict::source::offline::OfflineDictionary;
 use wind_dict::store::userdata::{UserData, UserDataState};
@@ -53,7 +54,9 @@ fn main() {
 
     let tray = Tray::new()
         .tooltip(format!("wind-dict — {} 查询", settings.hotkey))
-        .icon_rgba(16, 16, &icon())
+        // 托盘图标与标题栏、任务栏是同一份产物（`scripts/gen-icon.ps1`）。此前这里是
+        // 一块 16×16 的纯蓝方块占位——托盘里一排图标中它是唯一认不出是什么的那个。
+        .icon_rgba(icon::TRAY_SIZE, icon::TRAY_SIZE, icon::TRAY_RGBA)
         .on_left_click(|ctx| ctx.show_window())
         .on_double_click(|ctx| ctx.show_window())
         .menu(vec![
@@ -68,11 +71,11 @@ fn main() {
     // 「接不上」，症结其实不在框架，而在我们把本可用角色表达的颜色写成了具体色值。
     let skin = settings.skin.skin();
 
-    // 窗口 920 宽：召回改成按需抽屉之后，常驻开销只剩 44px 的 rail，主列平时拿到
-    // 876px——远超设计稿正文限宽 640px，正文因此靠 `max_width` 自己收着，不再是被
-    // 侧栏挤出来的宽度。抽屉展开时主列 596px，仍装得下限宽后的正文。
+    // 窗口 920 宽：召回是按需抽屉、入口在标题栏，故抽屉收起时主列拿到**整个** 920，
+    // 释义一行排满不再有右侧留白（正文限宽已撤，见 `ui::EN_DEF_MAX_W`）。抽屉展开时
+    // 主列 640，仍是舒适的阅读宽度。
     let mut app = App::new("wind-dict", 920, 620)
-        // 下限按**抽屉展开态**定：720 时展开还剩 396px 给主列，勉强够读；再窄就该让
+        // 下限按**抽屉展开态**定：720 时展开还剩 440px 给主列，勉强够读；再窄就该让
         // 抽屉改为盖住主列而不是挤它（尚未实现），而不是让用户拖到一个不可用的尺寸。
         .min_size(720, 480)
         // 无系统标题栏：标题栏由 `ui::title_bar` 自绘，才能与整体配色一致。
@@ -276,11 +279,6 @@ fn launched_for_tray() -> bool {
 /// 没法喂参数，而「带不带这个开关」正是决定用户双击图标后有没有窗口的那一下。
 fn wants_tray(args: &[String]) -> bool {
     args.iter().any(|a| a == wind_dict::autostart::TRAY_ARG)
-}
-
-/// 托盘图标：16×16 纯色 RGBA8（占位，免捆绑资源文件）。
-fn icon() -> Vec<u8> {
-    [0x4C, 0x8B, 0xF5, 0xFF].repeat(16 * 16)
 }
 
 #[cfg(test)]

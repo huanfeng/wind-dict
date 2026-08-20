@@ -11,6 +11,7 @@
 
 pub mod autostart;
 pub mod domain;
+pub mod icon;
 pub mod settings;
 pub mod skin;
 pub mod source;
