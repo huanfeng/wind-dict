@@ -1,0 +1,1342 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>wind-dict search-first redesign</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --page-bg: #eef1f4;
+      --page-text: #17202a;
+      --page-muted: #607080;
+      --page-line: #d5dde5;
+      --page-panel: #ffffff;
+      --shadow: 0 22px 50px rgba(18, 27, 36, .16);
+      font-family: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-width: 980px;
+      color: var(--page-text);
+      background: var(--page-bg);
+    }
+
+    button,
+    input { font: inherit; }
+
+    .icon {
+      width: 18px;
+      height: 18px;
+      display: inline-block;
+      flex: 0 0 auto;
+      stroke: currentColor;
+      stroke-width: 1.9;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      fill: none;
+    }
+
+    .page {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 22px 24px 34px;
+    }
+
+    .top {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 14px;
+    }
+
+    .top h1 {
+      margin: 0 0 4px;
+      font-size: 20px;
+      line-height: 1.2;
+    }
+
+    .top p {
+      margin: 0;
+      color: var(--page-muted);
+      font-size: 13px;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 6px;
+      padding: 5px;
+      border: 1px solid var(--page-line);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, .75);
+    }
+
+    .tabs button {
+      height: 34px;
+      border: 0;
+      border-radius: 7px;
+      padding: 0 12px;
+      color: #354555;
+      background: transparent;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .tabs button[aria-selected="true"] {
+      color: #fff;
+      background: #162232;
+    }
+
+    .research {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+
+    .research article {
+      min-height: 96px;
+      padding: 12px 13px;
+      border: 1px solid var(--page-line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, .74);
+    }
+
+    .research strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 13px;
+    }
+
+    .research span {
+      display: block;
+      color: var(--page-muted);
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .mock {
+      display: none;
+    }
+
+    .mock.active {
+      display: block;
+    }
+
+    .flow-demo {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 0 0 12px;
+      padding: 10px 12px;
+      border: 1px solid var(--page-line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, .78);
+    }
+
+    .flow-demo strong {
+      font-size: 13px;
+    }
+
+    .flow-demo span {
+      color: var(--page-muted);
+      font-size: 12px;
+    }
+
+    .flow-buttons {
+      display: flex;
+      gap: 6px;
+      padding: 4px;
+      border: 1px solid var(--page-line);
+      border-radius: 9px;
+      background: #f7f9fb;
+    }
+
+    .flow-buttons button {
+      height: 30px;
+      border: 0;
+      border-radius: 6px;
+      padding: 0 10px;
+      color: #405163;
+      background: transparent;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+
+    .flow-buttons button[aria-pressed="true"] {
+      color: #fff;
+      background: #243447;
+    }
+
+    .window {
+      overflow: hidden;
+      width: 100%;
+      height: 720px;
+      border: 1px solid rgba(31, 41, 55, .2);
+      border-radius: 10px;
+      color: var(--text);
+      background: var(--bg);
+      box-shadow: var(--shadow);
+    }
+
+    .titlebar {
+      height: 38px;
+      display: flex;
+      align-items: center;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      background: var(--title);
+      user-select: none;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding-left: 13px;
+      color: var(--text);
+      font-size: 12.5px;
+      font-weight: 750;
+    }
+
+    .mark {
+      width: 21px;
+      height: 21px;
+      display: grid;
+      place-items: center;
+      border-radius: 6px;
+      color: var(--on-accent);
+      background: var(--accent);
+      font-size: 12px;
+      font-weight: 850;
+    }
+
+    .sub {
+      color: var(--muted);
+      font-weight: 500;
+    }
+
+    .spacer { flex: 1; }
+
+    .source {
+      height: 30px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 7px;
+      padding: 0 10px;
+      color: var(--text);
+      font-size: 12.5px;
+    }
+
+    .title-icon,
+    .win {
+      width: 38px;
+      height: 30px;
+      display: inline-grid;
+      place-items: center;
+      border: 0;
+      color: var(--muted);
+      background: transparent;
+    }
+
+    .title-icon.active {
+      color: var(--accent);
+      background: var(--accent-soft);
+      border-radius: 7px;
+    }
+
+    .win.close:hover {
+      color: #fff;
+      background: #e81123;
+    }
+
+    .min {
+      width: 13px;
+      height: 1px;
+      background: currentColor;
+    }
+
+    .max {
+      width: 12px;
+      height: 12px;
+      border: 1.5px solid currentColor;
+    }
+
+    .x {
+      position: relative;
+      width: 14px;
+      height: 14px;
+    }
+
+    .x::before,
+    .x::after {
+      content: "";
+      position: absolute;
+      left: 6px;
+      top: 0;
+      width: 1.5px;
+      height: 15px;
+      background: currentColor;
+    }
+
+    .x::before { transform: rotate(45deg); }
+    .x::after { transform: rotate(-45deg); }
+
+    .body {
+      height: calc(100% - 38px);
+      min-height: 0;
+      background: var(--bg);
+    }
+
+    .search {
+      min-width: 0;
+      height: 52px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0 9px 0 15px;
+      color: var(--text);
+      background: var(--surface);
+    }
+
+    .search input {
+      min-width: 0;
+      flex: 1;
+      border: 0;
+      outline: 0;
+      color: inherit;
+      background: transparent;
+      font-size: 18px;
+    }
+
+    .icon-btn {
+      width: 34px;
+      height: 34px;
+      display: inline-grid;
+      place-items: center;
+      border: 0;
+      border-radius: 7px;
+      color: var(--muted);
+      background: transparent;
+    }
+
+    .icon-btn.active {
+      color: var(--accent);
+      background: var(--accent-soft);
+    }
+
+    .primary {
+      height: 36px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      border: 0;
+      border-radius: 7px;
+      padding: 0 16px;
+      color: var(--on-accent);
+      background: var(--accent);
+      font-weight: 750;
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+
+    .word {
+      margin: 0;
+      color: var(--text);
+      font-family: Georgia, "Times New Roman", "Microsoft YaHei", serif;
+      font-size: 48px;
+      line-height: 1.05;
+      letter-spacing: 0;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .speak { color: var(--accent); }
+
+    .divider {
+      height: 1px;
+      background: var(--line);
+    }
+
+    .defs {
+      display: grid;
+      gap: 13px;
+      font-size: 17px;
+      line-height: 1.72;
+    }
+
+    .def {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+
+    .pos {
+      min-width: 38px;
+      height: 25px;
+      display: inline-grid;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--accent);
+      font-family: Georgia, serif;
+      font-size: 13px;
+      font-weight: 750;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .chip {
+      height: 30px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 0 10px;
+      color: var(--muted);
+      background: var(--surface);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .chip.active {
+      color: var(--accent);
+      background: var(--accent-soft);
+    }
+
+    .suggest {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      box-shadow: 0 12px 28px rgba(17, 24, 39, .14);
+    }
+
+    .suggest[hidden],
+    .suggest-row[hidden] {
+      display: none;
+    }
+
+    .suggest-row {
+      min-height: 40px;
+      display: grid;
+      grid-template-columns: 88px 1fr auto;
+      align-items: center;
+      gap: 12px;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .suggest-row:last-child { border-bottom: 0; }
+    .suggest-row.active { background: var(--accent-soft); }
+    .suggest-row strong { color: var(--text); font-size: 14px; }
+
+    .tag {
+      height: 22px;
+      display: inline-grid;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0 7px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 750;
+      white-space: nowrap;
+    }
+
+    .drawer {
+      border-left: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    .drawer-head {
+      height: 52px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--line);
+      padding: 0 14px;
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .seg {
+      display: flex;
+      gap: 4px;
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-soft);
+    }
+
+    .seg span {
+      min-width: 66px;
+      height: 28px;
+      display: grid;
+      place-items: center;
+      border-radius: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .seg .active {
+      color: var(--text);
+      background: var(--surface);
+      box-shadow: 0 1px 3px rgba(17, 24, 39, .08);
+    }
+
+    .recall-list {
+      display: grid;
+      gap: 4px;
+      padding: 12px;
+    }
+
+    .recall {
+      height: 36px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      border-radius: 7px;
+      padding: 0 10px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .recall.active {
+      color: var(--text);
+      background: var(--accent-soft);
+    }
+
+    .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 99px;
+      background: var(--muted-2);
+    }
+
+    .recall.active .dot { background: var(--accent); }
+
+    .note {
+      min-height: 68px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      color: var(--muted);
+      background: var(--surface-soft);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .section-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 850;
+      letter-spacing: .02em;
+      text-transform: uppercase;
+    }
+
+    .kv {
+      display: grid;
+      gap: 8px;
+    }
+
+    .kv div {
+      min-height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      border-radius: 7px;
+      padding: 0 10px;
+      color: var(--muted);
+      background: var(--surface-soft);
+      font-size: 12.5px;
+      font-weight: 650;
+    }
+
+    .kv .active {
+      color: var(--text);
+      box-shadow: inset 3px 0 0 var(--accent);
+    }
+
+    .kbd {
+      min-width: 24px;
+      height: 24px;
+      display: inline-grid;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-bottom-width: 2px;
+      border-radius: 5px;
+      padding: 0 6px;
+      color: var(--muted);
+      background: var(--surface);
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    /* 01 */
+    .focus {
+      --title: #f5f6f7;
+      --bg: #f8fafb;
+      --surface: #ffffff;
+      --surface-soft: #f2f5f7;
+      --panel: #f3f6f8;
+      --line: #dce4eb;
+      --text: #17212b;
+      --muted: #677685;
+      --muted-2: #b7c1ca;
+      --accent: #2f6fd6;
+      --accent-soft: #e7f0ff;
+      --on-accent: #ffffff;
+    }
+
+    .focus .body {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 54px;
+    }
+
+    .focus-main {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 14px;
+      padding: 22px 28px;
+    }
+
+    .focus-search-stage {
+      position: relative;
+      z-index: 3;
+    }
+
+    .focus-toolbar {
+      display: grid;
+      grid-template-columns: minmax(400px, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .focus-actions {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .focus-suggest {
+      position: absolute;
+      z-index: 5;
+      left: 0;
+      right: 136px;
+      top: 58px;
+      max-height: 292px;
+      overflow: auto;
+    }
+
+    .focus-result {
+      min-width: 0;
+      overflow: auto;
+      padding: 30px 34px;
+    }
+
+    .focus-result .word-block {
+      display: grid;
+      gap: 13px;
+      margin-bottom: 20px;
+    }
+
+    .focus-rail {
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      gap: 8px;
+      border-left: 1px solid var(--line);
+      padding: 12px 10px;
+      background: var(--panel);
+    }
+
+    .vertical-label {
+      writing-mode: vertical-rl;
+      margin: 6px auto;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: .08em;
+    }
+
+    /* 02 */
+    .drawer-open {
+      --title: #f2f2ee;
+      --bg: #fbfbf8;
+      --surface: #ffffff;
+      --surface-soft: #f4f3ef;
+      --panel: #f7f5ef;
+      --line: #e0ded6;
+      --text: #1e1d1a;
+      --muted: #77736a;
+      --muted-2: #b4b0a6;
+      --accent: #4269c6;
+      --accent-soft: #e9efff;
+      --on-accent: #ffffff;
+    }
+
+    .drawer-open .body {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 292px;
+    }
+
+    .drawer-open-main {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 18px;
+      padding: 24px 32px;
+    }
+
+    .drawer-open .search {
+      max-width: 860px;
+    }
+
+    .reader-card {
+      overflow: auto;
+      max-width: 820px;
+      padding: 36px 44px;
+    }
+
+    .reader-card .word {
+      font-size: 58px;
+    }
+
+    .reader-card .defs {
+      max-width: 700px;
+      font-size: 18px;
+      line-height: 1.82;
+    }
+
+    /* 03 */
+    .command {
+      --title: #f5f8f5;
+      --bg: #eef4ef;
+      --surface: #ffffff;
+      --surface-soft: #edf5ef;
+      --panel: #eef4ef;
+      --line: #d6e2d9;
+      --text: #17231d;
+      --muted: #66756a;
+      --muted-2: #aab8ae;
+      --accent: #0f7d5d;
+      --accent-soft: #def2ea;
+      --on-accent: #ffffff;
+    }
+
+    .command.window {
+      width: min(960px, 100%);
+      height: 650px;
+      margin: 36px auto;
+      border-radius: 12px;
+    }
+
+    .command .body {
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      gap: 10px;
+      padding: 24px;
+    }
+
+    .command .search {
+      height: 64px;
+      border-radius: 10px;
+      padding-left: 20px;
+      box-shadow: 0 12px 30px rgba(24, 70, 48, .12);
+    }
+
+    .command .search input {
+      font-size: 23px;
+      font-weight: 750;
+    }
+
+    .command-content {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 224px;
+      gap: 12px;
+    }
+
+    .command-card {
+      min-width: 0;
+      overflow: hidden;
+      padding: 22px 26px;
+    }
+
+    .command-side {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 12px;
+      min-width: 0;
+      min-height: 0;
+    }
+
+    .command-panel {
+      padding: 13px;
+    }
+
+    .bottom-strip {
+      min-height: 54px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 9px 12px;
+    }
+
+    /* 04 */
+    .dense {
+      --title: #202421;
+      --bg: #171b18;
+      --surface: #20251f;
+      --surface-soft: #1c211d;
+      --panel: #1c201d;
+      --line: rgba(255, 255, 255, .11);
+      --text: #f0f3ee;
+      --muted: #a2aba1;
+      --muted-2: #657066;
+      --accent: #69d69f;
+      --accent-soft: rgba(105, 214, 159, .14);
+      --on-accent: #102016;
+      color-scheme: dark;
+    }
+
+    .dense .body {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 14px;
+      padding: 16px;
+    }
+
+    .dense-toolbar {
+      display: grid;
+      grid-template-columns: minmax(360px, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .dense-main {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 300px;
+      gap: 14px;
+    }
+
+    .dense-result {
+      min-width: 0;
+      overflow: auto;
+      padding: 26px 30px;
+    }
+
+    .dense-side {
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      gap: 12px;
+      min-width: 0;
+      min-height: 0;
+    }
+
+    .side-card {
+      padding: 14px;
+    }
+
+    .side-card h3 {
+      margin: 0 0 10px;
+      font-size: 13px;
+    }
+
+    .stat-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .stat {
+      min-height: 58px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 9px;
+      color: var(--muted);
+      background: var(--surface-soft);
+      font-size: 12px;
+    }
+
+    .stat strong {
+      display: block;
+      color: var(--text);
+      font-size: 19px;
+      line-height: 1.2;
+    }
+
+    .sources {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .source-chip {
+      height: 34px;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 0 10px;
+      color: var(--muted);
+      background: var(--surface);
+      font-size: 12.5px;
+      font-weight: 700;
+    }
+
+    .source-chip.active {
+      color: var(--text);
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+
+    @media (max-width: 1120px) {
+      body { min-width: 920px; }
+      .research { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .window { height: 700px; }
+      .focus .body { grid-template-columns: minmax(0, 1fr); }
+      .focus-rail { display: none; }
+      .command-content,
+      .dense-main { grid-template-columns: minmax(0, 1fr); }
+      .command-side,
+      .dense-side { display: none; }
+      .drawer-open .body { grid-template-columns: minmax(0, 1fr); }
+      .drawer-open .drawer { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <symbol id="i-search" viewBox="0 0 24 24"><path d="m21 21-4.3-4.3"/><circle cx="11" cy="11" r="7"/></symbol>
+    <symbol id="i-star" viewBox="0 0 24 24"><path d="m12 3 2.9 5.9 6.5.9-4.7 4.6 1.1 6.4L12 17.8l-5.8 3 1.1-6.4-4.7-4.6 6.5-.9L12 3Z"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M12 15.5A3.5 3.5 0 1 0 12 8a3.5 3.5 0 0 0 0 7.5Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1A2 2 0 1 1 4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7A2 2 0 1 1 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1A2 2 0 1 1 19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.1a2 2 0 1 1 0 4H21a1.7 1.7 0 0 0-1.6 1Z"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-speaker" viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+    <symbol id="i-pin" viewBox="0 0 24 24"><path d="m14 4 6 6-3 1-4 4-1 5-8-8 5-1 4-4 1-3Z"/><path d="m4 20 5-5"/></symbol>
+    <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></symbol>
+    <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5Z"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m20 6-11 11-5-5"/></symbol>
+  </svg>
+
+  <main class="page">
+    <div class="top">
+      <div style="flex:1;min-width:0">
+        <h1>wind-dict 搜索优先 UI 方案</h1>
+        <p>新版把历史记录从常驻主页移到按需打开的召回层，主屏只服务当前查询和当前词头。</p>
+      </div>
+      <nav class="tabs" aria-label="方案切换">
+        <button type="button" data-tab="focus" aria-selected="true">01 专注主屏</button>
+        <button type="button" data-tab="drawer" aria-selected="false">02 抽屉召回</button>
+        <button type="button" data-tab="command" aria-selected="false">03 速查命令</button>
+        <button type="button" data-tab="dense" aria-selected="false">04 专业紧凑</button>
+      </nav>
+    </div>
+
+    <section class="research" aria-label="调研结论">
+      <article><strong>主流网页词典</strong><span>Merriam-Webster、Oxford 都把搜索输入放在顶部或主页核心区域，历史不是常驻主导航。</span></article>
+      <article><strong>翻译工具</strong><span>Google Translate 把 History/Saved 做成 side panel；DeepL 把 history 定义为回看和复用，不是默认工作区。</span></article>
+      <article><strong>桌面词典</strong><span>GoldenDict 类桌面工具强调多词典结果同页和强检索能力，辅助面板服务当前词条而非长期占住历史。</span></article>
+      <article><strong>本项目取舍</strong><span>历史是系统被动记录的事实，收藏才是主动意图；主页应更偏查询、结果、收藏动作。</span></article>
+    </section>
+
+    <section class="mock active" data-panel="focus">
+      <div class="flow-demo" data-flow-demo>
+        <div>
+          <strong>搜索过程模拟</strong>
+          <span data-flow-caption>输入 mak，出现 3 条补全；结果卡片位置保持不变。</span>
+        </div>
+        <div class="flow-buttons" aria-label="搜索过程状态">
+          <button type="button" data-flow="idle" aria-pressed="false">空输入</button>
+          <button type="button" data-flow="typing3" aria-pressed="true">3 条候选</button>
+          <button type="button" data-flow="typing7" aria-pressed="false">7 条候选</button>
+          <button type="button" data-flow="committed" aria-pressed="false">选中查询</button>
+        </div>
+      </div>
+      <div class="window focus">
+        <div class="titlebar">
+          <div class="brand"><span class="mark">词</span><span>wind-dict</span><span class="sub">英汉 · 汉英</span></div>
+          <div class="spacer"></div>
+          <div class="source">离线词典 <svg class="icon"><use href="#i-down"/></svg></div>
+          <button class="title-icon" aria-label="历史记录"><svg class="icon"><use href="#i-clock"/></svg></button>
+          <button class="title-icon" aria-label="设置"><svg class="icon"><use href="#i-settings"/></svg></button>
+          <div class="win"><span class="min"></span></div>
+          <div class="win"><span class="max"></span></div>
+          <div class="win close"><span class="x"></span></div>
+        </div>
+        <div class="body">
+          <main class="focus-main">
+            <div class="focus-search-stage">
+              <div class="focus-toolbar">
+                <div class="search">
+                  <svg class="icon"><use href="#i-search"/></svg>
+                  <input value="mak" aria-label="输入中文或英文" data-focus-query />
+                  <button class="icon-btn" aria-label="清空" data-focus-clear><svg class="icon"><use href="#i-x"/></svg></button>
+                  <button class="primary">查询</button>
+                </div>
+                <div class="focus-actions">
+                  <button class="icon-btn active" aria-label="收藏"><svg class="icon"><use href="#i-star"/></svg></button>
+                  <button class="icon-btn" aria-label="复制"><svg class="icon"><use href="#i-copy"/></svg></button>
+                  <button class="icon-btn" aria-label="固定窗口"><svg class="icon"><use href="#i-pin"/></svg></button>
+                </div>
+              </div>
+              <div class="suggest focus-suggest" data-focus-suggest>
+                <div class="suggest-row active" data-suggest-row><strong>make</strong><span>v. 做，制造，使成为；n. 品牌，型号</span><span class="tag">Enter</span></div>
+                <div class="suggest-row" data-suggest-row><strong>maker</strong><span>n. 制造者，生产商</span><span></span></div>
+                <div class="suggest-row" data-suggest-row><strong>making</strong><span>n. 制作；形成；成功所需素质</span><span></span></div>
+                <div class="suggest-row" data-suggest-row><strong>makeup</strong><span>n. 化妆品；组成；补考</span><span></span></div>
+                <div class="suggest-row" data-suggest-row><strong>manage</strong><span>v. 管理；设法做到；处理</span><span></span></div>
+                <div class="suggest-row" data-suggest-row><strong>matter</strong><span>n. 事情；问题；物质；v. 要紧</span><span></span></div>
+                <div class="suggest-row" data-suggest-row><strong>major</strong><span>adj. 主要的；重要的；n. 专业</span><span></span></div>
+              </div>
+            </div>
+            <article class="card focus-result">
+              <div style="display:grid;gap:13px;margin-bottom:20px">
+                <div style="display:flex;align-items:flex-start;gap:14px">
+                  <h2 class="word">make</h2>
+                  <button class="icon-btn active" aria-label="收藏"><svg class="icon"><use href="#i-star"/></svg></button>
+                </div>
+                <div class="meta">
+                  <span>英 /meɪk/</span><svg class="icon speak"><use href="#i-speaker"/></svg>
+                  <span>美 /meɪk/</span><svg class="icon speak"><use href="#i-speaker"/></svg>
+                  <span class="tag">原形命中</span>
+                </div>
+                <div class="chips">
+                  <span class="chip">过去式 made</span>
+                  <span class="chip">现在分词 making</span>
+                  <span class="chip">三单 makes</span>
+                </div>
+              </div>
+              <div class="divider" style="margin-bottom:20px"></div>
+              <div class="defs">
+                <div class="def"><span class="pos">v.</span><span>制造，做成；使得，使成为；准备，安排；赚得，获得。</span></div>
+                <div class="def"><span class="pos">n.</span><span>品牌，型号；性格，气质；制作方式。</span></div>
+              </div>
+              <section class="card" style="margin-top:24px;padding:15px;background:var(--surface-soft)">
+                <div class="section-label">英英释义</div>
+                <p style="margin:10px 0 0;color:var(--muted);font-size:13px;line-height:1.6">to create or prepare something by combining materials or putting parts together.</p>
+              </section>
+            </article>
+          </main>
+          <aside class="focus-rail">
+            <button class="icon-btn" aria-label="历史记录"><svg class="icon"><use href="#i-clock"/></svg></button>
+            <button class="icon-btn active" aria-label="收藏"><svg class="icon"><use href="#i-star"/></svg></button>
+            <button class="icon-btn" aria-label="词库"><svg class="icon"><use href="#i-book"/></svg></button>
+            <div class="vertical-label">召回</div>
+            <button class="icon-btn" aria-label="设置"><svg class="icon"><use href="#i-settings"/></svg></button>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <section class="mock" data-panel="drawer">
+      <div class="window drawer-open">
+        <div class="titlebar">
+          <div class="brand"><span class="mark">词</span><span>wind-dict</span><span class="sub">抽屉已打开</span></div>
+          <div class="spacer"></div>
+          <div class="source">离线词典 <svg class="icon"><use href="#i-down"/></svg></div>
+          <button class="title-icon active" aria-label="历史记录"><svg class="icon"><use href="#i-clock"/></svg></button>
+          <button class="title-icon" aria-label="收藏"><svg class="icon"><use href="#i-star"/></svg></button>
+          <div class="win"><span class="min"></span></div>
+          <div class="win"><span class="max"></span></div>
+          <div class="win close"><span class="x"></span></div>
+        </div>
+        <div class="body">
+          <main class="drawer-open-main">
+            <div class="search">
+              <svg class="icon"><use href="#i-search"/></svg>
+              <input value="make" aria-label="输入中文或英文" />
+              <button class="icon-btn" aria-label="清空"><svg class="icon"><use href="#i-x"/></svg></button>
+            </div>
+            <article class="card reader-card">
+              <div style="display:grid;gap:16px;margin-bottom:24px">
+                <div style="display:flex;align-items:flex-start;gap:14px">
+                  <h2 class="word">make</h2>
+                  <button class="icon-btn active" aria-label="收藏"><svg class="icon"><use href="#i-star"/></svg></button>
+                </div>
+                <div class="meta">
+                  <span>英 /meɪk/</span><svg class="icon speak"><use href="#i-speaker"/></svg>
+                  <span>美 /meɪk/</span><svg class="icon speak"><use href="#i-speaker"/></svg>
+                </div>
+                <div class="chips">
+                  <span class="chip">过去式 made</span>
+                  <span class="chip">现在分词 making</span>
+                  <span class="chip">三单 makes</span>
+                </div>
+              </div>
+              <div class="divider" style="margin-bottom:24px"></div>
+              <div class="defs">
+                <div class="def"><span class="pos">v.</span><span>制造，做成；使得，使成为；准备，安排；赚得，获得。常用于 make something possible / make somebody happy 等结构。</span></div>
+                <div class="def"><span class="pos">n.</span><span>品牌，型号；制作方式；人的性格或气质。</span></div>
+              </div>
+            </article>
+          </main>
+          <aside class="drawer">
+            <div class="drawer-head">
+              <div class="seg"><span class="active">历史</span><span>收藏</span></div>
+              <button class="icon-btn" aria-label="关闭"><svg class="icon"><use href="#i-x"/></svg></button>
+            </div>
+            <div class="recall-list">
+              <div class="recall active"><span class="dot"></span><span>make</span><span style="margin-left:auto">刚刚</span></div>
+              <div class="recall"><span class="dot"></span><span>made</span><span style="margin-left:auto">09:42</span></div>
+              <div class="recall"><span class="dot"></span><span>making</span><span style="margin-left:auto">09:41</span></div>
+              <div class="recall"><span class="dot"></span><span>mediate</span><span style="margin-left:auto">昨天</span></div>
+              <div class="recall"><span class="dot"></span><span>行</span><span style="margin-left:auto">昨天</span></div>
+              <div class="recall"><span class="dot"></span><span>皮实</span><span style="margin-left:auto">周日</span></div>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <section class="mock" data-panel="command">
+      <div class="window command">
+        <div class="titlebar">
+          <div class="brand"><span class="mark">词</span><span>wind-dict</span><span class="sub">速查</span></div>
+          <div class="spacer"></div>
+          <span class="kbd">Ctrl</span><span class="kbd">Alt</span><span class="kbd">D</span>
+          <button class="title-icon" aria-label="完整窗口"><svg class="icon"><use href="#i-panel"/></svg></button>
+          <div class="win"><span class="min"></span></div>
+          <div class="win close"><span class="x"></span></div>
+        </div>
+        <div class="body">
+          <div class="search">
+            <svg class="icon"><use href="#i-search"/></svg>
+            <input value="mak" aria-label="输入中文或英文" />
+            <button class="icon-btn" aria-label="清空"><svg class="icon"><use href="#i-x"/></svg></button>
+            <button class="primary">查询</button>
+          </div>
+          <div class="suggest">
+            <div class="suggest-row active"><strong>make</strong><span>v. 做，制造，使成为；n. 品牌，型号</span><span class="tag">Enter</span></div>
+            <div class="suggest-row"><strong>maker</strong><span>n. 制造者，生产商</span><span></span></div>
+            <div class="suggest-row"><strong>making</strong><span>n. 制作；形成；成功所需素质</span><span></span></div>
+          </div>
+          <div class="command-content">
+            <article class="card command-card">
+              <div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:8px">
+                <h2 class="word" style="font-size:42px">make</h2>
+                <button class="icon-btn active" aria-label="收藏"><svg class="icon"><use href="#i-star"/></svg></button>
+              </div>
+              <div class="meta"><span>英 /meɪk/</span><svg class="icon speak"><use href="#i-speaker"/></svg><span>美 /meɪk/</span><svg class="icon speak"><use href="#i-speaker"/></svg></div>
+              <div class="divider" style="margin:17px 0"></div>
+              <div class="defs" style="font-size:16px;line-height:1.62">
+                <div class="def"><span class="pos">v.</span><span>制造，做成；使得，使成为；准备，安排。</span></div>
+                <div class="def"><span class="pos">n.</span><span>品牌，型号；制作方式。</span></div>
+              </div>
+            </article>
+            <aside class="command-side">
+              <section class="card command-panel">
+                <div class="section-label" style="margin-bottom:10px">动作</div>
+                <div class="kv">
+                  <div class="active"><span>收藏词头</span><svg class="icon"><use href="#i-check"/></svg></div>
+                  <div><span>复制中文释义</span><svg class="icon"><use href="#i-copy"/></svg></div>
+                  <div><span>打开完整窗口</span><svg class="icon"><use href="#i-panel"/></svg></div>
+                </div>
+              </section>
+              <section class="card command-panel">
+                <div class="section-label" style="margin-bottom:10px">备注</div>
+                <div class="note">make it possible / make a decision</div>
+              </section>
+            </aside>
+          </div>
+          <div class="card bottom-strip">
+            <div class="chips">
+              <span class="chip active"><svg class="icon"><use href="#i-star"/></svg> 收藏</span>
+              <span class="chip"><svg class="icon"><use href="#i-clock"/></svg> 最近</span>
+              <span class="chip">made</span>
+              <span class="chip">行</span>
+              <span class="chip">皮实</span>
+            </div>
+            <button class="icon-btn" aria-label="设置"><svg class="icon"><use href="#i-settings"/></svg></button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="mock" data-panel="dense">
+      <div class="window dense">
+        <div class="titlebar">
+          <div class="brand"><span class="mark">词</span><span>wind-dict</span><span class="sub">深色专业</span></div>
+          <div class="spacer"></div>
+          <div class="source">离线词典 <svg class="icon"><use href="#i-down"/></svg></div>
+          <button class="title-icon" aria-label="历史记录"><svg class="icon"><use href="#i-clock"/></svg></button>
+          <button class="title-icon" aria-label="设置"><svg class="icon"><use href="#i-settings"/></svg></button>
+          <div class="win"><span class="min"></span></div>
+          <div class="win"><span class="max"></span></div>
+          <div class="win close"><span class="x"></span></div>
+        </div>
+        <div class="body">
+          <div class="dense-toolbar">
+            <div class="search">
+              <svg class="icon"><use href="#i-search"/></svg>
+              <input value="make" aria-label="输入中文或英文" />
+              <button class="icon-btn" aria-label="清空"><svg class="icon"><use href="#i-x"/></svg></button>
+            </div>
+            <div class="sources">
+              <span class="source-chip active">离线词典</span>
+              <span class="source-chip">DeepL 译源</span>
+              <span class="source-chip">AI 译源</span>
+              <button class="icon-btn active" aria-label="收藏"><svg class="icon"><use href="#i-star"/></svg></button>
+              <button class="primary">查询</button>
+            </div>
+          </div>
+          <div class="dense-main">
+            <article class="card dense-result">
+              <div style="display:grid;gap:13px;margin-bottom:20px">
+                <div style="display:flex;align-items:flex-start;gap:14px">
+                  <h2 class="word">make</h2>
+                  <button class="icon-btn active" aria-label="收藏"><svg class="icon"><use href="#i-star"/></svg></button>
+                </div>
+                <div class="meta">
+                  <span>英 /meɪk/</span><svg class="icon speak"><use href="#i-speaker"/></svg>
+                  <span>美 /meɪk/</span><svg class="icon speak"><use href="#i-speaker"/></svg>
+                  <span class="tag">原形命中</span>
+                </div>
+                <div class="chips">
+                  <span class="chip">过去式 made</span>
+                  <span class="chip">现在分词 making</span>
+                  <span class="chip">三单 makes</span>
+                </div>
+              </div>
+              <div class="divider" style="margin-bottom:20px"></div>
+              <div class="defs">
+                <div class="def"><span class="pos">v.</span><span>制造，做成；使得，使成为；准备，安排；赚得，获得。</span></div>
+                <div class="def"><span class="pos">n.</span><span>品牌，型号；性格，气质；制作方式。</span></div>
+              </div>
+            </article>
+            <aside class="dense-side">
+              <section class="card side-card">
+                <h3>词头状态</h3>
+                <div class="stat-grid">
+                  <div class="stat"><strong>3</strong><span>词形变化</span></div>
+                  <div class="stat"><strong>2</strong><span>义项分组</span></div>
+                  <div class="stat"><strong>142</strong><span>收藏总数</span></div>
+                  <div class="stat"><strong>0 ms</strong><span>离线查询</span></div>
+                </div>
+              </section>
+              <section class="card side-card">
+                <h3>备注</h3>
+                <div class="note">make it clear / make sense / make a decision</div>
+              </section>
+              <section class="card side-card">
+                <h3>查询源状态</h3>
+                <div class="kv">
+                  <div class="active"><span>离线词典</span><span>已收录</span></div>
+                  <div><span>DeepL 译源</span><span>未调用</span></div>
+                  <div><span>AI 译源</span><span>未调用</span></div>
+                </div>
+              </section>
+            </aside>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const tabs = Array.from(document.querySelectorAll("[data-tab]"));
+    const panels = Array.from(document.querySelectorAll("[data-panel]"));
+
+    function show(name, updateHash = true) {
+      tabs.forEach((tab) => tab.setAttribute("aria-selected", String(tab.dataset.tab === name)));
+      panels.forEach((panel) => panel.classList.toggle("active", panel.dataset.panel === name));
+      if (updateHash) history.replaceState(null, "", `#${name}`);
+    }
+
+    tabs.forEach((tab) => tab.addEventListener("click", () => show(tab.dataset.tab)));
+
+    const [initialPanel, initialFlowFromHash] = location.hash.slice(1).split(":");
+    if (tabs.some((tab) => tab.dataset.tab === initialPanel)) show(initialPanel, false);
+
+    const flow = {
+      idle: {
+        query: "",
+        count: 0,
+        caption: "空输入时不显示候选，结果区保持在同一位置。"
+      },
+      typing3: {
+        query: "mak",
+        count: 3,
+        caption: "输入 mak，出现 3 条补全；结果卡片位置保持不变。"
+      },
+      typing7: {
+        query: "ma",
+        count: 7,
+        caption: "输入 ma，出现 7 条补全；浮层变高但不推开结果。"
+      },
+      committed: {
+        query: "make",
+        count: 0,
+        caption: "选中 make 后补全收起，只更新当前查询词和结果。"
+      }
+    };
+
+    const flowButtons = Array.from(document.querySelectorAll("[data-flow]"));
+    const flowCaption = document.querySelector("[data-flow-caption]");
+    const focusQuery = document.querySelector("[data-focus-query]");
+    const focusSuggest = document.querySelector("[data-focus-suggest]");
+    const suggestRows = Array.from(document.querySelectorAll("[data-suggest-row]"));
+    const focusClear = document.querySelector("[data-focus-clear]");
+
+    function setFlow(name) {
+      const state = flow[name] || flow.typing3;
+      if (focusQuery) focusQuery.value = state.query;
+      if (flowCaption) flowCaption.textContent = state.caption;
+      if (focusSuggest) focusSuggest.hidden = state.count === 0;
+      if (focusClear) focusClear.hidden = state.query.length === 0;
+      suggestRows.forEach((row, index) => {
+        row.hidden = index >= state.count;
+      });
+      flowButtons.forEach((button) => {
+        button.setAttribute("aria-pressed", String(button.dataset.flow === name));
+      });
+    }
+
+    flowButtons.forEach((button) => {
+      button.addEventListener("click", () => setFlow(button.dataset.flow));
+    });
+
+    const requestedFlow = new URLSearchParams(location.search).get("flow") || initialFlowFromHash;
+    setFlow(flow[requestedFlow] ? requestedFlow : "typing3");
+  </script>
+</body>
+</html>

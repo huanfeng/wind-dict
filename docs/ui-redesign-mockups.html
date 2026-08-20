@@ -1,0 +1,1704 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>wind-dict UI redesign mockups</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --page-bg: #eceff1;
+      --page-text: #1b1f23;
+      --page-muted: #69737f;
+      --page-line: #d7dde3;
+      --page-panel: #ffffff;
+      --focus: #2f6fed;
+      --shadow: 0 20px 50px rgba(23, 31, 38, .16);
+      font-family: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-width: 980px;
+      background: var(--page-bg);
+      color: var(--page-text);
+    }
+
+    button,
+    input {
+      font: inherit;
+    }
+
+    .icon {
+      width: 18px;
+      height: 18px;
+      display: inline-block;
+      flex: 0 0 auto;
+      stroke: currentColor;
+      stroke-width: 1.9;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      fill: none;
+    }
+
+    .page-shell {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 22px 24px 32px;
+    }
+
+    .decision-bar {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      margin-bottom: 16px;
+    }
+
+    .decision-title {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .decision-title h1 {
+      margin: 0 0 4px;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    .decision-title p {
+      margin: 0;
+      color: var(--page-muted);
+      font-size: 13px;
+    }
+
+    .style-tabs {
+      display: flex;
+      gap: 6px;
+      padding: 5px;
+      border: 1px solid var(--page-line);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, .7);
+    }
+
+    .style-tabs button {
+      height: 34px;
+      border: 0;
+      border-radius: 7px;
+      padding: 0 12px;
+      color: #3d4752;
+      background: transparent;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .style-tabs button[aria-selected="true"] {
+      color: #fff;
+      background: #1d2733;
+    }
+
+    .decision-notes {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 0 0 16px;
+    }
+
+    .decision-note {
+      min-height: 94px;
+      padding: 12px 13px;
+      border: 1px solid var(--page-line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, .72);
+    }
+
+    .decision-note strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 13px;
+    }
+
+    .decision-note span {
+      display: block;
+      color: var(--page-muted);
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .mockup-panel {
+      display: none;
+    }
+
+    .mockup-panel.is-active {
+      display: block;
+    }
+
+    .native-window {
+      overflow: hidden;
+      width: 100%;
+      height: 720px;
+      border: 1px solid rgba(34, 41, 47, .2);
+      border-radius: 10px;
+      background: #fff;
+      box-shadow: var(--shadow);
+    }
+
+    .titlebar {
+      height: 38px;
+      display: flex;
+      align-items: center;
+      border-bottom: 1px solid var(--line);
+      background: var(--title);
+      color: var(--muted);
+      user-select: none;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-width: 0;
+      padding-left: 13px;
+      color: var(--text);
+      font-size: 12.5px;
+      font-weight: 700;
+    }
+
+    .brand-mark {
+      width: 21px;
+      height: 21px;
+      display: grid;
+      place-items: center;
+      border-radius: 6px;
+      color: var(--on-accent);
+      background: var(--accent);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .brand-sub {
+      color: var(--muted);
+      font-weight: 500;
+    }
+
+    .title-spacer {
+      flex: 1;
+    }
+
+    .source-pill,
+    .title-action,
+    .window-control {
+      height: 30px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+    }
+
+    .source-pill {
+      gap: 6px;
+      padding: 0 10px;
+      border-radius: 7px;
+      color: var(--text);
+      font-size: 12.5px;
+    }
+
+    .title-action,
+    .window-control {
+      width: 38px;
+    }
+
+    .window-control.close:hover {
+      color: #fff;
+      background: #e81123;
+    }
+
+    .win-min {
+      width: 13px;
+      height: 1px;
+      background: currentColor;
+    }
+
+    .win-max {
+      width: 12px;
+      height: 12px;
+      border: 1.6px solid currentColor;
+    }
+
+    .win-close {
+      position: relative;
+      width: 14px;
+      height: 14px;
+    }
+
+    .win-close::before,
+    .win-close::after {
+      content: "";
+      position: absolute;
+      left: 6px;
+      top: 0;
+      width: 1.5px;
+      height: 15px;
+      background: currentColor;
+    }
+
+    .win-close::before { transform: rotate(45deg); }
+    .win-close::after { transform: rotate(-45deg); }
+
+    .app-body {
+      height: calc(100% - 38px);
+      display: flex;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .left-rail {
+      width: var(--rail-width);
+      flex: 0 0 var(--rail-width);
+      border-right: 1px solid var(--line);
+      background: var(--rail);
+    }
+
+    .main-area {
+      min-width: 0;
+      flex: 1;
+    }
+
+    .segmented {
+      display: flex;
+      align-items: center;
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-soft);
+    }
+
+    .segmented span {
+      flex: 1;
+      height: 28px;
+      display: grid;
+      place-items: center;
+      border-radius: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .segmented span.active {
+      color: var(--text);
+      background: var(--surface);
+      box-shadow: 0 1px 3px rgba(17, 24, 39, .08);
+    }
+
+    .side-list {
+      display: grid;
+      gap: 4px;
+    }
+
+    .side-row {
+      height: 34px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 10px;
+      border-radius: 7px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .side-row.active {
+      color: var(--text);
+      background: var(--accent-soft);
+    }
+
+    .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 99px;
+      background: var(--muted-2);
+    }
+
+    .side-row.active .dot {
+      background: var(--accent);
+    }
+
+    .source-list {
+      display: grid;
+      gap: 6px;
+    }
+
+    .source-item {
+      min-height: 34px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      border-radius: 7px;
+      padding: 0 9px;
+      color: var(--muted);
+      background: var(--surface-soft);
+      font-size: 12.5px;
+      font-weight: 650;
+    }
+
+    .source-item.active {
+      color: var(--text);
+      box-shadow: inset 3px 0 0 var(--accent);
+    }
+
+    .search-wrap {
+      position: relative;
+    }
+
+    .search-line {
+      height: 52px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: var(--surface);
+      color: var(--text);
+    }
+
+    .search-line input {
+      min-width: 0;
+      flex: 1;
+      border: 0;
+      outline: 0;
+      color: inherit;
+      background: transparent;
+      font-size: 17px;
+    }
+
+    .icon-btn {
+      width: 34px;
+      height: 34px;
+      display: inline-grid;
+      place-items: center;
+      border: 0;
+      border-radius: 7px;
+      color: var(--muted);
+      background: transparent;
+    }
+
+    .icon-btn.active {
+      color: var(--accent);
+      background: var(--accent-soft);
+    }
+
+    .primary-btn {
+      height: 36px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      border: 0;
+      border-radius: 7px;
+      padding: 0 16px;
+      color: var(--on-accent);
+      background: var(--accent);
+      font-weight: 700;
+    }
+
+    .candidate-popover {
+      position: absolute;
+      z-index: 4;
+      left: 0;
+      right: 0;
+      top: 58px;
+      padding: 6px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: var(--surface);
+      box-shadow: 0 14px 36px rgba(16, 24, 40, .18);
+    }
+
+    .candidate-row {
+      min-height: 37px;
+      display: grid;
+      grid-template-columns: 90px 1fr auto;
+      align-items: center;
+      gap: 12px;
+      padding: 0 10px;
+      border-radius: 7px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .candidate-row strong {
+      color: var(--text);
+      font-size: 14px;
+    }
+
+    .candidate-row.active {
+      background: var(--accent-soft);
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      height: 22px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0 7px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .result-card,
+    .plain-section {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .headword-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 14px;
+    }
+
+    .headword {
+      margin: 0;
+      color: var(--text);
+      font-family: Georgia, "Times New Roman", "Microsoft YaHei", serif;
+      font-size: 44px;
+      line-height: 1.04;
+      font-weight: 600;
+      letter-spacing: 0;
+    }
+
+    .phonetic {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .speak {
+      color: var(--accent);
+    }
+
+    .divider {
+      height: 1px;
+      background: var(--line);
+    }
+
+    .glosses {
+      display: grid;
+      gap: 13px;
+      font-size: 17px;
+      line-height: 1.72;
+    }
+
+    .gloss-row {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+
+    .pos {
+      min-width: 38px;
+      height: 25px;
+      display: inline-grid;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--accent);
+      font-family: Georgia, serif;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .inflections {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .inflections span {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      height: 28px;
+      border-radius: 6px;
+      padding: 0 10px;
+      color: var(--text);
+      background: var(--surface-soft);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .inflections em {
+      color: var(--muted);
+      font-size: 11px;
+      font-style: normal;
+      font-weight: 600;
+    }
+
+    .section-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .02em;
+      text-transform: uppercase;
+    }
+
+    .note-field {
+      min-height: 72px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      color: var(--muted);
+      background: var(--surface-soft);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .kbd {
+      min-width: 24px;
+      height: 24px;
+      display: inline-grid;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-bottom-width: 2px;
+      border-radius: 5px;
+      padding: 0 6px;
+      color: var(--muted);
+      background: var(--surface);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .small-muted {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    /* Style 1: workbench */
+    .style-workbench {
+      --title: #f3f5f6;
+      --bg: #f8fafb;
+      --surface: #ffffff;
+      --surface-soft: #f2f5f7;
+      --rail: #f0f3f5;
+      --line: #dde4ea;
+      --text: #17202a;
+      --muted: #6d7783;
+      --muted-2: #b9c2ca;
+      --accent: #326fe0;
+      --accent-2: #12805c;
+      --accent-soft: #e8f0ff;
+      --on-accent: #ffffff;
+      --rail-width: 226px;
+    }
+
+    .style-workbench .left-rail {
+      display: flex;
+      flex-direction: column;
+      padding: 14px 12px 12px;
+    }
+
+    .style-workbench .rail-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+
+    .style-workbench .rail-title {
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .style-workbench .side-list {
+      margin-top: 11px;
+    }
+
+    .style-workbench .rail-bottom {
+      display: grid;
+      gap: 8px;
+      margin-top: auto;
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
+    }
+
+    .style-workbench .rail-link {
+      height: 36px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      border-radius: 7px;
+      padding: 0 10px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .style-workbench .main-area {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      padding: 18px 22px 22px;
+      gap: 14px;
+    }
+
+    .style-workbench .top-strip {
+      display: grid;
+      grid-template-columns: minmax(440px, 1fr) auto;
+      gap: 14px;
+      align-items: start;
+    }
+
+    .style-workbench .search-line {
+      padding: 0 8px 0 16px;
+    }
+
+    .style-workbench .quick-actions {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      height: 52px;
+    }
+
+    .style-workbench .content-grid {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 265px;
+      gap: 16px;
+    }
+
+    .style-workbench .result-card {
+      min-width: 0;
+      overflow: hidden;
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      padding: 26px 30px;
+    }
+
+    .style-workbench .reading-scroll {
+      overflow: auto;
+      padding-right: 8px;
+    }
+
+    .style-workbench .head-meta {
+      display: grid;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+
+    .style-workbench .side-panel {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      gap: 12px;
+    }
+
+    .style-workbench .info-block {
+      padding: 14px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .style-workbench .info-block h3 {
+      margin: 0 0 10px;
+      font-size: 13px;
+    }
+
+    .style-workbench .source-state {
+      color: var(--accent-2);
+      font-size: 11px;
+    }
+
+    /* Style 2: reader */
+    .style-reader {
+      --title: #eef1ef;
+      --bg: #f5f0e6;
+      --surface: #fffdf8;
+      --surface-soft: #ede7da;
+      --rail: #ece3d3;
+      --line: #d8ccba;
+      --text: #2d261e;
+      --muted: #756a5a;
+      --muted-2: #b6a994;
+      --accent: #8f4728;
+      --accent-2: #2f6f68;
+      --accent-soft: #f4e1d3;
+      --on-accent: #ffffff;
+      --rail-width: 190px;
+    }
+
+    .style-reader .left-rail {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      padding: 22px 14px 16px;
+    }
+
+    .style-reader .reader-nav {
+      display: grid;
+      gap: 7px;
+      margin-top: 20px;
+    }
+
+    .style-reader .reader-nav div {
+      height: 38px;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      border-radius: 7px;
+      padding: 0 11px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .style-reader .reader-nav .active {
+      color: var(--text);
+      background: rgba(143, 71, 40, .12);
+    }
+
+    .style-reader .reader-count {
+      display: grid;
+      gap: 10px;
+      border-top: 1px solid var(--line);
+      padding-top: 14px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .style-reader .main-area {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 250px;
+      gap: 0;
+      background: var(--bg);
+    }
+
+    .style-reader .reader-main {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      padding: 24px 38px;
+    }
+
+    .style-reader .reader-search {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding-bottom: 18px;
+    }
+
+    .style-reader .search-line {
+      min-width: 0;
+      flex: 1;
+      height: 48px;
+      padding: 0 12px 0 15px;
+      background: rgba(255, 253, 248, .8);
+    }
+
+    .style-reader .book-page {
+      overflow: auto;
+      padding: 34px 44px 44px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 18px 36px rgba(67, 47, 27, .11);
+    }
+
+    .style-reader .book-page .headword {
+      font-size: 58px;
+    }
+
+    .style-reader .book-page .head-meta {
+      display: grid;
+      gap: 16px;
+      max-width: 680px;
+      margin-bottom: 24px;
+    }
+
+    .style-reader .glosses {
+      max-width: 720px;
+      font-size: 18px;
+      line-height: 1.82;
+    }
+
+    .style-reader .reader-aside {
+      min-width: 0;
+      border-left: 1px solid var(--line);
+      background: #f0e7d8;
+      padding: 22px 16px;
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      gap: 14px;
+    }
+
+    .style-reader .aside-block {
+      padding: 14px;
+      border: 1px solid rgba(120, 91, 58, .24);
+      border-radius: 8px;
+      background: rgba(255, 253, 248, .55);
+    }
+
+    .style-reader .aside-block h3 {
+      margin: 0 0 10px;
+      font-size: 13px;
+    }
+
+    .style-reader .mini-list {
+      display: grid;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .style-reader .mini-list strong {
+      color: var(--text);
+    }
+
+    /* Style 3: quick */
+    .style-quick {
+      --title: #f6f8f5;
+      --bg: #eef3ed;
+      --surface: #ffffff;
+      --surface-soft: #edf4ef;
+      --rail: #edf4ef;
+      --line: #d8e2da;
+      --text: #19231e;
+      --muted: #66746b;
+      --muted-2: #aab7ae;
+      --accent: #0f7d5d;
+      --accent-2: #b85d1f;
+      --accent-soft: #dff2ea;
+      --on-accent: #ffffff;
+      --rail-width: 0px;
+    }
+
+    .style-quick.native-window {
+      width: min(960px, 100%);
+      height: 660px;
+      margin: 40px auto;
+      border-radius: 12px;
+    }
+
+    .style-quick .app-body {
+      display: block;
+      padding: 24px;
+      background: #eef3ed;
+    }
+
+    .style-quick .quick-shell {
+      height: 100%;
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      gap: 10px;
+    }
+
+    .style-quick .quick-command {
+      position: relative;
+    }
+
+    .style-quick .search-line {
+      height: 62px;
+      border-radius: 11px;
+      padding: 0 12px 0 20px;
+      box-shadow: 0 14px 34px rgba(22, 72, 52, .12);
+    }
+
+    .style-quick .search-line input {
+      font-size: 23px;
+      font-weight: 650;
+    }
+
+    .style-quick .quick-candidates {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--surface);
+    }
+
+    .style-quick .quick-candidate {
+      min-height: 42px;
+      display: grid;
+      grid-template-columns: 86px 1fr auto;
+      align-items: center;
+      gap: 16px;
+      padding: 0 16px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .style-quick .quick-candidate:last-child {
+      border-bottom: 0;
+    }
+
+    .style-quick .quick-candidate.active {
+      background: var(--accent-soft);
+    }
+
+    .style-quick .quick-candidate strong {
+      color: var(--text);
+      font-size: 15px;
+    }
+
+    .style-quick .quick-result {
+      min-height: 0;
+      overflow: hidden;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 240px;
+      gap: 14px;
+    }
+
+    .style-quick .result-card {
+      min-width: 0;
+      overflow: hidden;
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      padding: 20px 24px;
+    }
+
+    .style-quick .result-card .headword {
+      font-size: 40px;
+    }
+
+    .style-quick .result-card .glosses {
+      gap: 10px;
+      font-size: 16px;
+      line-height: 1.58;
+    }
+
+    .style-quick .compact-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: rgba(255, 255, 255, .78);
+    }
+
+    .style-quick .chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .style-quick .chip {
+      height: 30px;
+      display: inline-flex;
+      align-items: center;
+      border-radius: 7px;
+      padding: 0 10px;
+      color: var(--muted);
+      background: var(--surface);
+      border: 1px solid var(--line);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .style-quick .right-stack {
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 14px;
+    }
+
+    .style-quick .mini-panel {
+      min-height: 0;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: var(--surface);
+      padding: 12px;
+    }
+
+    .style-quick .mini-panel .note-field {
+      min-height: 56px;
+      max-height: 80px;
+      overflow: hidden;
+    }
+
+    .style-quick .mini-panel h3 {
+      margin: 0 0 10px;
+      font-size: 13px;
+    }
+
+    /* Style 4: dark */
+    .style-darkpro {
+      --title: #202322;
+      --bg: #171916;
+      --surface: #222520;
+      --surface-soft: #1d211c;
+      --rail: #1b1e1b;
+      --line: rgba(255, 255, 255, .105);
+      --text: #f0f2ed;
+      --muted: #a3aba0;
+      --muted-2: #626b61;
+      --accent: #64d59f;
+      --accent-2: #f0b85d;
+      --accent-soft: rgba(100, 213, 159, .13);
+      --on-accent: #102018;
+      --rail-width: 248px;
+      color-scheme: dark;
+    }
+
+    .style-darkpro .app-body {
+      background: var(--bg);
+    }
+
+    .style-darkpro .left-rail {
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      padding: 14px;
+    }
+
+    .style-darkpro .rail-link {
+      min-height: 38px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .style-darkpro .source-stack {
+      display: grid;
+      gap: 8px;
+      margin: 14px 0;
+    }
+
+    .style-darkpro .source-card {
+      min-height: 52px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 10px;
+      color: var(--muted);
+      background: var(--surface-soft);
+      font-size: 12px;
+    }
+
+    .style-darkpro .source-card strong {
+      color: var(--text);
+      display: block;
+      margin-bottom: 2px;
+      font-size: 13px;
+    }
+
+    .style-darkpro .source-card.active {
+      border-color: rgba(100, 213, 159, .42);
+      background: var(--accent-soft);
+    }
+
+    .style-darkpro .main-area {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 14px;
+      padding: 16px;
+    }
+
+    .style-darkpro .dark-toolbar {
+      display: grid;
+      grid-template-columns: minmax(360px, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .style-darkpro .search-line {
+      height: 50px;
+      padding: 0 10px 0 14px;
+      background: #252923;
+    }
+
+    .style-darkpro .dark-grid {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 300px;
+      gap: 14px;
+    }
+
+    .style-darkpro .result-card {
+      min-width: 0;
+      overflow: auto;
+      padding: 24px 28px;
+      background: #20241f;
+    }
+
+    .style-darkpro .dark-aside {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      gap: 12px;
+    }
+
+    .style-darkpro .inspect-panel {
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #20241f;
+    }
+
+    .style-darkpro .inspect-panel h3 {
+      margin: 0 0 10px;
+      font-size: 13px;
+    }
+
+    .style-darkpro .stat-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .style-darkpro .stat {
+      min-height: 58px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 9px;
+      color: var(--muted);
+      background: var(--surface-soft);
+      font-size: 12px;
+    }
+
+    .style-darkpro .stat strong {
+      display: block;
+      color: var(--text);
+      font-size: 19px;
+      line-height: 1.2;
+    }
+
+    .recommendation {
+      margin-top: 16px;
+      display: grid;
+      grid-template-columns: 1.1fr .9fr;
+      gap: 12px;
+    }
+
+    .recommendation section {
+      border: 1px solid var(--page-line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, .76);
+      padding: 14px 16px;
+    }
+
+    .recommendation h2 {
+      margin: 0 0 8px;
+      font-size: 15px;
+    }
+
+    .recommendation p {
+      margin: 0;
+      color: var(--page-muted);
+      font-size: 13px;
+      line-height: 1.65;
+    }
+
+    @media (max-width: 1120px) {
+      body { min-width: 920px; }
+      .decision-notes { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .native-window { height: 700px; }
+      .style-workbench .content-grid,
+      .style-quick .quick-result,
+      .style-darkpro .dark-grid {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      .style-workbench .side-panel,
+      .style-quick .right-stack,
+      .style-darkpro .dark-aside {
+        display: none;
+      }
+      .style-reader .main-area {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      .style-reader .reader-aside {
+        display: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <symbol id="i-search" viewBox="0 0 24 24"><path d="m21 21-4.3-4.3"/><circle cx="11" cy="11" r="7"/></symbol>
+    <symbol id="i-star" viewBox="0 0 24 24"><path d="m12 3 2.9 5.9 6.5.9-4.7 4.6 1.1 6.4L12 17.8l-5.8 3 1.1-6.4-4.7-4.6 6.5-.9L12 3Z"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></symbol>
+    <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5Z"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M12 15.5A3.5 3.5 0 1 0 12 8a3.5 3.5 0 0 0 0 7.5Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1A2 2 0 1 1 4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7A2 2 0 1 1 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1A2 2 0 1 1 19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.1a2 2 0 1 1 0 4H21a1.7 1.7 0 0 0-1.6 1Z"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-speaker" viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+    <symbol id="i-pin" viewBox="0 0 24 24"><path d="m14 4 6 6-3 1-4 4-1 5-8-8 5-1 4-4 1-3Z"/><path d="m4 20 5-5"/></symbol>
+    <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m20 6-11 11-5-5"/></symbol>
+    <symbol id="i-arrow-left" viewBox="0 0 24 24"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></symbol>
+  </svg>
+
+  <main class="page-shell">
+    <div class="decision-bar">
+      <div class="decision-title">
+        <h1>wind-dict PC 端 UI 重新设计决策稿</h1>
+        <p>同一词典场景下的四套 Native 风格方向：布局、密度、阅读感与唤起方式各自拉开。</p>
+      </div>
+      <nav class="style-tabs" aria-label="风格切换">
+        <button type="button" data-style-tab="workbench" aria-selected="true">01 效率工作台</button>
+        <button type="button" data-style-tab="reader" aria-selected="false">02 阅读纸感</button>
+        <button type="button" data-style-tab="quick" aria-selected="false">03 热键速查</button>
+        <button type="button" data-style-tab="darkpro" aria-selected="false">04 深色专业</button>
+      </nav>
+    </div>
+
+    <div class="decision-notes">
+      <div class="decision-note">
+        <strong>01 效率工作台</strong>
+        <span>最接近当前实现：左侧历史/收藏、主区查询与结果、右侧查询源和备注，适合直接作为 MVP 主窗口。</span>
+      </div>
+      <div class="decision-note">
+        <strong>02 阅读纸感</strong>
+        <span>把结果当“词典书页”处理，正文更舒展，适合长释义阅读和收藏整理，但信息密度更低。</span>
+      </div>
+      <div class="decision-note">
+        <strong>03 热键速查</strong>
+        <span>面向 Ctrl+Alt+D 唤起后的即时查询，窗口更小、动作更少，适合作为未来独立速查模式。</span>
+      </div>
+      <div class="decision-note">
+        <strong>04 深色专业</strong>
+        <span>高密度、低亮度、查询源状态更显性，适合重度用户；可作为主窗口的深色皮肤方向。</span>
+      </div>
+    </div>
+
+    <section class="mockup-panel is-active" data-style-panel="workbench">
+      <div class="native-window style-workbench">
+        <div class="titlebar">
+          <div class="brand"><span class="brand-mark">词</span><span>wind-dict</span><span class="brand-sub">英汉 · 汉英</span></div>
+          <div class="title-spacer"></div>
+          <div class="source-pill">离线词典 <svg class="icon"><use href="#i-chevron-down"/></svg></div>
+          <button class="title-action" aria-label="固定窗口"><svg class="icon"><use href="#i-pin"/></svg></button>
+          <button class="title-action" aria-label="设置"><svg class="icon"><use href="#i-settings"/></svg></button>
+          <div class="window-control"><span class="win-min"></span></div>
+          <div class="window-control"><span class="win-max"></span></div>
+          <div class="window-control close"><span class="win-close"></span></div>
+        </div>
+        <div class="app-body">
+          <aside class="left-rail">
+            <div class="rail-head">
+              <div class="rail-title">回看</div>
+              <button class="icon-btn" aria-label="侧栏"><svg class="icon"><use href="#i-panel"/></svg></button>
+            </div>
+            <div class="segmented"><span class="active">历史</span><span>收藏</span></div>
+            <div class="side-list">
+              <div class="side-row active"><span class="dot"></span><span>make</span></div>
+              <div class="side-row"><span class="dot"></span><span>mediate</span></div>
+              <div class="side-row"><span class="dot"></span><span>行</span></div>
+              <div class="side-row"><span class="dot"></span><span>wind</span></div>
+              <div class="side-row"><span class="dot"></span><span>皮实</span></div>
+              <div class="side-row"><span class="dot"></span><span>lookup</span></div>
+              <div class="side-row"><span class="dot"></span><span>余</span></div>
+            </div>
+            <div class="rail-bottom">
+              <div class="rail-link"><svg class="icon"><use href="#i-book"/></svg><span>词库</span></div>
+              <div class="rail-link"><svg class="icon"><use href="#i-settings"/></svg><span>设置</span><span style="margin-left:auto;color:var(--muted-2)">142 词</span></div>
+            </div>
+          </aside>
+          <main class="main-area">
+            <div class="top-strip">
+              <div class="search-wrap">
+                <div class="search-line">
+                  <svg class="icon"><use href="#i-search"/></svg>
+                  <input value="mak" aria-label="输入中文或英文" />
+                  <button class="icon-btn" aria-label="清空"><svg class="icon"><use href="#i-x"/></svg></button>
+                  <button class="primary-btn">查询</button>
+                </div>
+                <div class="candidate-popover">
+                  <div class="candidate-row active"><strong>make</strong><span>v. 做，制造，使成为；n. 品牌，型号</span><span class="tag">Enter</span></div>
+                  <div class="candidate-row"><strong>maker</strong><span>n. 制造者，生产商</span><span></span></div>
+                  <div class="candidate-row"><strong>makeup</strong><span>n. 化妆品；组成；补考</span><span></span></div>
+                  <div class="candidate-row"><strong>making</strong><span>n. 制作；形成；成功所需素质</span><span></span></div>
+                </div>
+              </div>
+              <div class="quick-actions">
+                <button class="icon-btn active" aria-label="收藏"><svg class="icon"><use href="#i-star"/></svg></button>
+                <button class="icon-btn" aria-label="历史"><svg class="icon"><use href="#i-clock"/></svg></button>
+                <button class="icon-btn" aria-label="复制"><svg class="icon"><use href="#i-copy"/></svg></button>
+              </div>
+            </div>
+            <div class="content-grid">
+              <article class="result-card">
+                <div class="head-meta">
+                  <div class="headword-row">
+                    <h2 class="headword">make</h2>
+                    <button class="icon-btn active" aria-label="收藏"><svg class="icon"><use href="#i-star"/></svg></button>
+                  </div>
+                  <div class="phonetic">
+                    <span>英 /meɪk/</span><svg class="icon speak"><use href="#i-speaker"/></svg>
+                    <span>美 /meɪk/</span><svg class="icon speak"><use href="#i-speaker"/></svg>
+                    <span>原形命中</span>
+                  </div>
+                  <div class="inflections">
+                    <span><em>过去式</em> made</span>
+                    <span><em>现在分词</em> making</span>
+                    <span><em>三单</em> makes</span>
+                  </div>
+                </div>
+                <div class="divider"></div>
+                <div class="reading-scroll">
+                  <div class="glosses" style="margin-top:20px">
+                    <div class="gloss-row"><span class="pos">v.</span><span>制造，做成；使得，使成为；准备，安排；赚得，获得</span></div>
+                    <div class="gloss-row"><span class="pos">n.</span><span>品牌，型号；性格，气质；制作方式</span></div>
+                  </div>
+                  <div class="plain-section" style="margin-top:24px;padding:15px;background:var(--surface-soft)">
+                    <div class="section-title">英英释义</div>
+                    <p class="small-muted" style="margin:10px 0 0">to create or prepare something by combining materials or putting parts together.</p>
+                  </div>
+                </div>
+              </article>
+              <aside class="side-panel">
+                <section class="info-block">
+                  <h3>查询源</h3>
+                  <div class="source-list">
+                    <div class="source-item active"><span>离线词典</span><span class="source-state">已收录</span></div>
+                    <div class="source-item"><span>DeepL 译源</span><span>主动切换</span></div>
+                    <div class="source-item"><span>AI 译源</span><span>生成内容</span></div>
+                  </div>
+                </section>
+                <section class="info-block">
+                  <h3>备注</h3>
+                  <div class="note-field">常见动词，注意 make + object + adj. 的结构。</div>
+                </section>
+                <section class="info-block">
+                  <h3>相关历史</h3>
+                  <div class="side-list">
+                    <div class="side-row"><span class="dot"></span><span>made</span></div>
+                    <div class="side-row"><span class="dot"></span><span>making</span></div>
+                    <div class="side-row"><span class="dot"></span><span>maker</span></div>
+                  </div>
+                </section>
+              </aside>
+            </div>
+          </main>
+        </div>
+      </div>
+    </section>
+
+    <section class="mockup-panel" data-style-panel="reader">
+      <div class="native-window style-reader">
+        <div class="titlebar">
+          <div class="brand"><span class="brand-mark">词</span><span>wind-dict</span><span class="brand-sub">阅读模式</span></div>
+          <div class="title-spacer"></div>
+          <div class="source-pill">离线词典 <svg class="icon"><use href="#i-chevron-down"/></svg></div>
+          <button class="title-action" aria-label="固定窗口"><svg class="icon"><use href="#i-pin"/></svg></button>
+          <div class="window-control"><span class="win-min"></span></div>
+          <div class="window-control"><span class="win-max"></span></div>
+          <div class="window-control close"><span class="win-close"></span></div>
+        </div>
+        <div class="app-body">
+          <aside class="left-rail">
+            <div>
+              <div class="brand" style="padding-left:0"><span class="brand-mark">词</span><span>wind-dict</span></div>
+              <nav class="reader-nav">
+                <div class="active"><svg class="icon"><use href="#i-clock"/></svg><span>历史记录</span></div>
+                <div><svg class="icon"><use href="#i-star"/></svg><span>收藏</span></div>
+                <div><svg class="icon"><use href="#i-book"/></svg><span>词库</span></div>
+                <div><svg class="icon"><use href="#i-settings"/></svg><span>设置</span></div>
+              </nav>
+            </div>
+            <div></div>
+            <div class="reader-count">
+              <span>今日 12 次查询</span>
+              <span>收藏 142 个词头</span>
+            </div>
+          </aside>
+          <main class="main-area">
+            <section class="reader-main">
+              <div class="reader-search">
+                <div class="search-line">
+                  <svg class="icon"><use href="#i-search"/></svg>
+                  <input value="make" aria-label="输入中文或英文" />
+                  <button class="icon-btn" aria-label="清空"><svg class="icon"><use href="#i-x"/></svg></button>
+                </div>
+                <button class="icon-btn active" aria-label="收藏"><svg class="icon"><use href="#i-star"/></svg></button>
+              </div>
+              <article class="book-page">
+                <div class="head-meta">
+                  <div class="headword-row">
+                    <h2 class="headword">make</h2>
+                    <button class="icon-btn active" aria-label="收藏"><svg class="icon"><use href="#i-star"/></svg></button>
+                  </div>
+                  <div class="phonetic">
+                    <span>英 /meɪk/</span><svg class="icon speak"><use href="#i-speaker"/></svg>
+                    <span>美 /meɪk/</span><svg class="icon speak"><use href="#i-speaker"/></svg>
+                  </div>
+                  <div class="inflections">
+                    <span><em>过去式</em> made</span>
+                    <span><em>现在分词</em> making</span>
+                    <span><em>三单</em> makes</span>
+                  </div>
+                </div>
+                <div class="divider" style="margin-bottom:24px"></div>
+                <div class="glosses">
+                  <div class="gloss-row"><span class="pos">v.</span><span>制造，做成；使得，使成为；准备，安排；赚得，获得。常用于 make something possible / make somebody happy 等结构。</span></div>
+                  <div class="gloss-row"><span class="pos">n.</span><span>品牌，型号；制作方式；人的性格或气质。</span></div>
+                </div>
+                <div style="margin-top:34px">
+                  <div class="section-title">英英释义</div>
+                  <p style="max-width:680px;color:var(--muted);font-size:16px;line-height:1.8;margin:10px 0 0">to create, prepare, or produce something, especially by arranging parts or materials.</p>
+                </div>
+              </article>
+            </section>
+            <aside class="reader-aside">
+              <section class="aside-block">
+                <h3>本页词头</h3>
+                <div class="mini-list">
+                  <span><strong>make</strong> 英汉词条</span>
+                  <span>查询方向自动判定</span>
+                </div>
+              </section>
+              <section class="aside-block">
+                <h3>备注</h3>
+                <div class="note-field">make + 宾语 + 形容词：make it clear, make me happy。</div>
+              </section>
+              <section class="aside-block">
+                <h3>附近历史</h3>
+                <div class="mini-list">
+                  <span><strong>made</strong> 09:42</span>
+                  <span><strong>making</strong> 09:41</span>
+                  <span><strong>mediate</strong> 昨天</span>
+                  <span><strong>行</strong> 昨天</span>
+                </div>
+              </section>
+            </aside>
+          </main>
+        </div>
+      </div>
+    </section>
+
+    <section class="mockup-panel" data-style-panel="quick">
+      <div class="native-window style-quick">
+        <div class="titlebar">
+          <div class="brand"><span class="brand-mark">词</span><span>wind-dict</span><span class="brand-sub">速查</span></div>
+          <div class="title-spacer"></div>
+          <span class="kbd">Ctrl</span><span class="kbd">Alt</span><span class="kbd">D</span>
+          <button class="title-action" aria-label="展开主窗口"><svg class="icon"><use href="#i-panel"/></svg></button>
+          <div class="window-control"><span class="win-min"></span></div>
+          <div class="window-control close"><span class="win-close"></span></div>
+        </div>
+        <div class="app-body">
+          <div class="quick-shell">
+            <div class="quick-command">
+              <div class="search-line">
+                <svg class="icon"><use href="#i-search"/></svg>
+                <input value="mak" aria-label="输入中文或英文" />
+                <button class="icon-btn" aria-label="清空"><svg class="icon"><use href="#i-x"/></svg></button>
+                <button class="primary-btn">查询</button>
+              </div>
+            </div>
+            <div class="quick-candidates">
+              <div class="quick-candidate active"><strong>make</strong><span>v. 做，制造，使成为；n. 品牌，型号</span><span class="tag">Enter</span></div>
+              <div class="quick-candidate"><strong>maker</strong><span>n. 制造者，生产商</span><span></span></div>
+              <div class="quick-candidate"><strong>making</strong><span>n. 制作；形成；成功所需素质</span><span></span></div>
+            </div>
+            <div class="quick-result">
+              <article class="result-card">
+                <div class="head-meta">
+                  <div class="headword-row">
+                    <h2 class="headword">make</h2>
+                    <button class="icon-btn active" aria-label="收藏"><svg class="icon"><use href="#i-star"/></svg></button>
+                  </div>
+                  <div class="phonetic">
+                    <span>英 /meɪk/</span><svg class="icon speak"><use href="#i-speaker"/></svg>
+                    <span>美 /meɪk/</span><svg class="icon speak"><use href="#i-speaker"/></svg>
+                  </div>
+                </div>
+                <div class="divider" style="margin:16px 0"></div>
+                <div class="glosses">
+                  <div class="gloss-row"><span class="pos">v.</span><span>制造，做成；使得，使成为；准备，安排。</span></div>
+                  <div class="gloss-row"><span class="pos">n.</span><span>品牌，型号；制作方式。</span></div>
+                </div>
+              </article>
+              <aside class="right-stack">
+                <section class="mini-panel">
+                  <h3>动作</h3>
+                  <div class="source-list">
+                    <div class="source-item active"><span>收藏词头</span><span><svg class="icon"><use href="#i-check"/></svg></span></div>
+                    <div class="source-item"><span>复制中文释义</span><span></span></div>
+                    <div class="source-item"><span>打开完整窗口</span><span></span></div>
+                  </div>
+                </section>
+                <section class="mini-panel">
+                  <h3>简短备注</h3>
+                  <div class="note-field">make it possible / make a decision</div>
+                </section>
+              </aside>
+            </div>
+            <div class="compact-actions">
+              <div class="chip-row">
+                <span class="chip">made</span>
+                <span class="chip">making</span>
+                <span class="chip">行</span>
+                <span class="chip">wind</span>
+                <span class="chip">皮实</span>
+              </div>
+              <div style="display:flex;gap:8px">
+                <button class="icon-btn active" aria-label="收藏"><svg class="icon"><use href="#i-star"/></svg></button>
+                <button class="icon-btn" aria-label="设置"><svg class="icon"><use href="#i-settings"/></svg></button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="mockup-panel" data-style-panel="darkpro">
+      <div class="native-window style-darkpro">
+        <div class="titlebar">
+          <div class="brand"><span class="brand-mark">词</span><span>wind-dict</span><span class="brand-sub">专业模式</span></div>
+          <div class="title-spacer"></div>
+          <div class="source-pill">离线词典 <svg class="icon"><use href="#i-chevron-down"/></svg></div>
+          <button class="title-action" aria-label="固定窗口"><svg class="icon"><use href="#i-pin"/></svg></button>
+          <button class="title-action" aria-label="设置"><svg class="icon"><use href="#i-settings"/></svg></button>
+          <div class="window-control"><span class="win-min"></span></div>
+          <div class="window-control"><span class="win-max"></span></div>
+          <div class="window-control close"><span class="win-close"></span></div>
+        </div>
+        <div class="app-body">
+          <aside class="left-rail">
+            <div class="segmented"><span class="active">历史</span><span>收藏</span></div>
+            <div class="source-stack">
+              <div class="source-card active"><div><strong>离线词典</strong><span>ECDICT + CEDICT</span></div><svg class="icon"><use href="#i-check"/></svg></div>
+              <div class="source-card"><div><strong>DeepL 译源</strong><span>主动切换后查询</span></div></div>
+              <div class="source-card"><div><strong>AI 译源</strong><span>生成内容标识</span></div></div>
+            </div>
+            <div class="side-list">
+              <div class="side-row active"><span class="dot"></span><span>make</span></div>
+              <div class="side-row"><span class="dot"></span><span>made</span></div>
+              <div class="side-row"><span class="dot"></span><span>making</span></div>
+              <div class="side-row"><span class="dot"></span><span>mediate</span></div>
+              <div class="side-row"><span class="dot"></span><span>行</span></div>
+              <div class="side-row"><span class="dot"></span><span>皮实</span></div>
+            </div>
+            <div class="rail-link" style="border-top:1px solid var(--line);padding-top:12px;color:var(--muted)">
+              <svg class="icon"><use href="#i-settings"/></svg><span>设置</span><span style="margin-left:auto">142 词</span>
+            </div>
+          </aside>
+          <main class="main-area">
+            <div class="dark-toolbar">
+              <div class="search-wrap">
+                <div class="search-line">
+                  <svg class="icon"><use href="#i-search"/></svg>
+                  <input value="make" aria-label="输入中文或英文" />
+                  <button class="icon-btn" aria-label="清空"><svg class="icon"><use href="#i-x"/></svg></button>
+                </div>
+              </div>
+              <div style="display:flex;gap:8px">
+                <button class="icon-btn active" aria-label="收藏"><svg class="icon"><use href="#i-star"/></svg></button>
+                <button class="icon-btn" aria-label="复制"><svg class="icon"><use href="#i-copy"/></svg></button>
+                <button class="primary-btn">查询</button>
+              </div>
+            </div>
+            <div class="dark-grid">
+              <article class="result-card">
+                <div class="head-meta">
+                  <div class="headword-row">
+                    <h2 class="headword">make</h2>
+                    <button class="icon-btn active" aria-label="收藏"><svg class="icon"><use href="#i-star"/></svg></button>
+                  </div>
+                  <div class="phonetic">
+                    <span>英 /meɪk/</span><svg class="icon speak"><use href="#i-speaker"/></svg>
+                    <span>美 /meɪk/</span><svg class="icon speak"><use href="#i-speaker"/></svg>
+                    <span class="tag">原形命中</span>
+                  </div>
+                  <div class="inflections">
+                    <span><em>过去式</em> made</span>
+                    <span><em>现在分词</em> making</span>
+                    <span><em>三单</em> makes</span>
+                  </div>
+                </div>
+                <div class="divider" style="margin:18px 0"></div>
+                <div class="glosses">
+                  <div class="gloss-row"><span class="pos">v.</span><span>制造，做成；使得，使成为；准备，安排；赚得，获得。</span></div>
+                  <div class="gloss-row"><span class="pos">n.</span><span>品牌，型号；性格，气质；制作方式。</span></div>
+                </div>
+                <div class="plain-section" style="margin-top:22px;padding:15px;background:var(--surface-soft)">
+                  <div class="section-title">英英释义</div>
+                  <p class="small-muted" style="margin:10px 0 0">to create or prepare something by combining materials or putting parts together.</p>
+                </div>
+              </article>
+              <aside class="dark-aside">
+                <section class="inspect-panel">
+                  <h3>词头状态</h3>
+                  <div class="stat-grid">
+                    <div class="stat"><strong>3</strong><span>词形变化</span></div>
+                    <div class="stat"><strong>2</strong><span>义项分组</span></div>
+                    <div class="stat"><strong>142</strong><span>收藏总数</span></div>
+                    <div class="stat"><strong>0 ms</strong><span>离线查询</span></div>
+                  </div>
+                </section>
+                <section class="inspect-panel">
+                  <h3>备注</h3>
+                  <div class="note-field">make it clear / make sense / make a decision</div>
+                </section>
+                <section class="inspect-panel">
+                  <h3>候选预览</h3>
+                  <div class="source-list">
+                    <div class="source-item active"><span>make</span><span>v.</span></div>
+                    <div class="source-item"><span>maker</span><span>n.</span></div>
+                    <div class="source-item"><span>makeup</span><span>n.</span></div>
+                  </div>
+                </section>
+              </aside>
+            </div>
+          </main>
+        </div>
+      </div>
+    </section>
+
+    <div class="recommendation">
+      <section>
+        <h2>建议决策路径</h2>
+        <p>主窗口优先从“效率工作台”落地，因为它最贴合当前代码结构：固定侧栏、查询框、候选浮层、结果区、设置入口都能直接映射。视觉皮肤可以吸收“阅读纸感”和“深色专业”的色彩与排版，而“热键速查”更适合等主窗口稳定后做第二窗口形态。</p>
+      </section>
+      <section>
+        <h2>实现注意</h2>
+        <p>Native 版保持 920×620 的默认窗口与 720×480 的下限时，侧栏应支持收起；候选浮层继续覆盖结果而不推走正文；“收藏”只表达书签语义，不改名为生词本。</p>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    const tabs = Array.from(document.querySelectorAll("[data-style-tab]"));
+    const panels = Array.from(document.querySelectorAll("[data-style-panel]"));
+
+    function showStyle(name, updateHash = true) {
+      tabs.forEach((tab) => tab.setAttribute("aria-selected", String(tab.dataset.styleTab === name)));
+      panels.forEach((panel) => panel.classList.toggle("is-active", panel.dataset.stylePanel === name));
+      if (updateHash) history.replaceState(null, "", `#${name}`);
+    }
+
+    tabs.forEach((tab) => {
+      tab.addEventListener("click", () => showStyle(tab.dataset.styleTab));
+    });
+
+    const initial = location.hash.slice(1);
+    if (tabs.some((tab) => tab.dataset.styleTab === initial)) {
+      showStyle(initial, false);
+    }
+  </script>
+</body>
+</html>
