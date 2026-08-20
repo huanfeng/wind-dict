@@ -1135,8 +1135,16 @@ fn window_root(st: Rc<State>, unavailable: Option<String>) -> Element {
 
 /// 自定义标题栏：应用标识 + 窗口按钮。
 ///
-/// 拖动区只标在品牌块上（见 `brand`），不是整条。落在窗口按钮上不拖、正常点击
-/// （windui 按「命中可聚焦控件则不拖」处理）。
+/// 整条 `window_drag()` 可拖动窗口；落在窗口按钮与三个文字入口上不拖、正常点击——
+/// windui 沿父链自内向外找最近的裁决者，先遇到可聚焦控件就交给它（`Tree::hit_role`）。
+///
+/// 曾有一版把拖动区缩到品牌块上，那是上游只看命中落定节点时的绕法，已随
+/// wind-ui-rust `7b6ab36` 撤回，见 `bar_entry`。
+///
+/// 附带一条真实的取舍：三个入口贴着窗口顶边，而可聚焦子树整体优先判 `HTCLIENT`，
+/// 于是那 141px 宽的一段**让不出顶部 8px 的缩放带**——从标题栏右侧那截顶边往上拖
+/// 拉不动窗口高度。窗口按钮那 138px 本来就是这样（它一直是可聚焦控件），左侧品牌区
+/// 与其余三条边不受影响，够用。
 fn title_bar(st: Rc<State>) -> Element {
     Element::row()
         .width_match()
@@ -1145,6 +1153,7 @@ fn title_bar(st: Rc<State>) -> Element {
         // 标题栏底走 `SurfaceAlt` 而非皮肤里那个具体色：三套皮肤的 `titlebar` 恰好
         // 都等于 `surface_alt`，用角色表达之后换肤能自动跟随，不必重建元素树。
         .bg_role(Role::SurfaceAlt)
+        .window_drag()
         .child(brand().weight(1.0))
         // 召回与设置三个入口并列在这里。
         //
@@ -1194,21 +1203,14 @@ fn recall_entry(text: &str, tab: usize, st: Rc<State>) -> Element {
 
 /// 标题栏上的一个文字入口。
 ///
-/// **不得落在 `window_drag` 区域内**，否则整个文字部分点不动——拖动区的标记是这么
-/// 检查的（windui `Tree::drag_hit_at`）：看**命中落定的那个节点自身**可不可聚焦，
-/// 可以就交给它、不拖窗。而命中会落在里面那个 `label` 上（`Label` 是真实控件，
-/// `hit_opaque` 默认 true，命中即停），`Label::focusable()` 是 false——于是判定
-/// 认为这里是标题栏空白，`WM_NCHITTEST` 答 `HTCAPTION`，系统接管，客户区连
-/// `WM_LBUTTONDOWN` 都收不到。外层 `Clickable::focusable()` 虽为 true 却轮不到它，
-/// 判定不沿父链找。
+/// 落在 `window_drag` 区域内仍可点：windui 沿父链自内向外找最近的裁决者，命中虽落在
+/// 里面那个 `label` 上（不可聚焦），外层这个 `Clickable` 先于标题栏的 `window_drag`
+/// 被遇到，于是判交互、不拖窗。
 ///
-/// 症状是**只有文字上下的空隙能点**（那里命中落在 `Clickable` 自身），且顶上 8px
-/// 还要让给窗口缩放边框（`RESIZE_BORDER_LOGICAL`），于是实机表现为「只有按钮最下面
-/// 一条能点」。故拖动区改标在 `brand` 上，标题栏行本身不再是拖动区。
-///
-/// 上游那条判定该沿父链找最近的可交互节点（与 `on_drop` / `context_menu` 的冒泡
-/// 语义一致），已按 `docs/upstream-drag-hit-bubbles.md` 提出。它补上之后这里怎么
-/// 摆都行。
+/// 这条**曾经不成立**，实机表现是「只有按钮最下面一条能点」：那时判定只看命中落定的
+/// 节点自身，`Label::focusable()` 为 false 就当成了标题栏空白，`WM_NCHITTEST` 答
+/// `HTCAPTION`，客户区连 `WM_LBUTTONDOWN` 都收不到。上游 `7b6ab36` 已把两侧判定统一
+/// 成一次父链遍历（`Tree::hit_role`），经过与结案记在 `docs/upstream-drag-hit-bubbles.md`。
 ///
 /// **不画激活态**。抽屉开着时它头部的分段控件已经写明当前停在哪一页，标题栏再标一次
 /// 是重复；而 windui 的 `bg_role` 是构建期定死的，要让它跟着信号变得多叠一个节点——
@@ -1228,19 +1230,11 @@ fn bar_entry(text: &str, on_click: impl FnMut(&mut EventCtx) + 'static) -> Eleme
 }
 
 /// 标题栏左侧的应用标识：图标 + 名称 + 能力副标题。
-///
-/// **窗口拖动区就是这里**，不是整条标题栏——理由见 `bar_entry`：标在整条上，右侧那
-/// 三个文字入口会被 `HTCAPTION` 吞掉，点不动。
-///
-/// 拖动手感不受影响：本元素在 `title_bar` 里带 `weight(1.0)`，右侧入口之外的整片
-/// 空白都归它，双击最大化也照旧。真正失去的只有「在『历史』二字上按住拖窗」，而那
-/// 本来就该是点击。
 fn brand() -> Element {
     Element::row()
         .cross(Align::Center)
         .spacing(9)
         .padding_xy(14, 0)
-        .window_drag()
         .child(
             // 应用标识。**与托盘、任务栏是同一份产物**（`scripts/gen-icon.ps1`），
             // 三处必然一致。
