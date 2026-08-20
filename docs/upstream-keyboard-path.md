@@ -116,6 +116,12 @@ Element::text_input(sig, "…")
 - **`autofocus` 是一次性的**（语义同 HTML），不是每次唤起都重新聚焦。故「唤起即全选」
   只在进程起来后第一次唤起成立；第二次唤起若焦点从未离开过查询框，上次查的词还在、
   光标在末尾。要每次唤起都全选得有个 per-wake 钩子（`on_show`），上游说明确要就单独提。
+
+  **2026-08-20 追记：这条也结了。** 上游 `675d6d5` 加了 `App::on_show`，并让
+  `autofocus` / `autofocus_select_all` 在隐藏→可见的跃迁上**自动重新兑现**
+  （`AppHandler::on_window_shown` → `rearm_autofocus`）。托盘点击、全局热键、
+  `WindowOp::Show` 三条唤起路径都算。
+  wind-dict 侧**不需要挂 `on_show`**——不必写一行代码，只删掉了那条已作废的注释。
 - **PageUp/PageDown** 当时不在 `Key` 枚举里，上游随后在 `8219b58` 补上了。
 
 下次提需求给**符号名**而不是行号——行号在对方改完自己的代码后必然作废。

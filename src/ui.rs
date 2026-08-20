@@ -1884,10 +1884,12 @@ fn query_box(st: Rc<State>) -> Element {
                 // 查另一个词」，而窗口只是被隐藏、上次的词原样还在框里。全选让下一个词
                 // 直接覆盖打上去，不用先删。
                 //
-                // 只在节点首次进入焦点环那一帧兑现（语义同 HTML 的 autofocus），故这是
-                // **进程起来后第一次唤起**的行为。第二次唤起若焦点从未离开过查询框，
-                // 不会重新全选——那需要一个 per-wake 钩子，windui 侧尚无，见
-                // `docs/upstream-windui-reply.md` 的「下一步」。
+                // **每次唤起都重新兑现**：托盘点击 / 全局热键 / `WindowOp::Show` 造成的
+                // 隐藏→可见跃迁，上游都会重新 arm 一次（windui `on_window_shown`），
+                // 应用侧不需要挂 `on_show`。
+                //
+                // 这里此前写着「只在进程起来后第一次唤起兑现，第二次唤起焦点还停在原处」
+                // ——那条限制上游已经解掉了（`675d6d5`），注释一并作废。
                 .autofocus_select_all()
                 .on_submit(move |_ctx| submit_st.submit())
                 .on_nav_key(move |_ctx, ev| match ev.key {
