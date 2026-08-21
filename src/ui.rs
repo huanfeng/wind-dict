@@ -490,7 +490,10 @@ impl ExpandedStates {
         if let Some(s) = self.0.borrow().get(key) {
             return *s;
         }
-        debug_assert!(false, "展开态 `{key}` 未预建：`rebuild_cards` 与 `card_view` 的键对不上了");
+        debug_assert!(
+            false,
+            "展开态 `{key}` 未预建：`rebuild_cards` 与 `card_view` 的键对不上了"
+        );
         signal(default_open)
     }
 }
@@ -651,9 +654,9 @@ impl State {
         // 位置在 `cards.set` 之前：这一行才是重建的触发点，先备好再放它走。
         let default_open = self.settings.borrow().expand_en;
         self.expanded.prepare(
-            cards.iter().flat_map(|c| {
-                (0..c.entries.len()).map(|i| expand_key(&c.headword, i))
-            }),
+            cards
+                .iter()
+                .flat_map(|c| (0..c.entries.len()).map(|i| expand_key(&c.headword, i))),
             default_open,
         );
         self.cards.set(cards);
@@ -1419,6 +1422,24 @@ fn pages(st: Rc<State>, unavailable: Option<String>) -> Element {
         )
 }
 
+/// 竖向容器里的滚动区：**高度靠 `weight` 拿，不能用 `.fill()`**。
+///
+/// 这不是风格偏好，是 windui 的测量规则决定的。竖向父容器里，子节点主轴（高度）上的
+/// `Match` 会被降级成 `Wrap`（`core.rs:measure_linear` 的「主轴上的 Match 降级为 Wrap」），
+/// 随后按 `at_most(整条主轴)` 解析——注意是**整条**，不是扣掉固定高兄弟之后的剩余。
+/// 于是内容超长的滚动区拿到的视口高等于整个父容器高，arrange 时从兄弟下方排起，
+/// 视口底边落到父容器**之外**，超出的那截被裁掉。
+///
+/// 症状是「滚到底还差一截看不见」，且差值恰好等于上方兄弟占的高度——设置页差一个
+/// 56px 页头，结果区差 26px（20px 提示行 + 6px 间距）。滚动条也够不到底，因为
+/// `max_scroll = content_h - 视口高` 里的视口高多算了那一截。
+///
+/// `weight` 走的是第二遍按剩余空间瓜分的路径（`MeasureSpec::exactly(portion)`），
+/// 视口高才等于真实可见高。`main_column` 里那句「不写 `.fill()`」说的是同一件事。
+fn scroll_area(child: Element) -> Element {
+    Element::scroll().width_match().weight(1.0).child(child)
+}
+
 /// 召回列表。历史与收藏共用一份数据信号，由 `SideLoader` 按当前页签重载。
 ///
 /// 改抽屉时顺带修掉了一处浪费：此前用 `Element::tabs` 把两页都建进树、只给未选中的
@@ -1570,13 +1591,10 @@ fn settings_page(st: Rc<State>) -> Element {
                         .fg_role(Role::Text),
                 ),
         )
-        .child(
-            Element::scroll()
-                .fill()
-                .child(Element::host_signal(st.settings_rev, move |_rev: u64| {
-                    settings_body(st.clone())
-                })),
-        )
+        .child(scroll_area(Element::host_signal(
+            st.settings_rev,
+            move |_rev: u64| settings_body(st.clone()),
+        )))
 }
 
 /// 设置页正文。每次 `settings_rev` 变动整体重建，故其中的构建时求值（选中环、
@@ -2135,7 +2153,7 @@ fn result_area(st: Rc<State>) -> Element {
                 .height(20)
                 .width_match(),
         )
-        .child(Element::scroll().fill().child(
+        .child(scroll_area(
             Element::host_signal(cards, move |c: Card| card_view(c, st.clone())).width_match(),
         ))
 }
@@ -2168,7 +2186,9 @@ fn card_view(c: Card, st: Rc<State>) -> Element {
     for (i, e) in c.entries.into_iter().enumerate() {
         // 只查表，不新建：本函数跑在重建作用域内，在这里 `signal()` 出来的句柄活不过
         // 下一次重建。信号由 `rebuild_cards` 预先备好，详见 `ExpandedStates`。
-        let expanded = st.expanded.get(&expand_key(&hw, i), st.settings.borrow().expand_en);
+        let expanded = st
+            .expanded
+            .get(&expand_key(&hw, i), st.settings.borrow().expand_en);
         col = col.child(entry_view(e, expanded));
     }
     // 备注排在最后：它是用户**附加**给这个词的东西，不该插进词典自身的内容里打断
@@ -2450,8 +2470,8 @@ fn join(s: &Sense) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        expand_key, group_by_headword, headwords_to_record, signal, write_note, ExpandedStates,
-        Role,
+        expand_key, group_by_headword, headwords_to_record, scroll_area, signal, write_note,
+        ExpandedStates, Role,
     };
     use crate::domain::{ChineseEntry, EnglishEntry, Entry, Headword, Inflections, Sense};
 
@@ -2606,7 +2626,10 @@ mod tests {
         let mut next = SignalScope::new();
         let again = next.collect(|| states.get("misc#0", false));
 
-        assert!(again.get(), "展开态该活过重建，且句柄不该随作用域一起被回收");
+        assert!(
+            again.get(),
+            "展开态该活过重建，且句柄不该随作用域一起被回收"
+        );
     }
 
     /// 不同词条各自开合，互不影响（多音字一个词头、多条词条）。
@@ -2648,5 +2671,82 @@ mod tests {
         write_note(text, tone, Role::Danger, "清空历史失败：库已锁定");
         assert_eq!(text.get(), "清空历史失败：库已锁定");
         assert_eq!(tone.get(), Role::Danger, "失败消息该是 Danger 角色");
+    }
+
+    /// 回归：设置页滚到底仍有一截正文看不见，差值恰好是页头的高度。
+    ///
+    /// 病因与规则写在 `scroll_area` 的文档注释里，这里守的是它的**结果**——竖向容器中
+    /// 滚动区的视口必须落在父容器内，且高度等于扣掉固定高兄弟之后的剩余。
+    ///
+    /// 曾经的写法是 `Element::scroll().fill()`。看着合理（"填满剩余空间"），实际上
+    /// 主轴上的 `Match` 被降级为 `Wrap` 后按整条父容器高解析，下面三条断言会各差一个
+    /// 页头：视口高 300 而非 244、底边 356 越出窗口、末块滚到底仍有 56px 在窗外。
+    #[test]
+    fn 滚动区的视口不越出父容器底边() {
+        use windui::core::Tree;
+        use windui::prelude::{Element, Size};
+        use windui::text::NullTextEngine;
+
+        const 窗口高: i32 = 300;
+        const 页头高: i32 = 56;
+        const 块高: i32 = 200;
+        const 块数: i32 = 3;
+
+        // 内容必须比视口高，否则滚不动也就测不出越界。
+        let mut 正文 = Element::col().width_match();
+        for _ in 0..块数 {
+            正文 = 正文.child(Element::leaf().width_match().height(块高));
+        }
+        // 设置页的骨架：固定高页头 + 滚动正文。
+        let 页 = Element::col()
+            .fill()
+            .child(Element::leaf().width_match().height(页头高))
+            .child(scroll_area(正文));
+
+        let mut tree = Tree::new();
+        let root = 页.build(&mut tree);
+        tree.root = Some(root);
+        let 布局 = |t: &mut Tree| t.layout_root(Size::new(400, 窗口高), &mut NullTextEngine);
+        布局(&mut tree);
+
+        // `Node::bounds` 是**相对父节点**的（绝对原点由 `arrange` 另行维护），
+        // 判断"有没有越出窗口"必须沿父链累加，否则拿深层节点的局部 y 当绝对值用。
+        fn 绝对底边(tree: &Tree, id: windui::core::NodeId) -> i32 {
+            let n = tree.get(id).unwrap();
+            let mut y = n.bounds.bottom();
+            let mut 上级 = n.parent;
+            while let Some(p) = 上级 {
+                let pn = tree.get(p).unwrap();
+                y += pn.bounds.y;
+                上级 = pn.parent;
+            }
+            y
+        }
+
+        let 滚动区 = tree.get(root).unwrap().children[1];
+        assert_eq!(
+            tree.get(滚动区).unwrap().bounds.h,
+            窗口高 - 页头高,
+            "视口高该是扣掉页头后的剩余；等于窗口高说明主轴 Match 又拿了整条"
+        );
+        assert_eq!(绝对底边(&tree, 滚动区), 窗口高, "视口底边不该越出窗口");
+
+        // 滚到底：末块的底边正好落在窗口内，一像素也不该被裁到窗外。
+        let (_, 最大滚动) = tree.scroll_range(滚动区).expect("scroll_area 应是滚动容器");
+        assert_eq!(
+            最大滚动,
+            块高 * 块数 - (窗口高 - 页头高),
+            "可滚动量按真实视口高算；视口多算一截，这里就少一截"
+        );
+        assert!(tree.set_scroll_y(滚动区, 最大滚动));
+        布局(&mut tree);
+
+        let 正文节点 = tree.get(滚动区).unwrap().children[0];
+        let 末块 = *tree.get(正文节点).unwrap().children.last().unwrap();
+        assert_eq!(
+            绝对底边(&tree, 末块),
+            窗口高,
+            "滚到底时正文末尾该贴着窗口底边，而不是停在窗外"
+        );
     }
 }
