@@ -24,7 +24,14 @@ anyhow = "1"
 # 且「程序启动子进程改注册表 Run 键」正是杀软重点盯防的行为模式，误报风险实打实。
 # 只启用注册表一个 feature，编译期开销可控。
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_System_Registry", "Win32_Foundation"] }
+# `Win32_UI_WindowsAndMessaging` 是为 `main::fatal` 的消息框加的：程序改成无控制台的
+# GUI 子系统后，启动期致命错误（词库打不开）原先那几行 eprintln 无处可去，用户看到的
+# 只是「双击了没反应」。
+windows = { version = "0.58", features = [
+    "Win32_System_Registry",
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # 仅构建期工具（examples/build_ecdict.rs）与测试使用。
 #
@@ -33,6 +40,19 @@ windows = { version = "0.58", features = ["Win32_System_Registry", "Win32_Founda
 # 放进 [dependencies] 会让 csv 及其依赖被链进那个以体积为卖点的最终二进制。
 [dev-dependencies]
 csv = "1"
+
+# 把 assets/wind-dict.ico 编进 exe 的资源段（组图标名 `MAINICON`）。
+#
+# 缺了它，任务栏与 Alt-Tab 里这个程序是**一块空白**：windui 建窗口类时按
+# `LoadIconW(hinst, "MAINICON")` 取图标（platform/win32/mod.rs），exe 里没有这份
+# 资源就退到 `HICON::default()`——即"没有图标"。托盘图标是另一条路（`Tray::icon_rgba`
+# 直接吃裸字节），所以此前托盘有图标、任务栏没有，看起来像是只有任务栏坏了。
+#
+# 取 embed-resource 而非手搓：它负责找 Windows SDK 里的 rc.exe（路径随 SDK 版本变）、
+# 处理交叉编译与 MSVC/GNU 两套工具链。它是 **build-dependency**，只在构建期跑，
+# 一个字节都不会进最终二进制——与上面 csv 那条是同样的取舍。
+[build-dependencies]
+embed-resource = "3"
 
 [profile.release]
 # 与 windui 对齐：体积优先 + LTO。词库才是体积大头，代码段能省则省。

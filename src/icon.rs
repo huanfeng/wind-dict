@@ -62,7 +62,7 @@ pub const BACK: &[u8] = include_bytes!("../assets/icons/arrow-left.svg");
 ///
 /// 位图而非 SVG，因为它的主体是一个汉字，而 windui 的 resvg 默认不渲染 SVG 内的文字
 /// （`svg-text` feature 默认关）。理由与取舍详见那个脚本的头注释。
-pub const APP: &[u8] = include_bytes!("../assets/app-icon-64.png");
+pub const APP: &[u8] = include_bytes!("../assets/app-icon-40.png");
 
 /// 托盘图标的裸 RGBA（32×32）。`Tray::icon_rgba` 只吃裸字节，不解 PNG。
 pub const TRAY_RGBA: &[u8] = include_bytes!("../assets/tray-32.rgba");

@@ -4,8 +4,18 @@
 //!
 //! 本文件只负责组装：词库 → 离线词典 → 界面 → 常驻外壳（热键 / 托盘 / 显隐）。
 
-// 常驻托盘应用不该带控制台窗口。debug 期保留，便于看 panic 与日志。
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// 常驻托盘应用不该带控制台窗口——**dev 构建也一样**。
+//
+// 此前这里是 `cfg_attr(not(debug_assertions), ...)`，只给 release 摘掉控制台，理由是
+// 「debug 期保留，便于看 panic 与日志」。但 dev 构建也是拿来**用**的（`dev.ps1 pd`
+// 把它部署到 `%LOCALAPPDATA%\wind-dict-dev` 常驻），于是一个托盘词典每次开机都先弹
+// 一个黑窗口杵在任务栏上——这不是「开发态的小代价」，这是产品缺陷。
+//
+// 摘掉之后 stderr 确实无处可去了，两条替代路径都已就位：
+//   - panic → `<用户数据目录>\panic.log`（见 `install_panic_log`，本就是为 release
+//     无控制台的情形写的）；
+//   - 启动期致命错误 → 消息框（见 `fatal`），比控制台还醒目，且用户也看得见。
+#![windows_subsystem = "windows"]
 
 use std::path::PathBuf;
 
@@ -16,6 +26,7 @@ use wind_dict::settings::Settings;
 use wind_dict::source::offline::OfflineDictionary;
 use wind_dict::store::userdata::{UserData, UserDataState};
 use wind_dict::ui;
+use wind_dict::APP_TITLE;
 
 fn main() {
     install_panic_log();
@@ -42,18 +53,16 @@ fn main() {
     let dict = match OfflineDictionary::open(&ecdict, &cedict) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("wind-dict：无法打开词库\n{e:?}\n");
-            eprintln!("英汉词库：{}", ecdict.display());
-            eprintln!("汉英词库：{}", cedict.display());
-            eprintln!("\n构建词库：");
-            eprintln!("  cargo run --release --example build_ecdict -- ecdict.csv ecdict.db");
-            eprintln!("  cargo run --release --example build_cedict -- cedict_ts.u8 cedict.db");
-            std::process::exit(1);
+            fatal(&format!(
+                "无法打开词库。\n\n英汉词库：{}\n汉英词库：{}\n\n构建词库：\n  cargo run --release --example build_ecdict -- ecdict.csv ecdict.db\n  cargo run --release --example build_cedict -- cedict_ts.u8 cedict.db\n\n详细原因：\n{e:?}",
+                ecdict.display(),
+                cedict.display(),
+            ));
         }
     };
 
     let tray = Tray::new()
-        .tooltip(format!("wind-dict — {} 查询", settings.hotkey))
+        .tooltip(format!("{APP_TITLE} — {} 查询", settings.hotkey))
         // 托盘图标与标题栏、任务栏是同一份产物（`scripts/gen-icon.ps1`）。此前这里是
         // 一块 16×16 的纯蓝方块占位——托盘里一排图标中它是唯一认不出是什么的那个。
         .icon_rgba(icon::TRAY_SIZE, icon::TRAY_SIZE, icon::TRAY_RGBA)
@@ -74,7 +83,7 @@ fn main() {
     // 窗口 920 宽：召回是按需抽屉、入口在标题栏，故抽屉收起时主列拿到**整个** 920，
     // 释义一行排满不再有右侧留白（正文限宽已撤，见 `ui::EN_DEF_MAX_W`）。抽屉展开时
     // 主列 640，仍是舒适的阅读宽度。
-    let mut app = App::new("wind-dict", 920, 620)
+    let mut app = App::new(APP_TITLE, 920, 620)
         // 下限按**抽屉展开态**定：720 时展开还剩 440px 给主列，勉强够读；再窄就该让
         // 抽屉改为盖住主列而不是挤它（尚未实现），而不是让用户拖到一个不可用的尺寸。
         .min_size(720, 480)
@@ -112,10 +121,36 @@ fn main() {
     app.content(ui::build(dict, user, theme, hotkey)).run();
 }
 
+/// 报告一条**启动期致命错误**后退出。
+///
+/// 无控制台的 GUI 程序里，`eprintln!` + `exit(1)` 对用户等同于**什么也没发生**——
+/// 双击图标，窗口没出来，没有任何提示。词库缺失恰恰是最可能被真实用户撞上的那条
+/// （绿色分发时漏拷 `.db`），它必须说话。
+///
+/// 仍保留 `eprintln!`：从终端跑 `cargo run` 时 Rust 会把标准流接到父控制台上，
+/// 那行输出在开发态照样看得到，且不必等人点掉对话框。
+fn fatal(msg: &str) -> ! {
+    eprintln!("{APP_TITLE}：{msg}");
+    #[cfg(windows)]
+    unsafe {
+        use windows::core::HSTRING;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        // 此刻还没有任何窗口（词库在建窗口之前打开），故属主传空。
+        MessageBoxW(
+            None,
+            &HSTRING::from(msg),
+            &HSTRING::from(APP_TITLE),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+    std::process::exit(1)
+}
+
 /// 把 panic 追加写到 `<用户数据目录>\panic.log`，写完仍交回默认钩子。
 ///
-/// **没有它时用户看到的是什么**：release 构建带 `windows_subsystem = "windows"`
-/// （无控制台）且 `panic = "abort"`，一次 panic 的全部表现就是**进程凭空消失**——
+/// **没有它时用户看到的是什么**：两档构建都带 `windows_subsystem = "windows"`
+/// （无控制台），release 还叠了 `panic = "abort"`，一次 panic 的全部表现就是
+/// **进程凭空消失**——
 /// 没有窗口、没有提示、没有退出码可看。而 panic 若发生在 Win32 的窗口过程里，
 /// 它甚至不是「Rust 崩溃」的样子：跨 C ABI 不能展开，运行时直接 `__fastfail`，
 /// 事件查看器里只留下一条 `0xc0000409`，故障模块是 exe 自身、偏移落在 panic 机制
@@ -146,7 +181,8 @@ fn install_panic_log() {
                 .unwrap_or_else(|| "（无消息）".to_string());
             append_panic_log(&dir, &where_, &msg);
         }
-        // 交回默认钩子：dev 构建有控制台，那条输出仍然是最快的反馈。
+        // 交回默认钩子：从终端跑 `cargo run` 时标准流接在父控制台上，那条输出仍是最快的
+        // 反馈；双击启动时它无处可去，日志才是唯一线索——两条路都留着。
         prev(info);
     }));
 }

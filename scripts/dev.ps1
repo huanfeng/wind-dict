@@ -136,7 +136,9 @@ function Ensure-Dict {
 
 # ---------- 构建 ----------
 # exe + 词库组装到 build[_dev]\; 内容即部署内容。
-# dev 变体走默认 debug (保留控制台窗口看 panic); release 走优化 + 无控制台。
+# dev 变体走默认 debug (未优化 + 断言), release 走优化。两者都是 GUI 子系统 (无控制台):
+# dev 构建也会被 pd 部署成常驻程序, 弹黑窗口是产品缺陷不是开发便利。panic 看
+# %LOCALAPPDATA%\wind-dict-data-dev\panic.log。
 function Build-App ([string]$profile = "release") {
     $outdir = Out-For $profile
     if (-not (Ensure-Dict)) { return $false }

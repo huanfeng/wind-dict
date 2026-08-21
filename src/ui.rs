@@ -1303,7 +1303,7 @@ fn brand() -> Element {
             crate::icon::app(20),
         )
         .child(
-            Element::label("wind-dict")
+            Element::label(crate::APP_TITLE)
                 .font_size(12.5)
                 .font_weight(600)
                 .fg_role(Role::Text),
