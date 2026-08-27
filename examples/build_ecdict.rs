@@ -1,7 +1,8 @@
 //! 构建期工具：`ecdict.csv` → 自建精简英汉词库（SQLite）。
 //!
-//! 为何自建而不用官方的 `ecdict-sqlite-28.zip`（207MB 压缩 / 预计 600MB+ 解压），
-//! 见 docs/adr/0010。
+//! 为何自建而不用官方的 `ecdict-sqlite-28.zip`（206.7MB 压缩 / 811.9MB 解压，实测），
+//! 见 docs/adr/0010。产出的表结构**逐列对齐上游** `stardict.py`，故官方发布与任何
+//! 同格式的第三方词库都可直接替换本工具的产物。
 //!
 //! ```bash
 //! cargo run --release --example build_ecdict -- ecdict.csv ecdict.db
@@ -51,8 +52,9 @@ fn main() -> Result<()> {
     {
         let mut stmt = tx.prepare(
             "INSERT OR IGNORE INTO stardict
-             (word, sw, phonetic, definition, translation, pos, bnc, frq, exchange)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (word, sw, phonetic, definition, translation, pos,
+              collins, oxford, tag, bnc, frq, exchange, detail, audio)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )?;
 
         for (i, rec) in rdr.records().enumerate() {
@@ -73,6 +75,9 @@ fn main() -> Result<()> {
                 empty_sw += 1;
             }
 
+            // 下标对应 CSV 表头：word,phonetic,definition,translation,pos,collins,
+            // oxford,tag,bnc,frq,exchange,detail,audio。硬编码下标可行，是因为 ECDICT
+            // 标准版与 ultimate 版的表头**逐列一致**（已实测核对），下标不会漂移。
             stmt.execute(rusqlite::params![
                 word,
                 sw,
@@ -80,9 +85,14 @@ fn main() -> Result<()> {
                 none_if_empty(&unescape_newlines(get(2))),
                 none_if_empty(&unescape_newlines(get(3))),
                 none_if_empty(get(4)),
+                parse_flag(get(5)),
+                parse_flag(get(6)),
+                none_if_empty(get(7)),
                 parse_rank(get(8)),
                 parse_rank(get(9)),
                 none_if_empty(get(10)),
+                none_if_empty(&unescape_newlines(get(11))),
+                none_if_empty(get(12)),
             ])?;
             ok += 1;
 
@@ -134,4 +144,17 @@ fn parse_rank(s: &str) -> Option<i64> {
         Ok(n) if n > 0 => Some(n),
         _ => None,
     }
+}
+
+/// 柯林斯星级与牛津标记：空字符串与非法值一律作 `0`。
+///
+/// 存 `0` 而非 NULL 是**刻意与上游对齐**——`stardict.py` 给这两列的声明就是
+/// `INTEGER DEFAULT(0)`。词库要能与官方发布互换，值域就得一致；读取侧
+/// （`store::ecdict::rank_u8`）也据此把 `0` 与 NULL 一同当作「未评级」。
+///
+/// 这与 `parse_rank` 把 `0` 归一成 NULL 的做法相反，但两者并不矛盾：`bnc`/`frq`
+/// 上游声明的正是 `DEFAULT(NULL)`，且排序需要 NULL 才能被显式后置（见 `parse_rank`）。
+/// 每一列各随各的上游声明，这正是「对齐格式」的含义。
+fn parse_flag(s: &str) -> i64 {
+    s.parse::<i64>().unwrap_or(0).max(0)
 }

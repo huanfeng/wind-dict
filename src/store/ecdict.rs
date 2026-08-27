@@ -10,17 +10,21 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, Row};
 
 use crate::domain::{
-    Candidate, EnglishEntry, Entry, Headword, InflectionKind, Inflections, Lookup, Query,
+    Candidate, EnglishEntry, Entry, Grading, Headword, InflectionKind, Inflections, Lookup, Query,
 };
 
-/// 自建英汉词库的表结构。**构建工具与测试共用此定义**。
+/// 英汉词库的表结构。**构建工具与测试共用此定义**。
 ///
-/// 这是发货的 schema，不是 ECDICT 上游 `stardict.py` 的。相对上游丢弃的列
-/// （见 docs/adr/0010）：`detail`（JSON 扩展）、`audio`（官方未实现）——本项目无
-/// 用途且是体积大头；`collins`/`oxford`/`tag`——当前无功能依赖。
+/// **逐列对齐 ECDICT 上游 `stardict.py` 的 `stardict` 表**（列名、类型、`COLLATE`、
+/// 默认值均一致）。这不是巧合而是目标：对齐之后，官方发布的 `ecdict-sqlite-*.zip`
+/// 与任何按该格式生成的第三方词库都能直接替换本库，程序一行不改——见 adr/0010 修订。
 ///
-/// 表名沿用 `stardict` 以便与上游工具链对照。保留 `bnc`/`frq`：补全按词频排序全靠
-/// 它们。保留 `sw`：前缀补全的索引列，值由 [`stripped_word`] 在构建期算出。
+/// 此前这里丢弃了 `collins`/`oxford`/`tag`/`detail`/`audio` 五列。丢弃的代价被低估了：
+/// 前三列虽然全库覆盖率仅 1.8%/0.4%/1.9%，却**只标常用词**，恰是用户真正会查的那批；
+/// 而它们的体积代价近乎为零（`detail` 全库仅 1 条有值，`audio` 官方标注「待添加」，
+/// 0 条有值）。丢列省下的不是体积，是信息。
+///
+/// 保留 `sw`：前缀补全的索引列，值由 [`stripped_word`] 在构建期算出。上游同样有此列。
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS stardict (
     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL UNIQUE,
@@ -30,15 +34,24 @@ CREATE TABLE IF NOT EXISTS stardict (
     definition TEXT,
     translation TEXT,
     pos VARCHAR(16),
+    collins INTEGER DEFAULT(0),
+    oxford INTEGER DEFAULT(0),
+    tag VARCHAR(64),
     bnc INTEGER DEFAULT(NULL),
     frq INTEGER DEFAULT(NULL),
-    exchange TEXT
+    exchange TEXT,
+    detail TEXT,
+    audio TEXT
 );";
 
 /// 索引。构建期应在**灌完数据后**再建——先建索引再逐行插入，等于每插一行维护一次
 /// B 树，77 万行下慢一个数量级。
 ///
 /// `stardict_3 (sw, word)` 是补全的命脉，见 `complete` 与其查询计划测试。
+///
+/// 上游还建了 `stardict_1 ON stardict (id)`，本库**不建**：`id` 是 `INTEGER PRIMARY
+/// KEY`，即 rowid 的别名，为它再建唯一索引纯属冗余占体积。这不损害互换性——格式
+/// 兼容看的是列，不是索引：官方库多这一个索引我们照读，我们少建它上游工具也照读。
 pub const INDEXES: &str = "
 CREATE UNIQUE INDEX IF NOT EXISTS stardict_2 ON stardict (word);
 CREATE INDEX IF NOT EXISTS stardict_3 ON stardict (sw, word COLLATE NOCASE);
@@ -49,10 +62,16 @@ pub struct Ecdict {
     conn: Connection,
 }
 
-/// 查询词条时取的列。`detail` 与 `audio` 不取：
-/// `detail` 是 JSON 扩展、`audio` 官方尚未实现，二者在本项目均无用途，
-/// 且是词库体积的大头之一（见 docs/adr/0001 的后果）。
-const ENTRY_COLS: &str = "word, phonetic, definition, translation, pos, exchange";
+/// 查询词条时取的列。
+///
+/// `detail` 与 `audio` 建表时保留（为兼容上游格式与第三方词库），但**查询时不取**：
+/// 官方对二者的标注是「待添加」，实测全库分别只有 1 条与 0 条有值，取了也无可呈现。
+/// 哪天上游填上了，或用户换了带这些数据的第三方库，在此加列即可。
+///
+/// 新增的五列顺序**追加在末尾**而非插进中间，是为了让 [`row_to_entry`] 里既有的
+/// 列序号不必整体位移——那种改动一旦漏一处，取到的就是错位的字段且不会报错。
+const ENTRY_COLS: &str =
+    "word, phonetic, definition, translation, pos, exchange, collins, oxford, tag, bnc, frq";
 
 impl Ecdict {
     /// 以只读方式打开词库。
@@ -191,7 +210,38 @@ fn row_to_entry(row: &Row<'_>) -> rusqlite::Result<EnglishEntry> {
         zh_definition: row.get(3)?,
         pos: row.get(4)?,
         inflections: exchange.as_deref().map(parse_exchange).unwrap_or_default(),
+        grading: Grading {
+            collins: rank_u8(row.get(6)?),
+            // 上游的 `oxford` 是 `INTEGER DEFAULT(0)`，不是 NULL——官方库里未收录的词
+            // 存的是 0 而非空。故判据是「大于 0」而不是 `is_some`，否则读官方库时
+            // 每个词都会被标成牛津核心词。
+            oxford: row.get::<_, Option<i64>>(7)?.unwrap_or(0) > 0,
+            tags: row
+                .get::<_, Option<String>>(8)?
+                .as_deref()
+                .map(Grading::parse_tags)
+                .unwrap_or_default(),
+            bnc: rank_u32(row.get(9)?),
+            frq: rank_u32(row.get(10)?),
+        },
     })
+}
+
+/// 星级：`NULL` 与 `0` 都作「未评级」。
+///
+/// 与 `rank_u32` 同理——上游 `collins` 的默认值是 `0` 而非 `NULL`，读官方库时
+/// 未评级的词取到的是 0。若原样传给界面，会画出「0 颗星」这种东西。
+fn rank_u8(v: Option<i64>) -> Option<u8> {
+    v.filter(|n| *n > 0).map(|n| n as u8)
+}
+
+/// 词频排名：`NULL` 与 `0` 都作「未进榜」。
+///
+/// ECDICT 用 `0` 表示未知，而排名是从 1 开始的。构建期虽已把 0 归一成 NULL
+/// （`build_ecdict::parse_rank`），此处仍要防一手：本库可能被**外部词库整体替换**，
+/// 那些库里 0 是否已归一，不由我们说了算。
+fn rank_u32(v: Option<i64>) -> Option<u32> {
+    v.filter(|n| *n > 0).map(|n| n as u32)
 }
 
 /// 解析 ECDICT 的 `exchange` 字段。
@@ -290,6 +340,34 @@ mod tests {
         match entry {
             Entry::English(e) => e,
             Entry::Chinese(_) => panic!("英汉词库不该产出汉英词条"),
+        }
+    }
+
+    /// 插一条带分级的词。参数顺序与 SQL 列序一致，避免调用处对不上号。
+    #[allow(clippy::too_many_arguments)]
+    fn seed_graded(
+        db: &Ecdict,
+        word: &str,
+        collins: i64,
+        oxford: i64,
+        tag: Option<&str>,
+        bnc: Option<i64>,
+        frq: Option<i64>,
+    ) {
+        db.conn
+            .execute(
+                "INSERT INTO stardict (word, sw, translation, collins, oxford, tag, bnc, frq)
+                 VALUES (?1, ?2, '译文', ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![word, stripped_word(word), collins, oxford, tag, bnc, frq],
+            )
+            .unwrap();
+    }
+
+    /// 取出查询结果里唯一那条英汉词条。
+    fn only(lookup: Lookup) -> EnglishEntry {
+        match lookup {
+            Lookup::Found { entries, .. } => en(&entries[0]).clone(),
+            Lookup::NotFound => panic!("应当命中"),
         }
     }
 
@@ -533,5 +611,71 @@ mod tests {
             !plan.contains("SCAN stardict"),
             "补全不得全表扫描，实际计划：\n{plan}"
         );
+    }
+
+    // ── 词汇分级 ──────────────────────────────────────────
+
+    #[test]
+    fn 分级字段完整读出() {
+        use crate::domain::ExamTag;
+        let db = Ecdict::in_memory().unwrap();
+        // 取自 ECDICT 中 `support` 的真实值。
+        seed_graded(
+            &db,
+            "support",
+            5,
+            1,
+            Some("gk cet4 cet6 ky ielts"),
+            Some(481),
+            Some(524),
+        );
+        let g = only(db.lookup(&q("support")).unwrap()).grading;
+        assert_eq!(g.collins, Some(5));
+        assert!(g.oxford);
+        assert_eq!(
+            g.tags,
+            vec![
+                ExamTag::Gaokao,
+                ExamTag::Cet4,
+                ExamTag::Cet6,
+                ExamTag::Kaoyan,
+                ExamTag::Ielts
+            ]
+        );
+        assert_eq!(g.bnc, Some(481));
+        assert_eq!(g.frq, Some(524));
+        assert!(!g.is_empty());
+    }
+
+    /// 上游用 `0` 表示「未评级」，NULL 只是本项目自建库的写法。
+    ///
+    /// 这条守的是**格式互换**这个能力本身（见 adr/0010 修订）：schema 对齐上游之后，
+    /// 用户可以直接换上官方发布的 `ecdict-sqlite-*.zip`。那些库里 `collins`/`oxford`
+    /// 的声明是 `INTEGER DEFAULT(0)`，未收录的词存的是 0 而非 NULL——若把 0 当成有效
+    /// 值，界面上**每个词**都会挂着「牛津核心」，柯林斯那格还会画出 0 颗星的空壳。
+    ///
+    /// 断言 `is_empty` 是重点：界面据它决定画不画整行徽章，判错就是满屏空徽章。
+    #[test]
+    fn 上游库的零值当作未评级而非有效值() {
+        let db = Ecdict::in_memory().unwrap();
+        seed_graded(&db, "aabomycin", 0, 0, None, Some(0), Some(0));
+        let g = only(db.lookup(&q("aabomycin")).unwrap()).grading;
+        assert_eq!(g.collins, None, "0 星等于没评级");
+        assert!(!g.oxford, "oxford=0 不是牛津核心词");
+        assert_eq!(g.bnc, None, "词频 0 表示未进榜");
+        assert_eq!(g.frq, None);
+        assert!(g.is_empty(), "全 0 的分级须视为空，界面据此不画那一行");
+    }
+
+    /// 越界星级如实读出，钳制交给渲染侧（`ui::grading_row` 的 `min(5)`）。
+    ///
+    /// 本库自己不会产出这种值，但词库可被外部文件整体替换。读取层的职责是如实呈现
+    /// 数据、不擅自改写——把钳制放在这里，就等于让存储层替界面决定能画几颗星。
+    #[test]
+    fn 越界星级如实读出不在读取层改写() {
+        let db = Ecdict::in_memory().unwrap();
+        seed_graded(&db, "weird", 99, 1, None, None, None);
+        let g = only(db.lookup(&q("weird")).unwrap()).grading;
+        assert_eq!(g.collins, Some(99));
     }
 }

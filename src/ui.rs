@@ -2473,7 +2473,9 @@ mod tests {
         expand_key, group_by_headword, headwords_to_record, scroll_area, signal, write_note,
         ExpandedStates, Role,
     };
-    use crate::domain::{ChineseEntry, EnglishEntry, Entry, Headword, Inflections, Sense};
+    use crate::domain::{
+        ChineseEntry, EnglishEntry, Entry, Grading, Headword, Inflections, Sense,
+    };
 
     fn 英汉(词头: &str) -> Entry {
         Entry::English(EnglishEntry {
@@ -2483,6 +2485,7 @@ mod tests {
             en_definition: None,
             pos: None,
             inflections: Inflections::default(),
+            grading: Grading::default(),
         })
     }
 

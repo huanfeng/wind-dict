@@ -117,6 +117,132 @@ impl InflectionKind {
     }
 }
 
+/// 考试大纲标记。ECDICT `tag` 字段的取值，以空格分隔。
+///
+/// 与 [`InflectionKind`] 同理不做成开放字符串：取值是**有限且已知**的八种，用枚举
+/// 才能让界面穷尽处理并给出中文标签。未知码直接丢弃——把 `tag` 里的意外取值原样
+/// 渲染成徽章，界面上会冒出没人认识的字母。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExamTag {
+    /// 中考（`zk`）。
+    Zhongkao,
+    /// 高考（`gk`）。
+    Gaokao,
+    /// 四级（`cet4`）。
+    Cet4,
+    /// 六级（`cet6`）。
+    Cet6,
+    /// 考研（`ky`）。
+    Kaoyan,
+    /// 托福（`toefl`）。
+    Toefl,
+    /// 雅思（`ielts`）。
+    Ielts,
+    /// GRE（`gre`）。
+    Gre,
+}
+
+impl ExamTag {
+    /// ECDICT `tag` 字段的码。
+    pub fn from_code(code: &str) -> Option<Self> {
+        Some(match code {
+            "zk" => Self::Zhongkao,
+            "gk" => Self::Gaokao,
+            "cet4" => Self::Cet4,
+            "cet6" => Self::Cet6,
+            "ky" => Self::Kaoyan,
+            "toefl" => Self::Toefl,
+            "ielts" => Self::Ielts,
+            "gre" => Self::Gre,
+            _ => return None,
+        })
+    }
+
+    /// 界面上的中文标签。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Zhongkao => "中考",
+            Self::Gaokao => "高考",
+            Self::Cet4 => "四级",
+            Self::Cet6 => "六级",
+            Self::Kaoyan => "考研",
+            Self::Toefl => "托福",
+            Self::Ielts => "雅思",
+            Self::Gre => "GRE",
+        }
+    }
+
+    /// 学习阶段由浅入深的次序。
+    ///
+    /// 库里 `tag` 的字符串顺序是录入顺序（`support` 存的是 `gk cet4 cet6 ky ielts`），
+    /// 并不保证递进。界面上并排展示时，乱序的难度标签读起来没有意义，故排序而非
+    /// 原样呈现。
+    fn rank(self) -> u8 {
+        match self {
+            Self::Zhongkao => 0,
+            Self::Gaokao => 1,
+            Self::Cet4 => 2,
+            Self::Cet6 => 3,
+            Self::Kaoyan => 4,
+            Self::Toefl => 5,
+            Self::Ielts => 6,
+            Self::Gre => 7,
+        }
+    }
+}
+
+/// 词汇分级：这个词有多重要、归属哪些考试大纲。
+///
+/// 五项分别来自 ECDICT 的 `collins` / `oxford` / `tag` / `bnc` / `frq`。聚合成一个
+/// 结构而非平铺进 [`EnglishEntry`]，理由与 [`Inflections`] 相同：它们回答的是同一个
+/// 问题（「这词值不值得记」），且**汉英词条上一项都没有**——CC-CEDICT 不带任何词频
+/// 与分级信号。聚合后这份差异在类型上一目了然。
+///
+/// 这些字段此前被构建期丢弃（见 docs/adr/0010 的修订）。全库覆盖率虽低
+/// （`collins` 1.8%、`oxford` 0.4%、`tag` 1.9%），但它们**只标常用词**——恰恰是
+/// 用户真正会查的那批。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Grading {
+    /// 柯林斯星级，1–5。`None` = 未评级。
+    pub collins: Option<u8>,
+    /// 是否属于牛津三千核心词汇。
+    pub oxford: bool,
+    /// 所属考试大纲，已按学习阶段由浅入深排序。
+    pub tags: Vec<ExamTag>,
+    /// 英国国家语料库词频排名。越小越高频，`None` = 未进榜。
+    ///
+    /// 与 `frq` 并存不是冗余：BNC 统计数百年来的英文资料，当代语料库只统计近 20 年。
+    /// `quay`（码头）在当代语料库排两万开外，在 BNC 却排第 8906——读旧书时它是高频词。
+    pub bnc: Option<u32>,
+    /// 当代语料库词频排名。越小越高频，`None` = 未进榜。
+    pub frq: Option<u32>,
+}
+
+impl Grading {
+    /// 是否没有任何可展示的分级信息。
+    ///
+    /// 界面据此决定要不要画那一行徽章——全空时连容器都不该建，否则词条上会多出
+    /// 一道没有内容的间距。
+    pub fn is_empty(&self) -> bool {
+        self.collins.is_none()
+            && !self.oxford
+            && self.tags.is_empty()
+            && self.bnc.is_none()
+            && self.frq.is_none()
+    }
+
+    /// 解析 ECDICT 的 `tag` 字段：空格分隔的码，未知码丢弃，结果按阶段排序去重。
+    pub fn parse_tags(tag: &str) -> Vec<ExamTag> {
+        let mut v: Vec<ExamTag> = tag
+            .split_whitespace()
+            .filter_map(ExamTag::from_code)
+            .collect();
+        v.sort_by_key(|t| t.rank());
+        v.dedup();
+        v
+    }
+}
+
 /// 一组同词性的释义。
 ///
 /// ECDICT 的 `translation` 字段本身是有结构的——每行「词性 + 该词性下的释义」，如
@@ -227,6 +353,8 @@ pub struct EnglishEntry {
     pub pos: Option<String>,
     /// 词形变化。**英汉词条专有**——中文不屈折，故 [`ChineseEntry`] 上没有这个字段。
     pub inflections: Inflections,
+    /// 词汇分级。**英汉词条专有**——CC-CEDICT 不带词频与大纲信号，见 [`Grading`]。
+    pub grading: Grading,
 }
 
 /// 汉英词条：中文词头 + 英文释义。
@@ -562,5 +690,78 @@ mod tests {
     fn 数字与符号走英汉方向() {
         assert_eq!(Query::new("123").unwrap().direction(), Direction::EnToZh);
         assert_eq!(Query::new("!!!").unwrap().direction(), Direction::EnToZh);
+    }
+
+    // ── 词汇分级 ──────────────────────────────────────────
+
+    /// 库里的 `tag` 是**录入顺序**，不保证由浅入深。
+    ///
+    /// 断言的字面量取自真实数据：`support` 在 ECDICT 里存的正是 `gk cet4 cet6 ky ielts`。
+    #[test]
+    fn 大纲标签按学习阶段排序而非录入顺序() {
+        assert_eq!(
+            Grading::parse_tags("gk cet4 cet6 ky ielts"),
+            vec![
+                ExamTag::Gaokao,
+                ExamTag::Cet4,
+                ExamTag::Cet6,
+                ExamTag::Kaoyan,
+                ExamTag::Ielts
+            ]
+        );
+        // 完全乱序的输入同样归位。
+        assert_eq!(
+            Grading::parse_tags("gre zk cet4"),
+            vec![ExamTag::Zhongkao, ExamTag::Cet4, ExamTag::Gre]
+        );
+    }
+
+    /// 未知码丢弃，不渲染成徽章。
+    ///
+    /// 词库可被外部文件整体替换，`tag` 里出现什么不由我们说了算。原样渲染的话，
+    /// 界面上会冒出一排没人认识的字母。
+    #[test]
+    fn 未知大纲码被丢弃() {
+        assert_eq!(
+            Grading::parse_tags("cet4 xyz 中文 cet6"),
+            vec![ExamTag::Cet4, ExamTag::Cet6]
+        );
+        assert!(Grading::parse_tags("").is_empty());
+        assert!(Grading::parse_tags("   ").is_empty());
+    }
+
+    #[test]
+    fn 重复大纲码只留一个() {
+        assert_eq!(Grading::parse_tags("cet4 cet4 cet4"), vec![ExamTag::Cet4]);
+    }
+
+    /// `is_empty` 决定界面画不画那一行徽章，故它必须对「只有一项有值」保持敏感。
+    #[test]
+    fn 分级只要有一项有值就不算空() {
+        assert!(Grading::default().is_empty());
+        for g in [
+            Grading {
+                collins: Some(1),
+                ..Default::default()
+            },
+            Grading {
+                oxford: true,
+                ..Default::default()
+            },
+            Grading {
+                tags: vec![ExamTag::Cet4],
+                ..Default::default()
+            },
+            Grading {
+                bnc: Some(1),
+                ..Default::default()
+            },
+            Grading {
+                frq: Some(1),
+                ..Default::default()
+            },
+        ] {
+            assert!(!g.is_empty(), "有值的分级不该被判为空：{g:?}");
+        }
     }
 }
