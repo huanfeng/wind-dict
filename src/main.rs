@@ -80,12 +80,11 @@ fn main() {
     // 「接不上」，症结其实不在框架，而在我们把本可用角色表达的颜色写成了具体色值。
     let skin = settings.skin.skin();
 
-    // 窗口 920 宽：召回是按需抽屉、入口在标题栏，故抽屉收起时主列拿到**整个** 920，
-    // 释义一行排满不再有右侧留白（正文限宽已撤，见 `ui::EN_DEF_MAX_W`）。抽屉展开时
-    // 主列 640，仍是舒适的阅读宽度。
+    // 窗口 920 宽：界面是左右两栏（`ui::dict_page`），左栏定宽 280，故释义那一栏拿到
+    // 640——正文限宽已撤（见 `ui::EN_DEF_MAX_W`），一行排满正好是舒适的阅读宽度。
     let mut app = App::new(APP_TITLE, 920, 620)
-        // 下限按**抽屉展开态**定：720 时展开还剩 440px 给主列，勉强够读；再窄就该让
-        // 抽屉改为盖住主列而不是挤它（尚未实现），而不是让用户拖到一个不可用的尺寸。
+        // 下限 720：扣掉左栏那 280 还剩 440 给释义，勉强够读。再窄就该让左栏改为可收起
+        // 而不是继续压缩释义（尚未实现），而不是让用户拖到一个不可用的尺寸。
         .min_size(720, 480)
         // 无系统标题栏：标题栏由 `ui::title_bar` 自绘，才能与整体配色一致。
         .frameless()
@@ -116,9 +115,26 @@ fn main() {
 
     // 两个句柄都必须在 `content` **之前**取到——界面要拿着它们才能即时换肤、改键。
     let theme = app.theme_handle();
-    let hotkey = app.hotkey_handle(settings.hotkey.to_hotkey(), |ctx| ctx.show_window());
+    // 热键**切换**显隐，不是只管唤起。
+    //
+    // 「按一下出来、再按一下收回去」是常驻工具热键的通常语义（Listary、uTools 皆然），
+    // 而此前只有 `show_window`：窗口已经在眼前时再按一下毫无反应，用户只能去点关闭。
+    //
+    // 可见性取自 `window_state()` 而非应用侧自己记的标志——隐藏可以发生在框架内部
+    // （ESC 关窗、`hide_on_close` 的关闭按钮），应用收不到通知，自建标志迟早对不上。
+    // 这个字段是为本项目在 windui 补的（`WindowState::visible`），一并补的还有热键
+    // 派发前刷新一次快照：热键是唯一能在窗口隐藏、毫无消息往来时抵达的输入，不刷新
+    // 就会读到窗口被藏起来之前的陈值。
+    let hotkey = app.hotkey_handle(settings.hotkey.to_hotkey(), |ctx| {
+        if window_state().visible {
+            ctx.hide_window();
+        } else {
+            ctx.show_window();
+        }
+    });
 
-    app.content(ui::build(dict, user, theme, hotkey)).run();
+    let ui = ui::build(dict, user, theme, hotkey);
+    app.on_shortcut(ui.shortcut).content(ui.root).run();
 }
 
 /// 报告一条**启动期致命错误**后退出。

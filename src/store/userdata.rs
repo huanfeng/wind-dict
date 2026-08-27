@@ -381,6 +381,7 @@ mod tests {
             expand_en: true,
             ecdict: Some(std::path::PathBuf::from(r"D:\ec.db")),
             cedict: None,
+            left_pane_w: 340,
         };
         {
             let db = UserData::open(&path).unwrap();

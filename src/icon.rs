@@ -58,6 +58,10 @@ pub const CLOSE: &[u8] = include_bytes!("../assets/icons/x.svg");
 /// 左箭头：从设置页返回。
 pub const BACK: &[u8] = include_bytes!("../assets/icons/arrow-left.svg");
 
+/// 前进箭头。与 `BACK` 取自同一套图标（Lucide），故两枚并排时笔画粗细、端点圆角、
+/// 视觉重心完全一致——混用两套图标库最显眼的破绽就出在并排的一对上。
+pub const FORWARD: &[u8] = include_bytes!("../assets/icons/arrow-right.svg");
+
 /// 应用标识：圆角方块底 + 白色「词」。由 `scripts/gen-icon.ps1` 生成。
 ///
 /// 位图而非 SVG，因为它的主体是一个汉字，而 windui 的 resvg 默认不渲染 SVG 内的文字

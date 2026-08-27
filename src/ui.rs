@@ -20,7 +20,14 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use windui::core::{EventCtx, Widget};
+use windui::event::{Event, KeyEvent, PointerKind, ShortcutCtx};
 use windui::prelude::*;
+// 分隔条自绘那条竖线要用（`PaneSplitter::paint`）。它们不在 prelude 里——绝大多数
+// 应用不自绘，本项目也只有这一处。
+use windui::render::{Canvas, Paint};
+// 不在 `prelude` 里：右栏那排页签要的是**只有标签条**的 `TabBar`，而 prelude 只导出
+// 连内容区一起打包的 `Element::tabs`。理由见 `dict_tab_bar`。
+use windui::ui::containers::{TabBar, TabItem};
 
 use crate::domain::{Candidate, Dictionary, Entry, Headword, Lookup, Query, Sense, Wordlist};
 use crate::settings::Settings;
@@ -28,17 +35,18 @@ use crate::skin::SkinKind;
 use crate::source::offline::OfflineDictionary;
 use crate::store::userdata::{now_secs, UserDataState};
 
-/// 候选浮层最多列几条。
+/// 补全候选一次最多列几条。
 ///
-/// 20 条曾是「反正能滚」的产物，但浮层不带滚动条（高度随内容），且**没有键盘游标**
-/// （↑↓ 传不进来，见 `docs/upstream-keyboard-path.md`），滚动只能靠鼠标——那还不如
-/// 不列。7 条与有道词典的候选条数相当，且 7×38 + `padding(6)` 上下共 278px 的浮层
-/// 在 620px 窗口里盖不住结果区太多。补全是缩小范围的工具，不是穷举词表。
+/// 候选从「浮在结果之上的浮层」改成左栏里的常驻可滚列表之后，原先那条「7 条与有道
+/// 相当、且 278px 的浮层在 620px 窗口里盖不住结果区太多」的理由整个作废了：列表在
+/// 自己那一栏里，滚得动，也不遮任何东西。放宽到 40——够用户往下多扫一屏，也仍是
+/// 「缩小范围的工具」而非穷举词表。
 ///
-/// 另一层理由与显示无关：单字母前缀（如 `a`）会命中约 5 万行，且 `ORDER BY frq`
-/// 用不上索引（索引在 `(sw, word)` 上），SQLite 必须全排一遍——实测约 20ms。
-/// LIMIT 不减少排序量，但它是唯一能钳住内存与渲染开销的地方。
-const MAX_CANDIDATES: usize = 7;
+/// 另一层理由与显示无关，故**不随布局改变**：单字母前缀（如 `a`）会命中约 5 万行，
+/// 且 `ORDER BY frq` 用不上索引（索引在 `(sw, word)` 上），SQLite 必须全排一遍——
+/// 实测约 20ms。LIMIT 不减少排序量，但它是唯一能钳住内存与渲染开销的地方。所以这里
+/// 仍必须是一个具体上界，不能因为「列表能滚」就改成不限。
+const MAX_CANDIDATES: usize = 40;
 
 /// 监视查询词、驱动补全的响应式控件。
 ///
@@ -52,10 +60,8 @@ struct Completer {
     /// 键盘游标。换一批候选就归零——游标指的是「第几条」，而那批候选已经换人了，
     /// 留着旧下标会让高亮停在一个与上次毫不相干的词上。
     cursor: Signal<usize>,
-    /// 候选区重建计数。见 `State::bump_cands`。
-    cand_rev: Signal<Vec<u64>>,
-    /// 最近一次被「选中」写进查询框的词。见 `State::select`。
-    picked: Rc<RefCell<Option<String>>>,
+    /// 左栏当前页签。补全一有结果就把左栏拨到候选页，见 `on_update` 末尾。
+    left_tab: Signal<usize>,
     /// 上次见到的查询词版本。
     last_version: u64,
 }
@@ -70,50 +76,119 @@ impl Widget for Completer {
 
         let text = self.query.get();
 
-        // 选中而来的改词：收起浮层，不再补全。用户已经确定要哪个词了，此刻还列出
-        // 一串以它为前缀的别的词，只会盖住刚查出来的结果。
-        //
-        // 标记存的是**那个词**而非一个 bool，为的是能自校验。本方法的入口是纯版本
-        // 比较，而两次 `set` 之间若没有插进一次 layout，它们会**合并成一次**
-        // `on_update`（响应式更新在 layout 期派发——`core.rs:424` → `core.rs:370`，
-        // 而 layout 挂在 render 上，WM_PAINT 在 Win32 队列里优先级最低，可以被
-        // 鼠标消息饿着）。若只是个 bool，合并时它会被后一次（打字）那轮吃掉，
-        // 那一击的候选被静默清空。存了词就对不上，抑制自然失效，打字照常补全。
-        if self.picked.borrow_mut().take().as_deref() == Some(text.as_str()) {
-            self.candidates.set(Vec::new());
-            self.reset_cursor();
-            return;
-        }
-
         // 补全**永远由离线词典驱动**，与用户选中哪个查询源无关——补全需要词表，
         // 而词表只有词典有（译源没有词库，不知道世上存在哪些词）。见术语表「补全」。
         let list = self
             .dict
             .complete(&text, MAX_CANDIDATES)
             .unwrap_or_default();
+        let empty_query = text.trim().is_empty();
         self.candidates.set(list);
-        self.reset_cursor();
-    }
-}
-
-impl Completer {
-    /// 游标归零并让候选区重建。两件事必须一起做：游标是构建期读的，只改信号不重建，
-    /// 高亮会停在上一批候选的位置上。
-    fn reset_cursor(&self) {
+        // 游标归零。**不必再手动触发重建**：`LeftPaneLoader` 盯着 `cursor` 的版本，
+        // 而 `Signal::set` 无条件递增版本（windui `signal.rs:163`，不比较新旧值），
+        // 故即便游标本来就是 0，这一句也照样把列表叫醒。
         self.cursor.set(0);
-        bump(self.cand_rev);
+
+        // 左栏跟着**打字**走——注意只跟打字，不跟查询。
+        //
+        // 本方法是打字的唯一入口（它由 `query` 的版本驱动，而查询词只在用户输入和
+        // Tab 补全时才变），故这里拨页签影响不到「查完之后停在哪」：查询不动查询框，
+        // 也就叫不醒本方法。这是刻意的，见 `State::select`。
+        //
+        // 两条规则，其余情形一律**不动**页签（用户手点的选择要留得住）：
+        //
+        // - 查询词被清空 → 回历史页。「最近查过什么」正是空框时该有的内容，而一个空的
+        //   候选页什么也没说。
+        // - 否则 → 候选页。注意**没有候选时也切**：那时候选页会写明「没有以 xx 开头
+        //   的词」（见 `State::reload_candidates`），这是一句真实的回答；停在历史页则
+        //   等于对用户刚敲进去的那串字母不置一词。
+        self.left_tab.set(if empty_query {
+            LEFT_HISTORY
+        } else {
+            LEFT_CANDIDATES
+        });
     }
 }
 
-/// 侧栏页签：历史记录 / 收藏。
+/// 左栏页签：补全候选 / 历史记录 / 收藏。
 ///
-/// **不叫「生词本」**——设计稿此处写的是生词本，但术语表明令该词弃用：本项目的收藏
-/// 是纯粹的书签语义，不承载掌握程度与复习计划，叫生词本会招来那一整套学习状态。
-const TAB_HISTORY: usize = 0;
-const TAB_FAVORITES: usize = 1;
+/// 收藏**不叫「生词本」**——设计稿此处写的是生词本，但术语表明令该词弃用：本项目的
+/// 收藏是纯粹的书签语义，不承载掌握程度与复习计划，叫生词本会招来那一整套学习状态。
+///
+/// 三段共用**一个**列表（见 `LeftRow`），而不是三个列表各挂 `visible_when`：
+/// `on_update` 的派发只看 `enabled` 不看 `visible`，隐藏的列表照样跟着重建，
+/// 每次数据变更都是三倍的节点。
+const LEFT_CANDIDATES: usize = 0;
+const LEFT_HISTORY: usize = 1;
+const LEFT_FAVORITES: usize = 2;
 
-/// 侧栏一次最多列出的历史条数。侧栏是「最近查过什么」，不是全量档案。
-const SIDE_LIMIT: usize = 100;
+/// 右栏页签：全部 / 英汉 / 汉英。
+///
+/// 切的是**词库方向**，不是「两个词典」——离线词典是一个词典，英汉与汉英是它的两个
+/// 方向（ADR-0003、术语表「补全」条）。这排页签因此是个**结果筛选器**，不是查询源
+/// 选择器：它不改变查询走哪条路（方向由查询词自动判定，界面上没有方向选择器，也不
+/// 该有），只决定已经查出来的卡片显示哪些。
+///
+/// 由此推出一件必须如实呈现的事：一次查询只走一个方向，故**总有一个方向页是空的**
+/// （查 `apple` 时「汉英」必空）。空着不吭声会被读成「坏了」，故有 `filter_note`。
+const DICT_ALL: usize = 0;
+const DICT_EN_ZH: usize = 1;
+const DICT_ZH_EN: usize = 2;
+
+/// 左栏一行的高度。
+///
+/// 三个页签的行**必须同高**，见 `left_row`。键盘导航的滚动跟随也依赖这一点：它按
+/// `序号 × 行高` 直接算出目标位置，而不是去树里找那一行的节点——列表内容是响应式
+/// 重建的，重建时机与键盘事件不同步，按节点找会算在上一批行上。
+const ROW_H: i32 = 36;
+
+/// 左栏一次最多列出的历史条数。左栏是「最近查过什么」，不是全量档案。
+const RECALL_LIMIT: usize = 100;
+
+/// Ctrl + 字母 的虚拟键码。
+///
+/// **带修饰键的字母不是 `Key::Char`**：win32 下 Ctrl+L 的 WM_KEYDOWN 不产生 WM_CHAR，
+/// 框架据此把它归为「非文字输入」并交出 `Key::Other(VK)`。照着 `Key::Char('l')` 去
+/// match 会静默失配——快捷键按下去毫无反应，而代码看着完全合理。windui 自己的
+/// Ctrl+C / Ctrl+A（`ui/rich.rs`、`ui/inputs.rs`）也都是按 `Key::Other` 匹配的。
+const VK_L: u32 = 0x4C;
+const VK_R: u32 = 0x52;
+const VK_W: u32 = 0x57;
+
+/// 快捷键一览：`(按键, 作用)`。
+///
+/// 它同时是**设置页的展示数据**与**这套键位的说明书**，但**不驱动按键处理**——处理在
+/// `handle_shortcut` 与各控件的 `on_nav_key` 里，那些地方要 match 语法，表驱动不了。
+///
+/// 两处因此必须手动保持一致。之所以还是留下这张表：一套记不住的快捷键等于没有，而
+/// 让用户去翻源码或猜是更差的选择。改键位时**两边一起改**。
+const SHORTCUTS: &[(&str, &str)] = &[
+    ("Ctrl + L", "定位到查询框，并全选已有的词"),
+    ("Ctrl + R", "重新查一次当前的词"),
+    ("Ctrl + ← / →", "沿查询路径后退 / 前进"),
+    ("Ctrl + W", "收起窗口（不退出，热键可再唤起）"),
+    ("Esc", "设置页：返回词典；词典页：收起窗口"),
+    ("Tab", "焦点：查询框 → 列表 → 页签"),
+    ("↑ / ↓", "在左栏列表里移动，右栏实时跟随"),
+    ("→", "把选中的候选填进查询框"),
+    ("Enter", "查询选中的词，并记入历史"),
+    ("Ctrl + C", "复制右栏选中的文字"),
+];
+
+/// 标题栏上导航按钮的边长。两枚箭头与它们的居中都按这个值算，见 [`nav_buttons`]。
+const NAV_BTN: i32 = 26;
+
+/// 分隔条宽度。
+///
+/// 视觉上只有中间 1px 是线，其余 5px 是**命中余量**——一条 1px 的线用鼠标几乎抓不住。
+/// 6px 是能稳稳抓住、又不至于在两栏之间劈出一道明显缝隙的下限。
+const SPLITTER_W: i32 = 6;
+
+/// 右栏的最小可读宽度。
+///
+/// 拖分隔条时用它反推左栏的上限：无论窗口多窄、用户往右拖多狠，右栏都得留得下一个
+/// 30px 的词头加一行释义。没有这条，左栏可以被拖到把释义挤成一列单字。
+const RIGHT_MIN_W: i32 = 380;
 
 /// 主列当前显示哪一页。
 const PAGE_DICT: usize = 0;
@@ -146,11 +221,24 @@ const HEADWORD_SIZE: f32 = 30.0;
 /// 开屏时的分量够用，读词条时不再压场。
 const QUERY_H: i32 = 42;
 
-/// 强调色淡底的不透明度。用于列表选中行、已收藏星标的底。
+/// 强调色淡底的不透明度。用于「你正在看的是这条」的列表行、已收藏星标的底。
 ///
 /// 走 `bg_role_alpha` 而非写死颜色：淡底必须随强调色一起变，写死则换肤后底色与强调
 /// 色对不上。取 0.14 与设计稿三套皮肤的 `--accent-2` 观感相当。
 const ACCENT_SOFT_A: f32 = 0.14;
+
+/// 键盘游标那条候选的淡底，比 `ACCENT_SOFT_A` 再淡一档。
+///
+/// 两档而非一档，是因为左栏同时要回答**两个**问题，而它们并不总是同一条：
+///
+/// - 「我正在看哪个词」——`active`，用满档淡底加粗体。
+/// - 「回车会选中哪一条」——`at_cursor`，用这档半淡底。
+///
+/// 鼠标路径下两者恒重合（点候选会把游标一并挪过去，见 `State::pick_candidate`），
+/// 只有用 ↑↓ 预选时才分开——而那正是需要区分的时刻：用户在拿游标比划，眼睛还看着
+/// 当前那条的释义。此前只有游标一档，点了别的词之后高亮仍停在原处，指的是一个
+/// 早已不在看的词。
+const CURSOR_SOFT_A: f32 = 0.06;
 
 /// 正文行高倍数。
 ///
@@ -158,6 +246,28 @@ const ACCENT_SOFT_A: f32 = 0.14;
 /// 拥挤。只施加在**会换行的多行文字**上（释义、义项）——音标、量词这类单行注解
 /// 用不上，给了反而平白拉高行盒。
 const BODY_LH: f32 = 1.7;
+
+/// 富文本里各段的样式名。
+///
+/// 集中成常量而非散着写字面量：`RichDoc::style` 注册的名字与 `Para::styled` 引用的
+/// 名字必须一字不差，写错了不会报错——那一段只是**静默退回控件默认样式**，表现为
+/// 「某一行莫名其妙变成了正文色」，很难看出是打错了字。
+const SPAN_PHONETIC: &str = "phonetic";
+const SPAN_POS: &str = "pos";
+const SPAN_BODY: &str = "body";
+const SPAN_NOTE: &str = "note";
+const SPAN_INDEX: &str = "index";
+const SPAN_HEADWORD: &str = "headword";
+
+/// 释义正文与词性标记之间的悬挂缩进。
+///
+/// 词性在段首，释义跟在其后；释义换行时续行缩进到这个位置，与首行的释义文字对齐，
+/// 而不是绕回段首顶着词性下面。
+///
+/// 它取代了 `pos_chip` 当初那个 `min_width(42)` 定宽：定宽在「词性与释义是并排两列」
+/// 的行布局里才成立，而富文本里两者在**同一段**内（这正是能连续选中的原因），列的
+/// 概念不复存在，对齐只能靠悬挂缩进。
+const GLOSS_HANGING: i32 = 52;
 
 /// 英英释义的最大宽度。
 ///
@@ -171,10 +281,82 @@ const BODY_LH: f32 = 1.7;
 /// 「所有正文」收缩到「只有这一段」，两边的道理都保住了。
 const EN_DEF_MAX_W: i32 = 720;
 
-/// 侧栏的一行。
-#[derive(Clone, PartialEq, Eq)]
-struct SideRow {
-    headword: Headword,
+/// 查询导航路径：走过的词，按**浏览顺序**排列。
+///
+/// 与「历史记录」不是一回事，别合并：历史是按时间倒序、去重的**档案**（术语表里它是
+/// 「系统被动记录的事实」），回答「我这些天查过什么」；这里是一条**路径**，回答「我
+/// 刚才是从哪一步走到这儿的」，语义与浏览器的前进/后退完全一致——同一个词在路径上可以
+/// 出现多次，而回退之后再查新词会把前面那段截断。
+///
+/// 抽成独立类型而非几个散在 `State` 上的字段，是为了能单测：它的三条规则（不重复压、
+/// 回退后截断、边界不越界）都是纯逻辑，而 `State` 拖着一个真实的 SQLite 词典，进不了
+/// 单元测试。
+#[derive(Default)]
+struct NavPath {
+    path: Vec<String>,
+    /// 当前停在第几步。`path` 为空时无意义。
+    pos: usize,
+}
+
+impl NavPath {
+    /// 走到一个新词。
+    fn push(&mut self, word: &str) {
+        // 已经停在这个词上就不重复压：连点同一行、或回车查一个正看着的词，都不该在
+        // 路径上堆出一串一模一样的台阶。
+        if self.path.get(self.pos).map(String::as_str) == Some(word) {
+            return;
+        }
+        // 从当前位置截断——浏览器语义：后退几步之后再查新词，原先那段前进路径就作废了。
+        if !self.path.is_empty() {
+            self.path.truncate(self.pos + 1);
+        }
+        self.path.push(word.to_string());
+        self.pos = self.path.len() - 1;
+    }
+
+    /// 沿路径走一步，返回走到的词。走不动时为 `None`。
+    fn go(&mut self, forward: bool) -> Option<String> {
+        if !self.can_go(forward) {
+            return None;
+        }
+        self.pos = if forward { self.pos + 1 } else { self.pos - 1 };
+        self.path.get(self.pos).cloned()
+    }
+
+    /// 该方向上还有没有下一步。供按钮决定要不要置灰。
+    fn can_go(&self, forward: bool) -> bool {
+        if forward {
+            self.pos + 1 < self.path.len()
+        } else {
+            self.pos > 0
+        }
+    }
+}
+
+/// 左栏列表的一行。三个页签共用**一份**数据信号（`State::left_rows`），由
+/// `LeftPaneLoader` 按当前页签填充。
+///
+/// 高亮态（候选的键盘游标、召回行的「你正在看的是这条」）编进**数据**而非在构建期
+/// 现读，是因为二者都是构建期求值的视觉：只改信号不重建，高亮不会动。编进数据之后
+/// 游标一动就是一次数据变更，列表自然重建——原先专为此设的 `cand_rev` 重建计数
+/// 因此可以整个删掉。
+#[derive(Clone)]
+enum LeftRow {
+    /// 一条补全候选：点它即「确定查询词」，触发查询。
+    ///
+    /// `at_cursor`（回车会选这条）与 `active`（正在看这条）是两件事，见
+    /// `CURSOR_SOFT_A`。
+    Candidate {
+        cand: Candidate,
+        at_cursor: bool,
+        active: bool,
+    },
+    /// 一条召回记录（历史或收藏）：点它即查这个词。
+    Recall {
+        headword: Headword,
+        at_cursor: bool,
+        active: bool,
+    },
 }
 
 /// 结果区的一张词头卡片。
@@ -191,26 +373,49 @@ struct Card {
     entries: Vec<Entry>,
 }
 
-/// 监视页签与用户数据变更、重取侧栏列表的响应式控件。
+/// `LeftPaneLoader` 上一轮见到的各信号版本。
 ///
-/// 与 `Completer` 同构：不绘制任何东西，靠 `on_update` 相位工作，故空闲时不占 CPU。
-/// 它同时盯两个信号——页签切换要换数据源，用户数据变更（查询记了历史、收藏增删）
-/// 要刷新当前数据源。
-struct SideLoader {
-    st: Rc<State>,
-    last_tab: u64,
-    last_rev: u64,
+/// 拆成具名结构而非一串 `u64` 字段，是因为它有两个取值时刻（进门比对、出门记账），
+/// 两处必须取同一组信号——散成五个字段就等着漏掉其中一个。
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LeftInputs {
+    tab: u64,
+    cands: u64,
+    cursor: u64,
+    rev: u64,
+    cards: u64,
 }
 
-impl Widget for SideLoader {
+impl LeftInputs {
+    fn of(st: &State) -> Self {
+        Self {
+            tab: st.left_tab.version(),
+            cands: st.candidates.version(),
+            cursor: st.cursor.version(),
+            rev: st.revision.version(),
+            cards: st.cards.version(),
+        }
+    }
+}
+
+/// 监视左栏的全部输入、重算左栏行的响应式控件。
+///
+/// 与 `Completer` 同构：不绘制任何东西，靠 `on_update` 相位工作，故空闲时不占 CPU。
+///
+/// 它盯五个信号，因为左栏的一行长什么样确实取决于这五样东西：页签（换数据源）、
+/// 候选与键盘游标（候选行及其高亮）、用户数据变更（历史/收藏增删）、当前卡片
+/// （召回行的「你正在看的是这条」）。
+struct LeftPaneLoader {
+    st: Rc<State>,
+    last: LeftInputs,
+}
+
+impl Widget for LeftPaneLoader {
     fn on_update(&mut self, _ctx: &mut EventCtx) {
-        let (tab, rev) = (self.st.side_tab.version(), self.st.revision.version());
-        if tab == self.last_tab && rev == self.last_rev {
+        let now = LeftInputs::of(&self.st);
+        if now == self.last {
             return;
         }
-        self.last_tab = tab;
-        self.last_rev = rev;
-        self.st.reload_side();
         // 收藏状态变了，结果区的星标也得跟着变——卡片上的 `fav` 是快照，不会自己更新。
         //
         // 只刷星标、不重新分组：词条没变，重跑一遍 `group_by_headword` 是白做的。
@@ -218,7 +423,297 @@ impl Widget for SideLoader {
         // 代价：`revision` 不区分「收藏变了」和「历史变了」，故每次查询（写历史）也会
         // 白刷一遍星标，多花每词头一次 `is_favorite` 查询。没有拆成两个信号，是因为
         // 词头通常只有一两个，拆分买到的性能不抵它带来的「哪个信号该由谁 bump」的负担。
-        self.st.refresh_fav_flags();
+        //
+        // **只在 `revision` 变了时刷**，不是每轮都刷。这不是省一次查询那么简单：
+        // `refresh_fav_flags` 无条件 `cards.set`，而本控件又盯着 `cards`——每轮都刷
+        // 就是每轮都把自己叫醒，进程再也回不到空闲，windui「空闲零 CPU」这条核心
+        // 指标当场作废。
+        if now.rev != self.last.rev {
+            self.st.refresh_fav_flags();
+        }
+        // 换了页签就把行游标归零。下标指的是「第几行」，而换页签那批行已经换人了，
+        // 留着旧下标会让游标停在一个与刚才毫不相干的词上——候选页第 12 条与历史页
+        // 第 12 条之间没有任何关系。
+        //
+        // 在 `reload_left` **之前**归零，否则这一轮铺出来的行仍按旧下标标高亮。
+        if now.tab != self.last.tab {
+            self.st.cursor.set(0);
+        }
+        self.st.reload_left();
+        // **刷完再记账**，把自己刚造成的那次 `cards` 写入也算进去。若记上面那个 `now`，
+        // 下一轮又会看到「cards 变了」，同样是一个永不停歇的循环。
+        self.last = LeftInputs::of(&self.st);
+    }
+}
+
+/// 让左栏列表能拿键盘焦点、并用 ↑↓ 走行的控件。
+///
+/// ## 为什么需要一个控件
+///
+/// 列表的行各自是一个 `Clickable`，若靠它们自己拿焦点，Tab 会**逐行**走过去——四十条
+/// 候选就是四十下 Tab，而用户要的是「一下进列表，然后上下走」。这正是 WAI-ARIA 的
+/// roving tabindex：整块只占一个焦点位，内部移动交给方向键。windui 的 `TabBar` 出于
+/// 同样的理由也是整条一个控件。
+///
+/// 它挂在列表**外层的 col** 上，不是滚动容器本身——`Element::scroll()` 的滚动条拖动
+/// 逻辑住在它默认挂的 `ScrollWidget` 里，顶掉它就会重演「滚动条看得见、抓不住」那个
+/// 缺陷（见 `left_list`）。
+///
+/// ## 滚动跟随为什么按行高硬算
+///
+/// 游标移到视口外时列表要跟着滚。正统做法是拿到那一行的节点、调 `scroll_into_view`，
+/// 但行是响应式重建的：`on_update` 派发到本控件时，列表内容的重建（`DynList`，注册在
+/// 更内层）还没跑，此刻去树里找「第 i 行」找到的是上一批行。
+///
+/// 按 `序号 × ROW_H` 直接算就绕开了这个时序——代价是三个页签的行必须同高，而那本来
+/// 就是硬约束（见 `left_row`）。
+struct ListKeyNav {
+    st: Rc<State>,
+    /// 上次见到的游标版本。
+    last_cursor: u64,
+    /// 上次见到的「要焦点」请求版本。见 `State::focus_list`。
+    last_focus_req: u64,
+}
+
+impl ListKeyNav {
+    /// 把游标那一行滚进视口。已经在视口里就不动——否则每按一次键列表都会跳一下。
+    fn scroll_into_view(&self, ctx: &mut EventCtx) {
+        let i = self.st.cursor.get() as i32;
+        let me = ctx.id();
+        let tree = ctx.tree_mut();
+        // 本控件的唯一子节点就是那个滚动容器（见 `left_list`）。
+        let Some(scroll) = tree.get(me).and_then(|n| n.children.first().copied()) else {
+            return;
+        };
+        let Some(n) = tree.get(scroll) else {
+            return;
+        };
+        let (view_h, cur) = (n.bounds.h, n.scroll_y);
+        if view_h <= 0 {
+            return;
+        }
+        let (top, bottom) = (i * ROW_H, i * ROW_H + ROW_H);
+        let next = if top < cur {
+            top
+        } else if bottom > cur + view_h {
+            bottom - view_h
+        } else {
+            return;
+        };
+        tree.set_scroll_y(scroll, next.max(0));
+    }
+}
+
+impl Widget for ListKeyNav {
+    fn focusable(&self) -> bool {
+        true
+    }
+
+    fn on_update(&mut self, ctx: &mut EventCtx) {
+        // 有人点了行 → 替自己把键盘焦点要过来。理由见 `State::focus_list`。
+        let f = self.st.focus_list.version();
+        if f != self.last_focus_req {
+            self.last_focus_req = f;
+            ctx.request_focus();
+        }
+        let v = self.st.cursor.version();
+        if v == self.last_cursor {
+            return;
+        }
+        self.last_cursor = v;
+        // 跟随**不看焦点在哪**：在查询框里按 ↑↓ 同样要把列表滚到那一行上，否则用户
+        // 打着字往下翻，高亮早就跑到视口外面去了。
+        self.scroll_into_view(ctx);
+    }
+
+    fn on_event(&mut self, _ctx: &mut EventCtx, ev: &Event) -> bool {
+        let Event::Key(k) = ev else {
+            return false;
+        };
+        if !k.pressed {
+            return false;
+        }
+        match k.key {
+            Key::Down => {
+                self.st.move_cursor(true);
+                true
+            }
+            Key::Up => {
+                self.st.move_cursor(false);
+                true
+            }
+            // 回车在这里与在查询框里是同一件事：确定要游标那一行，且**记历史**。
+            Key::Enter => {
+                self.st.submit();
+                true
+            }
+            // Tab / Shift+Tab 一律放过，让焦点继续走。
+            _ => false,
+        }
+    }
+
+    // **不画焦点环**。曾经画过一圈 2px 的强调色边框，撤掉了：那一圈框住的是整个列表
+    // 区域，在一块本就被淡底、圆点、分隔线填满的栏里再套一个大框，读起来像是「这块
+    // 区域出错了」而不是「焦点在这儿」。
+    //
+    // 焦点的可见性由**游标行的高亮**承担——它一直在，且按方向键时会动，那比一圈静止
+    // 的边框更能说明「键盘现在管着这里」。
+}
+
+/// 两栏之间那条可拖动的分隔条。
+///
+/// ## 拖动中就重排，不是松手才重排
+///
+/// windui 的宽度是**构建期**定的——没有 `width_signal` 这种东西（对照 `fg_role_signal`
+/// 确实有），所以每改一次栏宽就得重建左栏那棵子树。
+///
+/// 曾经因此走过「拖动中只平移分隔条、松手才落定」的路子，撤掉了：拖分栏是一个靠**眼睛
+/// 反馈**收敛的动作，看不到内容跟着变，就只能松手看一眼、不合适再拖一次。当初担心的两
+/// 项代价实测都不成立——
+///
+/// - **滚动位置不会丢**：滚动状态归外层 `Element::scroll()` 自带的 `ScrollWidget`，
+///   重建的只是它内部那批行（见 `left_list`）。
+/// - **重建量很小**：左栏就一个查询框、一个分段控件和至多 `MAX_CANDIDATES` 行。
+///
+/// 写库仍留到松手（`PointerKind::Up`）：拖动途中的每个中间值都存一次，等于把用户
+/// 拖过的每一帧都往 SQLite 里写一遍，而其中只有最后那个值有意义。
+///
+/// ## 为什么要指针捕获
+///
+/// 分隔条只有 6px 宽，鼠标稍快一点就跑到它外面去了。`ctx.capture()` 之后事件不再按
+/// 命中派发、而是直送本节点，拖动才不会在半路断掉。`Up` 里**必须**释放，否则整个窗口
+/// 的点击都会继续被这条 6px 的线吃掉。
+struct PaneSplitter {
+    st: Rc<State>,
+    /// 拖动中：`(按下时的指针 x, 按下时的左栏宽)`。`None` = 没在拖。
+    drag: Option<(i32, i32)>,
+    /// 指针是否悬在条上。只影响那条线的粗细与颜色。
+    hover: bool,
+}
+
+impl PaneSplitter {
+    /// 拖到当前指针位置对应的左栏宽度。
+    fn target_w(&self, ctx: &mut EventCtx, x: i32) -> Option<i32> {
+        let (x0, w0) = self.drag?;
+        Some(clamp_left_w(w0 + x - x0, root_width(ctx)))
+    }
+}
+
+impl Widget for PaneSplitter {
+    /// 中间一条竖线；悬停或拖动时加粗并转强调色。
+    ///
+    /// 自绘而非用 `bg_role` 铺底：这条节点有 6px 宽（命中余量），整条铺色会在两栏之间
+    /// 画出一道明显的灰带。只画中间 1px，看起来才是一条分隔线。
+    fn paint(
+        &self,
+        bounds: Rect,
+        _content: Rect,
+        _focused: bool,
+        _enabled: bool,
+        canvas: &mut dyn Canvas,
+        _style: &Style,
+    ) {
+        let active = self.hover || self.drag.is_some();
+        let (w, role) = if active {
+            (2.0, Role::Accent)
+        } else {
+            (1.0, Role::Divider)
+        };
+        // 走 `icon::role_color` 而非写死色值：换肤时这条线必须跟着变，而 `Canvas` 收的
+        // 是具体 `Color`，角色只能在这里当场解析一次。
+        let paint = Paint::fill(crate::icon::role_color(role));
+        // 线画在**左边缘**，不是 6px 的中点。
+        //
+        // 画在中点时它离左栏的底色边界还有 2.5px，看起来像是「一条没对齐的线浮在两栏
+        // 中间」——左栏底色（SurfaceAlt）在 bounds.x 就断了，线却在 bounds.x+2.5。
+        // 贴着左边缘画，它才读作「左栏的右边界」。命中余量仍是整条 6px，只是全部落在
+        // 线的右侧——那半边是右栏的留白，本来就没有内容，占着不碍事。
+        canvas.fill_rect(bounds.x as f32, bounds.y as f32, w, bounds.h as f32, &paint);
+    }
+
+    /// 左右调整箭头。
+    ///
+    /// 这个形状是为本控件在 windui 补的（`CursorShape::SizeWE`）——此前只有
+    /// Arrow / Hand / Text，只能退而用手型，而手型说的是「这里能点」，与「这里能左右
+    /// 拖」指向两种不同的操作。
+    fn cursor(&self) -> CursorShape {
+        CursorShape::SizeWE
+    }
+
+    fn on_event(&mut self, ctx: &mut EventCtx, ev: &Event) -> bool {
+        let Event::Pointer(p) = ev else {
+            return false;
+        };
+        match p.kind {
+            // 悬停只改视觉，**不消费**：把 Enter/Leave 吞掉会打断框架自己的 hover 记账。
+            PointerKind::Enter => {
+                self.hover = true;
+                ctx.mark_dirty();
+                false
+            }
+            PointerKind::Leave => {
+                self.hover = false;
+                ctx.mark_dirty();
+                false
+            }
+            PointerKind::Down => {
+                self.drag = Some((p.pos.x, self.st.settings.borrow().left_pane_w));
+                ctx.capture();
+                ctx.mark_dirty();
+                true
+            }
+            PointerKind::Move => {
+                let Some(w) = self.target_w(ctx, p.pos.x) else {
+                    return false;
+                };
+                // 当场改宽度、当场重建：两栏跟着手一起动。**不写库**——写库留到松手。
+                self.st.set_left_w(w);
+                true
+            }
+            PointerKind::Up => {
+                if self.drag.take().is_none() {
+                    return false;
+                }
+                ctx.release_capture();
+                // **不按松手坐标重算宽度**，只存盘。
+                //
+                // 捕获被系统收走时（Alt+Tab、弹出原生模态、另一个窗口抢走鼠标），
+                // windui 会给捕获节点合成一个 `(-1000000, -1000000)` 的 Up 让它收尾。
+                // 按那个坐标重算，`clamp_left_w` 会把左栏钳到下限——于是一次被打断的
+                // 拖动会把栏宽定死在 200px，还写进设置库跨重启留着。
+                //
+                // 宽度在拖动途中每次 `Move` 都已经落进设置了，这里要做的本来就只有
+                // 存盘那一下。
+                self.st.save_left_w();
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// 监视右栏页签与卡片、重算「当前页签下该显示哪些卡片」的响应式控件。
+///
+/// 为什么要派生一个信号，而不在构建期就地过滤：结果区是 `host_signal(cards, …)`，
+/// 逐卡片映射，拿不到「整批筛完之后是不是空的」这个信息——而空态提示恰恰只要它。
+///
+/// **必须排在 `LeftPaneLoader` 之后**：后者刷星标即写 `cards`，本控件排在前面，
+/// 那次写入要等下一帧才被看见，星标慢一帧。
+struct CardFilter {
+    st: Rc<State>,
+    last_tab: u64,
+    last_cards: u64,
+}
+
+impl Widget for CardFilter {
+    fn on_update(&mut self, _ctx: &mut EventCtx) {
+        let (tab, cards) = (self.st.dict_tab.version(), self.st.cards.version());
+        if tab == self.last_tab && cards == self.last_cards {
+            return;
+        }
+        self.last_tab = tab;
+        self.last_cards = cards;
+        self.st.refilter_cards();
     }
 }
 
@@ -292,7 +787,8 @@ struct HotkeyEditor {
     ctrl: Signal<bool>,
     alt: Signal<bool>,
     shift: Signal<bool>,
-    key: Signal<String>,
+    /// 主键在 `HotkeyKey::all()` 里的下标。
+    key: Signal<usize>,
     last: (u64, u64, u64, u64),
 }
 
@@ -308,21 +804,17 @@ impl Widget for HotkeyEditor {
             return;
         }
         self.last = now;
-        let text = self.key.get();
-        let Some(c) = text
-            .trim()
-            .chars()
-            .next()
-            .filter(|c| c.is_ascii_alphanumeric())
-        else {
-            self.st.note_err("热键的主键请填一个字母或数字");
+        // 主键从固定表里按下标取，不再解析用户手打的字符串：下拉框只列得出合法项，
+        // 「填了个看不懂的键」这条错误路径整个消失了。
+        let all = crate::settings::HotkeyKey::all();
+        let Some(&key) = all.get(self.key.get()) else {
             return;
         };
         self.st.set_hotkey(crate::settings::HotkeySpec {
             ctrl: self.ctrl.get(),
             alt: self.alt.get(),
             shift: self.shift.get(),
-            key: c.to_ascii_uppercase(),
+            key,
         });
     }
 }
@@ -361,21 +853,48 @@ struct State {
     user: UserDataState,
     query: Signal<String>,
     candidates: Signal<Vec<Candidate>>,
-    /// 候选列表的键盘游标（下标）。候选非空时恒指向其中一条。
+    /// **左栏的行游标**（下标），三个页签共用。
+    ///
+    /// 它此前只服务候选页。扩到三段是键盘导航的前提：焦点落在列表上按 ↑↓ 时，用户
+    /// 不关心自己停在哪个页签——「上一条 / 下一条」对候选、历史、收藏是同一个动作。
+    ///
+    /// 切页签时归零（见 `LeftPaneLoader`）：下标指的是「第几行」，而换了页签那批行
+    /// 已经换人了，留着旧下标会让游标停在一个与上次毫不相干的词上。
     cursor: Signal<usize>,
-    /// 候选区重建计数。游标是构建期读的，改了游标必须让这块整体重来，见 `bump`。
-    cand_rev: Signal<Vec<u64>>,
-    /// 最近一次被「选中」写进查询框的词。见 `State::select`。
-    picked: Rc<RefCell<Option<String>>>,
-    /// 结果区按词头分组的卡片。**结果区唯一的数据源**，见 `rebuild_cards`。
+    /// 一次查询分组出来的**全部**卡片，未经右栏页签筛选。
+    ///
+    /// 它是查询结果的**真相**，但不是结果区读的那个信号——结果区读 `visible_cards`。
+    /// 两者的关系是单向派生（`refilter_cards`），故不存在「两份数据要同时更新」这种
+    /// 迟早会漏掉一处的要求。
     cards: Signal<Vec<Card>>,
+    /// 经右栏页签筛选后**当前该显示**的卡片。结果区唯一的数据源，由 `CardFilter` 派生。
+    visible_cards: Signal<Vec<Card>>,
     /// 结果区的提示文案（未收录、请输入等）。
     hint: Signal<String>,
-    /// 侧栏当前页签。
-    side_tab: Signal<usize>,
-    /// 侧栏当前列出的行。
-    side_rows: Signal<Vec<SideRow>>,
-    /// 用户数据的变更计数。收藏增删、历史写入后自增，驱动侧栏与卡片重取。
+    /// 右栏页签筛完之后的空态文案。空串 = 无需提示，见 `refilter_cards`。
+    filter_note: Signal<String>,
+    /// 右栏当前页签：全部 / 英汉 / 汉英。
+    dict_tab: Signal<usize>,
+    /// 左栏当前页签：候选 / 历史 / 收藏。
+    left_tab: Signal<usize>,
+    /// 左栏当前列出的行。三个页签共用，由 `LeftPaneLoader` 按页签填充。
+    left_rows: Signal<Vec<LeftRow>>,
+    /// 左栏列表为空时的文案。空串 = 列表非空，无需提示。
+    left_note: Signal<String>,
+    /// 查询导航路径。见 [`NavPath`]。
+    nav: RefCell<NavPath>,
+    /// 导航按钮的重建计数：两枚按钮的可用与否是构建期算的，走一步就得重建。
+    nav_rev: Signal<Vec<u64>>,
+    /// 「把键盘焦点交给左栏列表」的请求计数。
+    ///
+    /// 用计数器而非布尔：`Signal::set` 无条件递增版本，连点两次同一行也各是一次请求，
+    /// 而布尔翻不动就丢了第二次。
+    ///
+    /// 之所以要绕这一手：`EventCtx::request_focus` 只能把焦点给**自己**，而点击是行
+    /// 自己消费的（行是 `Clickable`），它没法替父容器要焦点。让行 bump 一个信号、
+    /// 由 `ListKeyNav` 在 `on_update` 里替自己要，是唯一不改上游的路径。
+    focus_list: Signal<Vec<u64>>,
+    /// 用户数据的变更计数。收藏增删、历史写入后自增，驱动左栏与卡片重取。
     ///
     /// 用计数而非直接刷新，是因为写入点（`record_all`、`toggle_favorite`）与读取点
     /// （侧栏、卡片）互不相识——让它们共享一个「有东西变了」的信号，比让写入方
@@ -393,13 +912,11 @@ struct State {
     theme: ThemeHandle,
     /// 热键句柄：改键即 `HotkeyHandle::set`，下一次消息循环生效。
     hotkey: HotkeyHandle,
-    /// 主列当前页：词典 / 设置。
+    /// 内容区当前页：词典 / 设置。
     page: Signal<usize>,
-    /// 召回抽屉是否展开。
-    ///
-    /// 默认关着（`build` 里初始化为 false）：DESIGN.md 的「Search is home」讲的正是
-    /// 这件事——默认可见的界面该服务下一次查询，而不是回顾上一次。
-    drawer_open: Signal<bool>,
+    /// 左栏重建计数。栏宽是构建期读的（windui 没有 `width_signal`），改了必须重建，
+    /// 见 `PaneSplitter`。
+    pane_rev: Signal<Vec<u64>>,
     /// 当前设置。界面上的各个控件绑到它的分量信号，改动经 `save_settings` 落库。
     settings: RefCell<Settings>,
     /// 设置页的即时反馈（保存失败、需重启生效等）。空串 = 无。
@@ -499,22 +1016,70 @@ impl ExpandedStates {
 }
 
 impl State {
-    /// 选中一个词：填进查询框、查询，并**关掉候选浮层**。
+    /// 点一条候选：把键盘游标挪到它身上，然后查询。
     ///
-    /// 候选浮层与侧栏行两处都走这里（两个侧栏页签共用同一个 `side_row`）。它们此前
-    /// 各自写「`query.set` 然后 `lookup`」，于是都带上了同一个毛病：`query.set`
-    /// **无条件** bump 版本（windui `signal.rs:163`，没有任何值比较），`Completer`
-    /// 醒来拿新词重算补全，浮层于是又开了——而这次它盖住的正是刚查出来的结果。
+    /// 挪游标不是可有可无的装饰。游标回答「回车会选中哪一条」，而用户刚用鼠标选定了
+    /// 一条——此刻若游标还停在原处，按回车会跳去查另一个词，这是实打实的错误动作。
+    /// 顺带也让两档高亮在鼠标路径下重合，见 `CURSOR_SOFT_A`。
     ///
-    /// 修法是记下「这次是选中，选的是哪个词」，由 `Completer` 比对后抑制一次补全。
-    /// 用 `RefCell` 而非 `Signal`：它不该触发任何重建，只是两段代码之间的一句交代。
+    /// 按词头回查下标而不是把下标编进行数据：候选最多 `MAX_CANDIDATES` 条，一次线性
+    /// 查找的代价可以忽略，而多一个字段就多一处要与列表顺序保持同步的东西。
+    /// 点左栏的一行：把游标挪到它身上、把键盘焦点交给列表，然后查询并记历史。
     ///
-    /// 之所以不能靠「点完把 candidates 清空」了事——清空发生在事件回调里，而响应式
-    /// 更新在其后的 layout 期才成批派发（`core.rs:424` → `core.rs:370`），清完立刻
-    /// 又被填回去。顺序在这里是决定性的。
+    /// **交焦点**是为了鼠标与键盘能接上：用户点了一行之后，多半接着想用 ↑↓ 继续看
+    /// 相邻的词——若焦点还留在查询框（或哪儿都不在），方向键就落不到列表上。
+    fn focus_row(&self, word: &str) {
+        bump(self.focus_list);
+        if let Some(i) = self
+            .left_rows
+            .get()
+            .iter()
+            .position(|r| self.row_matches(r, word))
+        {
+            self.cursor.set(i);
+        }
+        self.lookup(word);
+    }
+
+    /// 某一行是否就是这个词头。
+    fn row_matches(&self, r: &LeftRow, word: &str) -> bool {
+        match r {
+            LeftRow::Candidate { cand, .. } => cand.headword.as_str() == word,
+            LeftRow::Recall { headword, .. } => headword.as_str() == word,
+        }
+    }
+
+    fn pick_candidate(&self, word: &str) {
+        // 点候选同样把焦点交给列表，理由见 `focus_row`。
+        bump(self.focus_list);
+        if let Some(i) = self
+            .candidates
+            .get()
+            .iter()
+            .position(|c| c.headword.as_str() == word)
+        {
+            self.cursor.set(i);
+        }
+        self.lookup(word);
+    }
+
+    /// 选中一个词：**只查询**，不碰查询框，也不动左栏。
+    ///
+    /// 左栏三个页签的行、以及回车（`submit`）都走这里。
+    ///
+    /// **不写查询框**是这个方法最要紧的一条，它换来的是「点一条看一条」：候选原样留在
+    /// 左边，可以接着点下一条来回比对，而不是每点一次列表就换一批内容。查一个词并不
+    /// 意味着用户想改自己刚打的那串字——恰恰相反，他多半正想拿这串字继续挑。
+    ///
+    /// 这同时消掉了一整套机制。此前 `select` 会 `query.set(word)`，而 `query.set`
+    /// **无条件** bump 版本（windui `signal.rs:163`，没有任何值比较），于是 `Completer`
+    /// 醒来拿新词重算补全，候选被换成「以这个词为前缀的一串别的词」。为压住它，代码里
+    /// 曾有一个 `picked: RefCell<Option<String>>` 标记外加一段自校验注释——那整套东西
+    /// 的存在理由只是「select 会改查询框」。不改了，它们就一起没了。
+    ///
+    /// 想主动把词填进查询框仍有明确的入口：Tab（`accept_completion`）。那是 shell 的
+    /// 补全语义，用户按下它就是在说「把这个词接着编辑」。
     fn select(&self, word: &str) {
-        *self.picked.borrow_mut() = Some(word.to_string());
-        self.query.set(word.to_string());
         self.lookup(word);
     }
 
@@ -526,8 +1091,11 @@ impl State {
     /// 空输入不查：`lookup` 对空串会走 `Query::new` 的 None 分支，把结果区清成
     /// 「输入一个词开始查询」，等于用户按一下回车就把正在读的词条弄没了。
     fn submit(&self) {
-        if let Some(c) = self.candidate_at_cursor() {
-            self.select(c.headword.as_str());
+        // 游标那一行优先——三个页签一视同仁：候选页回车查那条候选，历史页回车查那条
+        // 历史。此处**记历史**（走 `select` → `lookup`），与 ↑↓ 的 `preview` 分开：
+        // 回车是用户表达「就是它」的那一下。
+        if let Some(w) = self.row_at_cursor() {
+            self.select(&w);
             return;
         }
         let text = self.query.get();
@@ -536,12 +1104,17 @@ impl State {
         }
     }
 
-    /// 移动候选游标。`down` 为真下移，否则上移。
+    /// 移动左栏行游标并**当场查出那一行**。`down` 为真下移，否则上移。
     ///
-    /// **不环绕**。列表最多 7 条、全在眼前，环绕买不到什么；而在顶上按 ↑ 直接跳到末条
-    /// 是种惊吓——尤其它同时意味着「再按一下就选中最后那个词」。
+    /// 移动即查，是「右栏跟着上下键实时变」这件事的全部实现——但它走 `preview`，
+    /// 不写历史，理由见那个方法。
+    ///
+    /// **不环绕**。在顶上按 ↑ 直接跳到末条是种惊吓——尤其它同时意味着「再按一下就
+    /// 选中最后那个词」。候选放宽到 40 条、列表滚得动之后这条更成立了：环绕会把视口
+    /// 从头甩到尾，而用户按 ↑ 的意图从来不是「去最后一条」。
     fn move_cursor(&self, down: bool) {
-        let n = self.candidates.get().len();
+        // 按**左栏当前列出的行**算边界，不再只看候选：历史页与收藏页同样要能用 ↑↓ 走。
+        let n = self.left_rows.get().len();
         if n == 0 {
             return;
         }
@@ -551,28 +1124,69 @@ impl State {
         } else {
             i.saturating_sub(1)
         };
-        if next != i {
-            self.cursor.set(next);
-            bump(self.cand_rev);
+        if next == i {
+            return;
         }
+        // 只改信号、不手动触发重建：高亮编在 `LeftRow` 的数据里（见该类型的注释），
+        // 而 `LeftPaneLoader` 盯着 `cursor` 的版本，重建自然跟上。
+        self.cursor.set(next);
+        if let Some(w) = self.row_word(next) {
+            self.preview(&w);
+        }
+    }
+
+    /// 第 `i` 行对应的词头。越界或列表为空时为 `None`。
+    fn row_word(&self, i: usize) -> Option<String> {
+        self.left_rows.get().get(i).map(|r| match r {
+            LeftRow::Candidate { cand, .. } => cand.headword.as_str().to_string(),
+            LeftRow::Recall { headword, .. } => headword.as_str().to_string(),
+        })
+    }
+
+    /// 游标当前指向的那一行的词头。
+    fn row_at_cursor(&self) -> Option<String> {
+        self.row_word(self.cursor.get())
     }
 
     /// Tab：把游标那条候选填进查询框，**不查询**。
     ///
     /// 这是 shell 的补全语义——Tab 补全词，回车才执行。对词典而言尤其顺：把词补全整了
     /// 再接着改（`make` → `maker`），比先查一次再回来改省一步。
-    fn accept_completion(&self) {
-        let Some(c) = self.candidate_at_cursor() else {
-            return;
+    /// 是否该由 → 接受补全。
+    ///
+    /// 只在**当前输入是游标那条候选的严格前缀**时才算数，且只在候选页。这是个近似——
+    /// 正确的判据是「光标在行尾」（fish / zsh 的 autosuggestion 就是这么判的），而
+    /// windui 的 `on_nav_key` 只给按键、给不到光标位置。
+    ///
+    /// 这个近似能**自我恢复**，所以可以接受：补全一次之后输入就等于候选、不再是严格
+    /// 前缀，→ 随即放行、正常移动光标。真正会误伤的只有「输入恰是某候选的前缀、且用户
+    /// 正想把光标往回移」这一种，而那时按一下 ← 就回来了。
+    fn should_accept_completion(&self) -> bool {
+        if self.left_tab.get() != LEFT_CANDIDATES {
+            return false;
+        }
+        let Some(w) = self.row_at_cursor() else {
+            return false;
         };
-        // 不走 `select`：那会连查询一起做掉，且抑制掉后续补全。这里只改字，补全照常
-        // 跟上——补完的词往往还要再接着打（`make` 之后接 `r`）。
-        self.query.set(c.headword.as_str().to_string());
+        let q = self.query.get();
+        !q.is_empty() && w.len() > q.len() && w.starts_with(&q)
     }
 
-    /// 游标当前指向的候选。候选为空、或游标越界时为 `None`。
-    fn candidate_at_cursor(&self) -> Option<Candidate> {
-        self.candidates.get().get(self.cursor.get()).cloned()
+    /// →：把游标那条候选填进查询框，**不查询**。
+    ///
+    /// 这是 shell 的补全语义——补全词，回车才执行。对词典而言尤其顺：把词补全整了再
+    /// 接着改（`make` → `maker`），比先查一次再回来改省一步。
+    ///
+    /// 此前绑在 Tab 上。让出 Tab 是为了把它还给**焦点导航**——从查询框跳到左栏列表
+    /// 需要一个键，而 Tab 正是所有 Windows 程序里的那个键；再占着它，用户就没有任何
+    /// 办法用键盘走出输入框。→ 是补全的常见替代键位（fish / zsh 同款）。
+    fn accept_completion(&self) {
+        let Some(w) = self.row_at_cursor() else {
+            return;
+        };
+        // 不走 `select`：那会连查询一起做掉。这里只改字，补全照常跟上——补完的词往往
+        // 还要再接着打（`make` 之后接 `r`）。
+        self.query.set(w);
     }
 
     /// 清空查询框，回到开屏状态。
@@ -592,9 +1206,27 @@ impl State {
         self.notice.set(String::new());
     }
 
-    /// 执行查询。**只在查询词确定时调用**（选中候选），不逐键触发——见术语表「补全」：
-    /// 补全回答「我想拼的是哪个词」，查询回答「这个词什么意思」，是两个动作。
+    /// 执行查询并记入历史。用户**确定**要这个词时走这条（回车、点一行）。
     fn lookup(&self, word: &str) {
+        self.lookup_inner(word, true);
+    }
+
+    /// 执行查询但**不记历史**。键盘 ↑↓ 扫过一行时走这条。
+    ///
+    /// 不记历史是承重的，不是优化：按住 ↓ 划过二十条候选会写下二十条历史记录，把
+    /// 「最近查过什么」冲成一串用户根本没看的词——而历史一旦被冲掉就找不回来了。
+    ///
+    /// 术语表把历史定义为「系统被动记录的**事实**」，那个事实是「用户查过这个词」。
+    /// 用方向键扫过去不构成这个事实，停下来读才算——所以记历史的时机是回车与点击，
+    /// 不是游标移动。
+    fn preview(&self, word: &str) {
+        self.lookup_inner(word, false);
+    }
+
+    /// 查询的实现。`record` 决定是否记入历史，两个入口的差别只有这一处。
+    ///
+    /// **查询的四条路径都必须经由这里**——见 `rebuild_cards` 的说明。
+    fn lookup_inner(&self, word: &str, record: bool) {
         // 上一次操作的消息到此为止：新一次查询开始，那条红字讲的已是别的词。
         self.notice.set(String::new());
         let Some(q) = Query::new(word) else {
@@ -622,7 +1254,13 @@ impl State {
                 } else {
                     String::new()
                 });
-                self.record_all(&headwords_to_record(&entries));
+                if record {
+                    self.record_all(&headwords_to_record(&entries));
+                    // 只有「确定要这个词」的查询才进导航路径，与记历史同一时机。
+                    // ↑↓ 扫过去的那些不进——否则按住方向键划过二十条，后退键就得
+                    // 按二十下才退得回来，而用户心里那一步只有一步。
+                    self.push_nav(word);
+                }
                 self.rebuild_cards(&entries);
             }
         }
@@ -752,19 +1390,6 @@ impl State {
         self.settings_note.set(String::new());
     }
 
-    /// 点标题栏上的召回入口：开抽屉并切到该页签；已经停在这一页则收起。
-    ///
-    /// 「再点一次收起」这条是刻意的：入口就那一个，若只负责打开，关抽屉就只剩头部
-    /// 那个 ×，而人手已经在标题栏上了。
-    fn toggle_drawer(&self, tab: usize) {
-        if self.drawer_open.get() && self.side_tab.get() == tab {
-            self.drawer_open.set(false);
-            return;
-        }
-        self.side_tab.set(tab);
-        self.drawer_open.set(true);
-    }
-
     fn bump_settings(&self) {
         bump(self.settings_rev);
     }
@@ -788,6 +1413,40 @@ impl State {
                 false
             }
         }
+    }
+
+    /// 改左栏宽度并重建左栏。**不写库**——拖动途中每帧都会调它。
+    ///
+    /// **没变就整个跳过**。`Signal::set` 无条件递增版本，不比较新旧值，所以指针在同一
+    /// 像素上抖动时若照走一遍，就是一串白重建；而「点一下分隔条没拖动」恰恰是最常见的
+    /// 误触。
+    fn set_left_w(&self, w: i32) {
+        if self.settings.borrow().left_pane_w == w {
+            return;
+        }
+        self.settings.borrow_mut().left_pane_w = w;
+        bump(self.pane_rev);
+    }
+
+    /// 把当前栏宽存进库。拖动松手时调一次。
+    ///
+    /// 与 `set_left_w` 分开，是因为两者的频率差着数量级：宽度每帧都可能变，而值得
+    /// 存盘的只有用户松手时那一个。合在一起就是把拖过的每一帧都写一遍 SQLite。
+    ///
+    /// 先改后存，与 `set_skin` 同一取向：栏宽是纯布局、可随时再拖，让用户当场看到结果
+    /// 比「先确保存住」更重要；存失败时如实告知本次有效、重启回退。
+    fn save_left_w(&self) {
+        if self.save_settings() {
+            self.note_clear();
+        } else {
+            self.note_err("栏宽已调整，但未能保存，重启后会回到原来的宽度");
+        }
+    }
+
+    /// 把左栏宽度恢复成默认值并存盘。
+    fn reset_left_w(&self) {
+        self.set_left_w(crate::settings::LEFT_PANE_W_DEFAULT);
+        self.save_left_w();
     }
 
     /// 换皮肤。
@@ -818,8 +1477,10 @@ impl State {
     /// 拦住无修饰键：那会吞掉该字母在**所有程序**里的输入，用户按一下 D 就唤起词典，
     /// 等于没法打字了——而这个错误一旦犯下，用户很难意识到是词典干的。
     fn set_hotkey(&self, spec: crate::settings::HotkeySpec) {
-        if !spec.has_modifier() {
-            self.note_err("热键至少要带一个 Ctrl / Alt / Shift，否则会吞掉该键在所有程序里的输入");
+        if !spec.is_safe() {
+            self.note_err(
+                "字母或数字作主键时至少要带一个 Ctrl / Alt / Shift，否则会吞掉该键在所有程序里的输入；F1–F12 可以单独用",
+            );
             return;
         }
         self.settings.borrow_mut().hotkey = spec;
@@ -899,17 +1560,17 @@ impl State {
 
     /// 从当前页签移除一行：历史页删历史条目，收藏页取消收藏。
     ///
-    /// **动作随页签而变**是刻意的：侧栏的 × 意思是「把这一行从我眼前的这个列表里
+    /// **动作随页签而变**是刻意的：召回行的 × 意思是「把这一行从我眼前的这个列表里
     /// 去掉」。在历史里那是删记录，在收藏里那是取消收藏——若两处都去删历史，收藏页
     /// 的 × 就会点了没反应。
     ///
     /// 失败当场告知：两者都是用户主动表达的意图，与历史的**被动写入**不同。
-    fn remove_side_row(&self, hw: &Headword) {
+    fn remove_recall_row(&self, hw: &Headword) {
         let UserDataState::Ready(u) = &self.user else {
             self.notice.set("用户数据未能打开，无法修改".into());
             return;
         };
-        let on_favorites = self.side_tab.get() == TAB_FAVORITES;
+        let on_favorites = self.left_tab.get() == LEFT_FAVORITES;
         let r = if on_favorites {
             u.remove_favorite(hw)
         } else {
@@ -946,7 +1607,7 @@ impl State {
         }
     }
 
-    /// 当前展示的第一个词头，供侧栏标出「你正在看的是这条」。
+    /// 当前展示的第一个词头，供左栏的召回行标出「你正在看的是这条」。
     fn current_headword(&self) -> Option<String> {
         self.cards
             .get()
@@ -996,36 +1657,153 @@ impl State {
             .unwrap_or_default()
     }
 
-    /// 宣告用户数据有变，驱动侧栏与卡片重取。
+    /// 宣告用户数据有变，驱动左栏与卡片重取。
     fn bump(&self) {
         self.revision.set(self.revision.get().wrapping_add(1));
     }
 
-    /// 重取侧栏列表。数据不可用或读取失败时给出空列表——顶部的警示条已说明原因，
-    /// 此处再报一遍是噪音。
-    fn reload_side(&self) {
-        let UserDataState::Ready(u) = &self.user else {
-            self.side_rows.set(Vec::new());
+    /// 把一个词压进导航路径。
+    fn push_nav(&self, word: &str) {
+        self.nav.borrow_mut().push(word);
+        bump(self.nav_rev);
+    }
+
+    /// 重查当前正在看的那个词。
+    ///
+    /// 走 `preview`（不记历史、不压导航路径）：刷新不是一次新的查询，用户只是想让词条
+    /// 重新读一遍库——换过词库文件之后尤其有用。没有词在看时什么也不做，而不是把结果区
+    /// 清空：那会把「刷新」变成「清屏」，是两件不同的事。
+    fn refresh(&self) {
+        if let Some(w) = self.current_headword() {
+            self.preview(&w);
+        }
+    }
+
+    /// 沿导航路径走一步。`forward` 为真前进，否则后退。
+    ///
+    /// 走到的词用 `preview` 查（不记历史、不再压回路径）：后退不是一次新的查询，而是
+    /// 回到一个已经发生过的位置——浏览器的后退同样不会在历史里新增一条。
+    ///
+    /// 借用必须在 `preview` **之前**放掉：那条路径会一路走到 `rebuild_cards`，将来若有
+    /// 谁在重建里读一次导航状态，留着 `borrow_mut` 就是运行期 panic，且现场极难读。
+    fn go_nav(&self, forward: bool) {
+        let word = self.nav.borrow_mut().go(forward);
+        let Some(word) = word else {
             return;
         };
-        let rows = if self.side_tab.get() == TAB_FAVORITES {
-            u.favorites().map(|v| {
-                v.into_iter()
-                    .map(|f| SideRow {
-                        headword: f.headword,
-                    })
-                    .collect()
+        self.preview(&word);
+        bump(self.nav_rev);
+    }
+
+    /// 路径上还有没有可后退 / 可前进的一步。供按钮决定要不要置灰。
+    fn can_go(&self, forward: bool) -> bool {
+        self.nav.borrow().can_go(forward)
+    }
+
+    /// 按当前页签重算左栏的行与空态文案。
+    ///
+    /// 三个页签走同一个出口（`left_rows`），故切页签只换数据、不换结构——这正是三段
+    /// 共用一个列表要买的东西，见 `LEFT_CANDIDATES` 一族常量的注释。
+    ///
+    /// 用户数据不可用或读取失败时给出空列表——顶部的警示条已说明原因，此处再报一遍
+    /// 是噪音。
+    fn reload_left(&self) {
+        if self.left_tab.get() == LEFT_CANDIDATES {
+            self.reload_candidates();
+            return;
+        }
+        self.reload_recall();
+    }
+
+    /// 候选页：把当前候选连同键盘游标、当前查看的词铺成行。
+    fn reload_candidates(&self) {
+        let at = self.cursor.get();
+        // 「正在看的是哪个词」对候选行与召回行是同一个问题，故用同一个来源。
+        let current = self.current_headword();
+        let rows: Vec<LeftRow> = self
+            .candidates
+            .get()
+            .into_iter()
+            .enumerate()
+            .map(|(i, cand)| LeftRow::Candidate {
+                active: current.as_deref() == Some(cand.headword.as_str()),
+                cand,
+                at_cursor: i == at,
             })
+            .collect();
+        // 空态分两种，说的不是一回事：没打字是「还没开始」，打了字没候选是「词典里
+        // 确实没有以它开头的词」。合成一句话会让后者读起来像前者，用户会以为自己
+        // 没打进去。
+        self.left_note.set(if !rows.is_empty() {
+            String::new()
         } else {
-            u.history(SIDE_LIMIT).map(|v| {
-                v.into_iter()
-                    .map(|h| SideRow {
-                        headword: h.headword,
-                    })
-                    .collect()
-            })
+            let q = self.query.get();
+            let q = q.trim();
+            if q.is_empty() {
+                "输入一个词开始补全".into()
+            } else {
+                format!("没有以「{q}」开头的词")
+            }
+        });
+        self.left_rows.set(rows);
+    }
+
+    /// 历史页 / 收藏页：从用户数据取词头，并标出当前正在看的那条。
+    fn reload_recall(&self) {
+        let on_favorites = self.left_tab.get() == LEFT_FAVORITES;
+        let UserDataState::Ready(u) = &self.user else {
+            self.left_rows.set(Vec::new());
+            self.left_note.set("用户数据未能打开".into());
+            return;
         };
-        self.side_rows.set(rows.unwrap_or_default());
+        let hws = if on_favorites {
+            u.favorites()
+                .map(|v| v.into_iter().map(|f| f.headword).collect::<Vec<_>>())
+        } else {
+            u.history(RECALL_LIMIT)
+                .map(|v| v.into_iter().map(|h| h.headword).collect())
+        };
+        let current = self.current_headword();
+        let at = self.cursor.get();
+        let rows: Vec<LeftRow> = hws
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(i, headword)| {
+                let active = current.as_deref() == Some(headword.as_str());
+                LeftRow::Recall {
+                    headword,
+                    at_cursor: i == at,
+                    active,
+                }
+            })
+            .collect();
+        self.left_note.set(if !rows.is_empty() {
+            String::new()
+        } else if on_favorites {
+            "还没有收藏任何词".into()
+        } else {
+            "还没有查询记录".into()
+        });
+        self.left_rows.set(rows);
+    }
+
+    /// 按右栏页签筛出该显示的卡片，并给出筛空时的说明。
+    ///
+    /// 「筛空」是这里唯一需要解释的状态：一次查询只走一个方向，故查 `apple` 时
+    /// 「汉英」页必然一条也没有。那**不是**故障，但空白一片看起来像故障，所以必须
+    /// 有一句话——而 `hint` 讲的是查询本身（未收录、经原形命中），不能拿来讲页签。
+    fn refilter_cards(&self) {
+        let tab = self.dict_tab.get();
+        let all = self.cards.get();
+        let had_any = !all.is_empty();
+        let kept: Vec<Card> = all.into_iter().filter(|c| card_in_tab(c, tab)).collect();
+        self.filter_note.set(if had_any && kept.is_empty() {
+            format!("本次查询没有{}方向的词条。", dict_tab_label(tab))
+        } else {
+            String::new()
+        });
+        self.visible_cards.set(kept);
     }
 
     /// 把一次查询命中的全部词头记入历史记录。
@@ -1053,6 +1831,70 @@ impl State {
         // 无条件递增版本（不比较新旧值），故列表照样全量重建、照样多一帧重绘。
         // 规模是个人级的几百条，这个代价可以接受，但别以为它不存在。
         self.bump();
+    }
+}
+
+/// 把左栏宽度钳进合法区间。
+///
+/// 两层上限，缺一不可：
+///
+/// - `settings` 里那对 MIN/MAX 是与窗口无关的**硬边界**，防止设置库被手改成荒唐值。
+/// - `root_w - RIGHT_MIN_W` 是跟着窗口走的那层，保证右栏永远留得下能读的宽度。
+///
+/// `root_w <= 0` 时只施加硬边界：那说明还没有布局过（首帧之前），此时按一个不存在的
+/// 窗口宽去算上限，只会把用户的设置无端改小。
+fn clamp_left_w(w: i32, root_w: i32) -> i32 {
+    let w = w.clamp(
+        crate::settings::LEFT_PANE_W_MIN,
+        crate::settings::LEFT_PANE_W_MAX,
+    );
+    if root_w <= 0 {
+        return w;
+    }
+    // `max` 兜住极窄窗口：那时两个下限打架，让左栏保住它的下限、右栏被挤，
+    // 总好过左栏被压到列不出一个词头。
+    let cap = (root_w - RIGHT_MIN_W).max(crate::settings::LEFT_PANE_W_MIN);
+    w.min(cap)
+}
+
+/// 当前窗口宽度（根节点的宽）。拿不到时返回 0，由 `clamp_left_w` 按「还没布局过」处理。
+fn root_width(ctx: &mut EventCtx) -> i32 {
+    let tree = ctx.tree_mut();
+    let root = tree.root;
+    root.and_then(|r| tree.get(r))
+        .map(|n| n.bounds.w)
+        .unwrap_or(0)
+}
+
+/// 一张卡片是否属于某个方向页签。
+///
+/// 「全部」收所有；方向页按卡片里词条的类型判——`Entry` 只有英汉与汉英两个变体
+/// （术语表：两类词条的形状本就不同，不存在能同时容纳二者的字段集合），故这个匹配
+/// 是穷尽的，不存在第三种词条等着被漏掉。
+///
+/// 按**第一条**词条判而非全部：一张卡片是一个词头下的全部词条
+/// （`group_by_headword`），而一次查询只走一个方向（`Query::direction` 判定后路由，
+/// 见 `source/offline.rs`），同一张卡片不可能既有英汉又有汉英词条。
+fn card_in_tab(c: &Card, tab: usize) -> bool {
+    match tab {
+        DICT_EN_ZH => matches!(c.entries.first(), Some(Entry::English(_))),
+        DICT_ZH_EN => matches!(c.entries.first(), Some(Entry::Chinese(_))),
+        // `DICT_ALL` 与任何越界值都收全部。越界不该发生（页签由 `TabBar` 写，取值受
+        // 标签数约束），但「筛空了」比「panic」更难查，故这里宁可放行。
+        _ => true,
+    }
+}
+
+/// 方向页签的名字，供空态文案引用。
+///
+/// 「英汉 / 汉英」是**查询方向**名，术语表允许；禁止的是「英汉词典 / 汉英词典」那个
+/// 组合——本项目只有一个词典。文案因此说的是「没有 X 方向的词条」，不是「X 词典里
+/// 没有」。
+fn dict_tab_label(tab: usize) -> &'static str {
+    match tab {
+        DICT_EN_ZH => "英汉",
+        DICT_ZH_EN => "汉英",
+        _ => "任何",
     }
 }
 
@@ -1112,12 +1954,25 @@ fn headwords_to_record(entries: &[Entry]) -> Vec<Headword> {
 ///
 /// `user` 不可用时顶部常驻一条警示，说明历史记录失效及其原因（收藏有入口后一并
 /// 纳入，见 `unavailable_bar`）。
+/// `build` 的产物：界面树，加上一份窗口级快捷键处理器。
+///
+/// 打包成一个结构而非让 `main` 各取一次，是因为两者共享同一个 `State`——分成两个函数
+/// 就得把 `State` 或它的构造过程暴露出去，而它是这个模块的全部内部机制。
+pub struct Ui {
+    pub root: Element,
+    /// 交给 [`windui::app::App::on_shortcut`]。
+    pub shortcut: ShortcutFn,
+}
+
+/// 窗口级快捷键处理器。抽成别名只为让 [`Ui`] 的字段读得下去。
+pub type ShortcutFn = Box<dyn FnMut(&mut ShortcutCtx, KeyEvent) -> bool>;
+
 pub fn build(
     dict: OfflineDictionary,
     user: UserDataState,
     theme: ThemeHandle,
     hotkey: HotkeyHandle,
-) -> Element {
+) -> Ui {
     let dict = Rc::new(dict);
     let unavailable = match &user {
         UserDataState::Ready(_) => None,
@@ -1134,19 +1989,27 @@ pub fn build(
         query: signal(String::new()),
         candidates: signal(Vec::new()),
         cursor: signal(0),
-        cand_rev: signal(vec![0]),
-        picked: Rc::new(RefCell::new(None)),
         cards: signal(Vec::new()),
+        visible_cards: signal(Vec::new()),
         hint: signal(String::from("输入一个词开始查询")),
-        side_tab: signal(TAB_HISTORY),
-        side_rows: signal(Vec::new()),
+        filter_note: signal(String::new()),
+        dict_tab: signal(DICT_ALL),
+        // 开屏停在历史页：DESIGN.md 的「Search is home / Recall is a drawer」讲的是
+        // 别拿历史当主导航，不是别让人看见它。左栏那 280px 在开屏时**没有别的内容**
+        // 可放——候选页此刻是空的——而「最近查过什么」正好是下一次查询的起点。
+        left_tab: signal(LEFT_HISTORY),
+        left_rows: signal(Vec::new()),
+        left_note: signal(String::new()),
+        nav: RefCell::new(NavPath::default()),
+        nav_rev: signal(vec![0]),
+        focus_list: signal(vec![0]),
         revision: signal(0),
         notice: signal(String::new()),
         expanded: ExpandedStates::default(),
         theme,
         hotkey,
         page: signal(PAGE_DICT),
-        drawer_open: signal(false),
+        pane_rev: signal(vec![0]),
         settings: RefCell::new(settings),
         settings_note: signal(String::new()),
         settings_note_tone: signal(Role::Danger),
@@ -1154,8 +2017,9 @@ pub fn build(
         settings_rev: signal(vec![0]),
         skin_rev: signal(vec![0]),
     });
-    // 开屏即列出历史：侧栏空着会让人以为功能坏了。
-    st.reload_side();
+    // 开屏即把左栏填上：驱动器要到第一次 layout 才跑，在那之前列表是空的，
+    // 而开屏那一眼正好落在这里。
+    st.reload_left();
 
     // 整棵树挂在 `skin_rev` 上：换肤时重建一次。
     //
@@ -1172,10 +2036,68 @@ pub fn build(
     //
     // 只包一层、不逐处细分：漏掉任何一处含图标的子树，就会出现「有的跟了有的没跟」，
     // 那是最难查的一类不一致。整树重建换来的是「不可能漏」。
-    Element::host_signal(st.skin_rev, move |_rev: u64| {
+    let sc_st = st.clone();
+    let root = Element::host_signal(st.skin_rev, move |_rev: u64| {
         // `host_signal` 的回调是 `Fn`，会被反复调用，故每次都得拿一份自己的。
         window_root(st.clone(), unavailable.clone())
-    })
+    });
+    Ui {
+        root,
+        shortcut: Box::new(move |ctx, ev| handle_shortcut(&sc_st, ctx, ev)),
+    }
+}
+
+/// 窗口级快捷键。返回 `true` = 已处理。
+///
+/// 这里只放**与焦点无关**的键：无论用户此刻停在查询框、列表还是右栏正文上，它们都该
+/// 生效。与焦点强相关的（↑↓ 走行、→ 接受补全、Enter 查询）留在各自控件的 `on_nav_key`
+/// 里——那些键在不同控件上本就该有不同含义，塞进这里反而要在每个分支里回头判断焦点。
+///
+/// windui 保证这条回调**排在焦点控件之后**：输入框正在打字时，字符键先被它吃掉，轮不
+/// 到这里。所以下面每一条都必须带修饰键或是功能键，裸字符键放进来会截胡打字。
+///
+/// 键位见 `SHORTCUTS`——那张表是给用户看的说明书，改这里也要改它。
+fn handle_shortcut(st: &Rc<State>, ctx: &mut ShortcutCtx, ev: KeyEvent) -> bool {
+    if !ev.pressed {
+        return false;
+    }
+    match ev.key {
+        // Ctrl+L：回到查询框并全选。浏览器地址栏的键位，是这类「跳回主输入框」最通用
+        // 的一个。走 windui 的 autofocus 通路，与热键唤起窗口做的是同一件事。
+        Key::Other(VK_L) if ev.ctrl => {
+            ctx.focus_main_input();
+            true
+        }
+        // Ctrl+R：重查当前词。
+        Key::Other(VK_R) if ev.ctrl => {
+            st.refresh();
+            true
+        }
+        // Ctrl+W：收起窗口。走关闭决策链，本项目 `hide_on_close` 会把它落成隐藏——
+        // 常驻工具的 Ctrl+W 该是「收起」而不是「退出」，进程还要留着等热键。
+        Key::Other(VK_W) if ev.ctrl => {
+            ctx.request_close();
+            true
+        }
+        Key::Left if ev.ctrl => {
+            st.go_nav(false);
+            true
+        }
+        Key::Right if ev.ctrl => {
+            st.go_nav(true);
+            true
+        }
+        // Esc 在设置页是**返回**，不是关窗。
+        //
+        // 这正是 `on_shortcut` 必须排在框架的 Escape 兜底之前的理由：兜底会直接把窗口
+        // 收掉，而用户在设置页按 Esc 想的是「退出这一页」。返回 true 把这一键吃掉，
+        // 兜底就轮不到了；不在设置页时返回 false 放行，Esc 照旧收起窗口（ADR-0007）。
+        Key::Escape if st.page.get() == PAGE_SETTINGS => {
+            st.page.set(PAGE_DICT);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// 窗口根：标题栏 + 分隔线 + 主体。每次换肤重建一次，见 `build`。
@@ -1210,26 +2132,32 @@ fn title_bar(st: Rc<State>) -> Element {
         // 都等于 `surface_alt`，用角色表达之后换肤能自动跟随，不必重建元素树。
         .bg_role(Role::SurfaceAlt)
         .window_drag()
-        .child(brand().weight(1.0))
-        // 召回与设置三个入口并列在这里。
+        .child(brand())
+        // 前进 / 后退紧跟应用标识，摆在**左上角**——浏览器、文件管理器、macOS 词典
+        // 都在这个位置，是这两枚箭头唯一不需要解释的落点。
         //
-        // 召回入口此前是右侧一条 44px 常驻 rail 上的两个字形（`↺` `☆`）。撤掉它有两
-        // 条独立的理由：
+        // 没有放进右栏（那里离释义更近、看着更「就近」）：`TabBar` 的高度在交叉轴上
+        // 会失控，与它并排或叠放都会把那一屏排坏，详见 `right_pane`。标题栏是定高的
+        // 38px，不吃这个亏。
+        .child(
+            Element::row()
+                .cross(Align::Center)
+                .padding_edges(Insets::new(4, 0, 0, 0))
+                .child(nav_buttons(st.clone())),
+        )
+        // 弹簧：把设置顶到最右。此前这个作用由 `brand().weight(1.0)` 兼任，中间插进
+        // 导航按钮之后就得单拎出来——否则品牌块会把按钮一路推到窗口中间。
+        .child(Element::leaf().weight(1.0))
+        // 标题栏右侧只剩设置一个入口了。
         //
-        // 1. **认不出来**。使用者把 `↺` 读成了「刷新」——这不是他看得不够仔细，而是
-        //    U+21BA 本来就是通用的循环/重载符号，把它当「历史」用是我们一厢情愿。
-        //    图标要么用公认字形，要么就别用；`历史` 二字没有第二种读法。
-        // 2. **它吃掉了正文右边的一条**。rail 常驻 44px + 左边框，正文永远够不到窗口
-        //    右缘。而正文限宽撤掉之后（见 `EN_DEF_MAX_W`），铺满右侧正是这次重排要的
-        //    效果，留一条灰带在那儿等于白撤。
+        // 「历史」「收藏」两个入口随召回抽屉一起撤掉——它们现在是左栏那个分段控件的
+        // 两段，与列表挨在一起。入口摆在离它要打开的东西最近的地方，比摆在标题栏上
+        // 再拉开一个抽屉少一步，也少一个「这两个字会打开什么」的疑问。
         //
-        // 用文字而非图标同样适用于设置：U+2699 在 Windows 上会被 Segoe UI Emoji 接管，
-        // 画出来是一个彩色齿轮，与这一屏的单色格调格格不入（变体选择符 U+FE0E 无效，
-        // windui 的文本渲染不处理它）。走 SVG 又要 `ImageContent::tint` 定一个具体
-        // 颜色，换肤时它不会跟着变——ADR-0012 结案段刚把「界面无一处写死颜色」这条
-        // 挣回来。
-        .child(recall_entry("历史", TAB_HISTORY, st.clone()))
-        .child(recall_entry("收藏", TAB_FAVORITES, st.clone()))
+        // 用文字而非图标：U+2699 在 Windows 上会被 Segoe UI Emoji 接管，画出来是一个
+        // 彩色齿轮，与这一屏的单色格调格格不入（变体选择符 U+FE0E 无效，windui 的文本
+        // 渲染不处理它）。走 SVG 又要 `ImageContent::tint` 定一个具体颜色，换肤时它
+        // 不会跟着变——ADR-0012 结案段刚把「界面无一处写死颜色」这条挣回来。
         .child(settings_entry(st))
         // 窗口按钮的宽度（46px，与设计一致）、图标形状与 hover 色均由 windui 硬编码，
         // 只有图标色可调。框架的 `BTN_H = 32` 在这里不生效——本行 `cross(Stretch)`
@@ -1247,14 +2175,6 @@ fn title_bar(st: Rc<State>) -> Element {
 fn settings_entry(st: Rc<State>) -> Element {
     let page = st.page;
     bar_entry("设置", move |_ctx| page.set(PAGE_SETTINGS))
-}
-
-/// 标题栏上的一个召回入口：开抽屉并切到该页签；已经停在这一页则收起。
-///
-/// 「再点一次收起」这条是刻意的：入口就这一个，若它只负责打开，关抽屉就只剩抽屉头部
-/// 那个 ×，而人手已经在这儿了。
-fn recall_entry(text: &str, tab: usize, st: Rc<State>) -> Element {
-    bar_entry(text, move |_ctx| st.toggle_drawer(tab))
 }
 
 /// 标题栏上的一个文字入口。
@@ -1327,99 +2247,154 @@ fn brand() -> Element {
         )
 }
 
-/// 主体区域：主列 + 召回抽屉。
+/// 主体区域：两栏词典页与设置页，外加两个零尺寸驱动器与一条通栏消息条。
 ///
-/// 召回从常驻侧栏改成按需抽屉，依据是 DESIGN.md 的「Search is home / Recall is a
-/// drawer」：默认可见的界面该服务**下一次**查询，而 224px 的历史列表是在回顾上一次。
+/// 布局是左右两栏——左边输入与列表，右边页签与释义，一如 macOS 自带的词典。上一版
+/// 是「主列 + 按需抽屉」，抽屉在此撤掉：两栏之外再挂一个 280px 的抽屉，在 720px 的
+/// 最小窗口里会挤成三栏；而历史、收藏与补全候选本就同形（都是一列词头），合进左栏
+/// 那一个列表比另开一栏更省地方，也更好找。
 ///
-/// 抽屉收起时主列独占**整个**宽度——一像素也不留。入口已经移到标题栏（见
-/// `recall_entry`），此处不再有 rail，「怎么把抽屉叫出来」仍然一直看得见。
+/// DESIGN.md 的「Search is home / Recall is a drawer」并没有因此作废：它反对的是把
+/// 历史当主导航，而这里的主导航仍是左栏顶上那个查询框——历史只是它下面那个列表在
+/// 没有候选时的默认内容。
 fn body(st: Rc<State>, unavailable: Option<String>) -> Element {
-    Element::row()
+    let (p1, p2) = (st.page, st.page);
+    let mut root = Element::col()
         .fill()
-        .cross(Align::Stretch)
-        // 列表驱动器提到这一层，且排在**所有消费者之前**。
+        // 三个驱动器都提到这一层，且排在**所有消费者之前**——`on_update` 按
+        // `Element::build` 的前序（即书写顺序）派发，排在消费者之后就慢一帧。
         //
-        // 它此前挂在侧栏内部，靠「侧栏在主列左边、故先建」才赶得上——`on_update` 按
-        // `Element::build` 的前序（即书写顺序）派发，而它除了重载列表还要刷新结果区
-        // 卡片的星标，落在主列之后就慢一帧。召回移到右侧之后那个前提不再成立，故提到
-        // 这里：位置由「必须先于所有消费者」这条约束决定，不再是左右布局的副产品。
-        .child(side_loader(st.clone()))
-        .child(pages(st.clone(), unavailable).weight(1.0))
-        .child(drawer(st))
+        // 它们**彼此之间的顺序也是承重的**，因为后一个消费前一个刚写下的信号：
+        //
+        // 1. `Completer` 产出候选、并把左栏拨到候选页；
+        // 2. `LeftPaneLoader` 据此铺出左栏的行；
+        // 3. `CardFilter` 据 `LeftPaneLoader` 刷星标时写下的 `cards` 派生出可见卡片。
+        //
+        // 补全驱动器此前挂在左栏内部（`left_pane`），排在 `LeftPaneLoader` **之后**，
+        // 于是候选与页签的更新总要等下一帧才被铺成行。症状很具体：打完字**立刻**按 ↓，
+        // 游标作用在上一批行上——左栏看着是候选，实际还是历史，于是按一下 ↓ 查出来的
+        // 是历史里的某个词。实机上打字与按键之间通常隔着好几帧，所以不容易撞见，但
+        // 「打完就按」恰恰是熟练用户的常态。
+        .child(completer(st.clone()))
+        .child(left_loader(st.clone()))
+        .child(card_filter(st.clone()));
+    // 不可用时才占这一行：正常情况下不该为一个不会发生的故障留白。
+    if let Some(why) = unavailable {
+        root = root.child(
+            Element::row()
+                .width_match()
+                .padding_xy(14, 10)
+                .child(unavailable_bar(&why)),
+        );
+    }
+    root
+        // 词典页与设置页叠在一起，按 `page` 切换。
+        //
+        // 用叠层而非替换，是为了保住词典页的状态——查询词、候选、结果卡片、滚动位置
+        // 都在元素树里，若切页时把整棵子树换掉，从设置页回来会发现结果没了。
+        //
+        // 设置页盖住的是**整个**两栏区，不只右栏：它自带页头与分组卡片，是一屏独立的
+        // 内容；只盖右栏会让左边留着一列与设置毫不相干的词，读起来像是「这些设置属于
+        // 那个词」。
+        .child(
+            Element::stack()
+                // 不写 `.fill()`：高度分量会立刻被 `weight` 覆盖（`weight` 在竖向父
+                // 容器里落到高度维），写了等于留一句死代码。
+                .width_match()
+                .weight(1.0)
+                .child(
+                    dict_page(st.clone())
+                        .fill()
+                        .visible_when(move || p1.get() == PAGE_DICT),
+                )
+                .child(
+                    settings_page(st.clone())
+                        .fill()
+                        .visible_when(move || p2.get() == PAGE_SETTINGS),
+                ),
+        )
+        // 消息条通栏摆在最底下。它此前在主列的查询框下方，那时只有一列，摆哪都一样；
+        // 两栏之后不行了——消息的来源横跨两栏（左栏删记录、右栏点收藏），摆进任一栏
+        // 都会出现「在这边操作、消息却在那边」。
+        .child(notice_row(st.notice))
 }
 
-/// 列表驱动器：零尺寸、不可见，重载召回列表并刷新结果区星标。位置约束见 `body`。
-fn side_loader(st: Rc<State>) -> Element {
+/// 通栏消息条。空串时整行连同内边距一起收起——`visible_when` 让 `measure` 直接返回
+/// `Size::ZERO`（windui `core.rs` 的 measure 开头就短路），是真的不占位，不是画成透明。
+fn notice_row(notice: Signal<String>) -> Element {
+    Element::row()
+        .width_match()
+        .padding_xy(14, 8)
+        .border_role(Role::Divider, 1)
+        .border_edges(Edges::TOP)
+        .visible_when(move || !notice.get().is_empty())
+        .child(notice_bar(notice, None))
+}
+
+/// 补全驱动器：零尺寸、不可见，监视查询词、产出候选。位置约束见 `body`。
+fn completer(st: Rc<State>) -> Element {
     Element::leaf()
         .reactive()
-        .widget(SideLoader {
-            last_tab: st.side_tab.version(),
-            last_rev: st.revision.version(),
+        .widget(Completer {
+            cursor: st.cursor,
+            left_tab: st.left_tab,
+            dict: st.dict.clone(),
+            query: st.query,
+            candidates: st.candidates,
+            last_version: st.query.version(),
+        })
+        .size(0, 0)
+}
+
+/// 左栏驱动器：零尺寸、不可见，重算左栏行并刷新结果区星标。位置约束见 `body`。
+fn left_loader(st: Rc<State>) -> Element {
+    Element::leaf()
+        .reactive()
+        .widget(LeftPaneLoader {
+            last: LeftInputs::of(&st),
             st,
         })
         .size(0, 0)
 }
 
-/// 召回抽屉：历史 / 收藏，按需展开，挤压主列而非盖住它。
-///
-/// 挤压而非覆盖：抽屉里点一个词，结果就出现在它左边，两者要同时可见。覆盖式抽屉
-/// 得先关掉才能读结果，而「点一个词 → 读 → 再点下一个」正是召回的主要用法。
-fn drawer(st: Rc<State>) -> Element {
-    let open = st.drawer_open;
-    Element::col()
-        .width(280)
-        .height_match()
-        .bg_role(Role::SurfaceAlt)
-        .border_role(Role::Divider, 1)
-        .border_edges(Edges::LEFT)
-        .visible_when(move || open.get())
-        .child(drawer_head(st.clone()))
-        .child(side_list(st).fill().padding_xy(8, 8).weight(1.0))
+/// 卡片筛选驱动器：零尺寸、不可见，按右栏页签派生 `visible_cards`。位置约束见 `body`。
+fn card_filter(st: Rc<State>) -> Element {
+    Element::leaf()
+        .reactive()
+        .widget(CardFilter {
+            last_tab: st.dict_tab.version(),
+            last_cards: st.cards.version(),
+            st,
+        })
+        .size(0, 0)
 }
 
-/// 抽屉头部：历史 / 收藏分段 + 关闭。
-///
-/// **不放收藏计数**。它原先在侧栏底部的设置入口上（「142 词」），那里的理由是「让人
-/// 知道这个入口后面有内容」——抽屉一打开列表就在眼前，这个理由没了。而它是构建期
-/// 快照，收藏之后不会自己更新，留着就是个会过期的数字。
-fn drawer_head(st: Rc<State>) -> Element {
-    let open = st.drawer_open;
+/// 词典页：左栏（输入 + 列表）+ 可拖的分隔条 + 右栏（页签 + 释义）。
+fn dict_page(st: Rc<State>) -> Element {
+    let pane_st = st.clone();
     Element::row()
-        .width_match()
-        .height(46)
-        .cross(Align::Center)
-        .padding_xy(10, 0)
-        .spacing(8)
-        .border_role(Role::Divider, 1)
-        .border_edges(Edges::BOTTOM)
-        // 分段控件而非页签：两者都表达单选，但页签的语义是「切换到另一个页面」，
-        // 而这里两页是同一个列表的两种来源，切过去人还在抽屉里。
-        .child(Element::segmented(vec!["历史", "收藏"], st.side_tab).weight(1.0))
-        .child(
-            crate::icon::button(crate::icon::CLOSE, 26, Role::TextDisabled)
-                .on_click(move |_ctx| open.set(false)),
-        )
+        .fill()
+        .cross(Align::Stretch)
+        // **只把左栏包进重建作用域**，右栏留在外面。改栏宽本该只改变宽度，而右栏那边
+        // 装着用户正读到一半的释义——滚动位置、将来的文本选区都活在元素树里，跟着重建
+        // 一次就没了。右栏的宽度靠 `weight` 自己跟上，不需要重建。
+        .child(Element::host_signal(st.pane_rev, move |_rev: u64| {
+            left_pane(pane_st.clone())
+        }))
+        .child(splitter(st.clone()))
+        .child(right_pane(st).weight(1.0))
 }
 
-/// 主列：词典页与设置页叠在一起，按 `page` 切换。
-///
-/// 用叠层而非替换，是为了保住词典页的状态——查询词、候选、结果卡片、滚动位置都在
-/// 元素树里，若切页时把整棵子树换掉，从设置页回来会发现结果没了。
-fn pages(st: Rc<State>, unavailable: Option<String>) -> Element {
-    let (p1, p2) = (st.page, st.page);
-    Element::stack()
-        .fill()
-        .child(
-            main_column(st.clone(), unavailable)
-                .fill()
-                .visible_when(move || p1.get() == PAGE_DICT),
-        )
-        .child(
-            settings_page(st)
-                .fill()
-                .visible_when(move || p2.get() == PAGE_SETTINGS),
-        )
+/// 两栏之间那条可拖动的分隔条。行为与取舍见 `PaneSplitter`。
+fn splitter(st: Rc<State>) -> Element {
+    Element::leaf()
+        .width(SPLITTER_W)
+        .height_match()
+        .widget(PaneSplitter {
+            st,
+            drag: None,
+            hover: false,
+        })
 }
 
 /// 竖向容器里的滚动区：**高度靠 `weight` 拿，不能用 `.fill()`**。
@@ -1435,41 +2410,147 @@ fn pages(st: Rc<State>, unavailable: Option<String>) -> Element {
 /// `max_scroll = content_h - 视口高` 里的视口高多算了那一截。
 ///
 /// `weight` 走的是第二遍按剩余空间瓜分的路径（`MeasureSpec::exactly(portion)`），
-/// 视口高才等于真实可见高。`main_column` 里那句「不写 `.fill()`」说的是同一件事。
+/// 视口高才等于真实可见高。`body` 里那句「不写 `.fill()`」说的是同一件事。
 fn scroll_area(child: Element) -> Element {
     Element::scroll().width_match().weight(1.0).child(child)
 }
 
-/// 召回列表。历史与收藏共用一份数据信号，由 `SideLoader` 按当前页签重载。
-///
-/// 改抽屉时顺带修掉了一处浪费：此前用 `Element::tabs` 把两页都建进树、只给未选中的
-/// 挂 `visible_when`，而 `on_update` 的派发只看 `enabled` 不看 `visible`，隐藏那页的
-/// 列表照样跟着重建——每次列表变更都是一倍的节点。现在抽屉里只有一个列表，页签切换
-/// 只换数据不换结构。
-///
-/// 传给 `list_signal` 的 key 函数当前是**死参数**：windui 的形参名为 `_key_fn`，
-/// 内部做全量重建，没有 keyed diff。传它是为将来上游补齐后自动生效，别据此以为
-/// 行有稳定身份（hover / 滚动位置在重建时都会丢）。
-fn side_list(st: Rc<State>) -> Element {
-    Element::list_signal(
-        st.side_rows,
-        |r: &SideRow| r.headword.as_str().to_string(),
-        move |r: SideRow| side_row(r, st.clone()),
-    )
-    .fill()
+/// 左栏：查询框 + 三段页签 + 一份列表。
+fn left_pane(st: Rc<State>) -> Element {
+    // 构建期读一次。宽度在 windui 里是构建期量，改了要重建——这正是 `pane_rev` 存在
+    // 的理由，见 `dict_page`。
+    let w = st.settings.borrow().left_pane_w;
+    Element::col()
+        .width(w)
+        .height_match()
+        // 左栏底比正文底暗一档，两栏的分界不全靠那条竖线撑着。三套皮肤的 `surface_alt`
+        // 都与 `bg` 拉开了这一档，用角色表达之后换肤自动跟随。
+        //
+        // 右边框已撤：那条线现在由分隔条自己画（`PaneSplitter::paint`），它要能随悬停
+        // 加粗变色，画在这里就跟不了手。
+        .bg_role(Role::SurfaceAlt)
+        // 右侧只留 2px：那一边紧挨着分隔条，10px 的对称内边距会在列表与分隔条之间
+        // 撑出一道明显的空沟。左侧仍要 10——它是正文与窗口边缘的距离。
+        .padding_edges(Insets::new(10, 12, 2, 12))
+        .spacing(9)
+        // 补全驱动器**不在这里**——它提到了 `body` 顶层，必须先于 `LeftPaneLoader`
+        // 跑，理由见那里。挂在左栏内部会让候选慢一帧铺出来。
+        //
+        // 占位符不用「单词」「搜索」（均为术语表弃用词），但必须保住「中英皆可」这条
+        // 信息：查询方向由查询词自动判定，界面上没有方向选择器（ADR-0003），用户无从
+        // 知道这个框两种文字都收。
+        //
+        // 设计稿此处的查询框右侧有一组 `Ctrl` `K` 键帽，未照做：本项目的唤起热键是
+        // Ctrl+Alt+D（`main.rs`），而窗口内并没有 Ctrl+K 这个键位。画一组按了没用的
+        // 键帽比不画更糟。
+        .child(query_box(st.clone()))
+        .child(left_note_line(st.left_note))
+        .child(left_list(st.clone()))
+        // 分段控件摆在**列表下方**，不是查询框与列表之间。
+        //
+        // 理由是 Tab 顺序：焦点从查询框出来该直接落到列表上——那是用户按 Tab 时想去
+        // 的地方（「移到列表进行操作」）。夹在中间时它必然先吃掉一次 Tab，而它切的是
+        // 列表的**数据来源**，属于「先决定看什么，再在里面走」——真要用键盘切来源，
+        // 从列表再 Tab 一下就到，顺序反而更顺。
+        //
+        // 底部横条也是侧栏筛选器的常见位置（Finder 的路径栏、邮件客户端的过滤条都在
+        // 这一档），视觉上不会被读成「列表的标题」。
+        //
+        // 用分段控件而非页签：两者都表达单选，但右栏顶上已经有一排真页签了，同屏两排
+        // 页签会让人以为它们是同一套导航的两级。分段的语义是「同一个列表的几种来源」，
+        // 正是这里的实情——切过去人还在左栏。
+        // 第一段叫「查询」而不是「候选」：这一段列的是当前输入能查到的词，用户读它
+        // 时想的是「我要查哪个」。「候选」是**补全**这个动作的内部说法（术语表里它是
+        // 一条正式术语），摆到界面上会让人以为那是另一种东西。
+        .child(Element::segmented(vec!["查询", "历史", "收藏"], st.left_tab).width_match())
 }
 
-/// 侧栏的一行：词头（点击即查）+ 移除按钮。
+/// 左栏列表的空态文案。列表非空时整行收起。
+///
+/// 摆在列表**上方**而非下方：列表拿 `weight` 占尽剩余高度，即便一行都没有也仍是那么
+/// 高，文案摆在它下面会被压到栏底——离用户刚敲字的地方隔着一整片空白，读起来不像是
+/// 在回答刚才那次输入。
+fn left_note_line(note: Signal<String>) -> Element {
+    Element::label_signal(note)
+        .font_size(12.5)
+        .fg_role(Role::TextMuted)
+        .width_match()
+        .padding_xy(12, 4)
+        .visible_when(move || !note.get().is_empty())
+}
+
+/// 左栏列表。三个页签共用一份数据信号，由 `LeftPaneLoader` 按当前页签重算。
+///
+/// **不用 `Element::list_signal`**，尽管它看起来正是为这件事准备的。它内部是
+/// `Self::scroll()` 之后再 `set_widget(DynList)`——而 `Element::scroll()` 的滚动条
+/// 拖动逻辑就住在它默认挂的那个 `ScrollWidget` 里，被 `DynList` 顶掉之后，滚动条
+/// **看得见、抓不住**：画得出来（绘制只看 `content_h > 视口高`），按下去却没有任何
+/// 东西处理这次拖动。滚轮不受影响（它走 `Tree::scroll_target`，只认 `Layout::Scroll`，
+/// 与 widget 无关），所以症状是「滚轮能滚、拖不动」这种半瘫。
+///
+/// 改成 `scroll_area(host_signal(…))`：外层是完整的 `Element::scroll()`（`ScrollWidget`
+/// 原封不动），里层 `host_signal` 是普通 col 挂 `DynList`，只管按信号重建行。两个职责
+/// 各归各位。结果区（`result_area`）一直是这么写的，那边的滚动条从来没坏过。
+///
+/// 高度靠 `weight` 拿、不能用 `.fill()`——理由见 `scroll_area`。
+fn left_list(st: Rc<State>) -> Element {
+    let nav = ListKeyNav {
+        last_cursor: st.cursor.version(),
+        last_focus_req: st.focus_list.version(),
+        st: st.clone(),
+    };
+    // 外面这层 col 只为挂 `ListKeyNav`：焦点与方向键归它，滚动仍归里面那个
+    // `scroll_area` 自带的 `ScrollWidget`。两个职责各归各位，理由见两者的注释。
+    Element::col()
+        .width_match()
+        .weight(1.0)
+        .reactive()
+        .widget(nav)
+        .child(
+            scroll_area(
+                Element::host_signal(st.left_rows, move |r: LeftRow| left_row(r, st.clone()))
+                    .width_match(),
+            )
+            // **只在右侧**留出滚动条的地盘。滚动条画在滚动容器的全矩形边缘，而内容排
+            // 在 padding 内——不留这一档，候选行的释义摘要就被压在滚动条底下（一列
+            // 半透明的灰条盖着字，正是它最该被读到的位置）。
+            //
+            // 用非对称 padding 而非 `padding_xy`：后者会让左边跟着白缩 10px，而左边
+            // 并没有滚动条。
+            .padding_edges(Insets::new(0, 0, 10, 0)),
+        )
+}
+
+/// 左栏的一行：按类型分派。
+///
+/// 两种行**同高**（36），故切页签时列表不跳。这不是巧合而是约束：三段共用一个列表，
+/// 高度不一致会让「切一下页签」看起来像「列表整个换了个东西」。
+fn left_row(r: LeftRow, st: Rc<State>) -> Element {
+    match r {
+        LeftRow::Candidate {
+            cand,
+            at_cursor,
+            active,
+        } => candidate_row(cand, at_cursor, active, st),
+        LeftRow::Recall {
+            headword,
+            at_cursor,
+            active,
+        } => recall_row(headword, at_cursor, active, st),
+    }
+}
+
+/// 左栏的一条召回记录：词头（点击即查）+ 移除按钮。
 ///
 /// 不用 `Element::nav_row`：它自带的 `›` 是「钻入子页」的语义，而这里点一行的动作是
 /// 「查这个词」，查完人还在原地。图标与语义不符会让人误以为侧边还有一层。
-fn side_row(r: SideRow, st: Rc<State>) -> Element {
-    let word = r.headword.as_str().to_string();
-    // 选中态标出「你正在看的是这条」——设计稿的圆点与淡底不是纯装饰，它回答了
-    // 「我刚点的是哪个」这个问题，尤其在历史列表里滚动之后。
-    let active = st.current_headword().as_deref() == Some(word.as_str());
+///
+/// `active`（「你正在看的是这条」）由调用方**在数据里**给出，不在这里现读——理由见
+/// `LeftRow`。
+fn recall_row(hw: Headword, at_cursor: bool, active: bool, st: Rc<State>) -> Element {
+    let word = hw.as_str().to_string();
     let (pick_st, del_st) = (st.clone(), st);
-    let (pick_word, del_hw) = (word.clone(), r.headword.clone());
+    let (pick_word, del_hw) = (word.clone(), hw);
     let mut row = Element::row()
         .width_match()
         .height(36)
@@ -1478,11 +2559,24 @@ fn side_row(r: SideRow, st: Rc<State>) -> Element {
         .padding_xy(12, 0)
         .spacing(10)
         .clickable()
+        // **退出 Tab 环**。行是 `Clickable`，默认可聚焦——不摘掉的话 Tab 会逐行走过
+        // 四十条候选，而整块列表只该占**一个**焦点位（roving tabindex，见
+        // `ListKeyNav`）：进来一次，之后交给 ↑↓。
+        //
+        // 鼠标点击不受影响：可聚焦与可点击是两件事。
+        .focusable(false)
         .on_click(move |_ctx| {
-            pick_st.select(&pick_word);
+            // 游标跟着鼠标走，理由同 `State::pick_candidate`：不挪的话，点完一行再按
+            // 回车会跳去查另一个词。
+            pick_st.focus_row(&pick_word);
         });
+    // 两档淡底，与候选行同一套：满档是「你正在看的是这条」，半档是「回车会选中
+    // 这一条」。设计稿的圆点与淡底不是纯装饰，它回答了「我刚点的是哪个」这个问题，
+    // 尤其在历史列表里滚动之后。
     if active {
         row = row.bg_role_alpha(Role::Accent, ACCENT_SOFT_A);
+    } else if at_cursor {
+        row = row.bg_role_alpha(Role::Accent, CURSOR_SOFT_A);
     }
     row.child(
         // 圆点：6px，选中时用强调色。
@@ -1501,60 +2595,101 @@ fn side_row(r: SideRow, st: Rc<State>) -> Element {
     )
     .child(
         crate::icon::button(crate::icon::CLOSE, 24, Role::TextDisabled)
-            .on_click(move |_ctx| del_st.remove_side_row(&del_hw)),
+            .on_click(move |_ctx| del_st.remove_recall_row(&del_hw)),
     )
 }
 
-/// 主列：查询框 + 补全候选 + 结果。
-fn main_column(st: Rc<State>, unavailable: Option<String>) -> Element {
-    // 左右 28px。rail 撤掉之后这个值管的是**正文与窗口边缘**的距离，两侧对称——正文
-    // 铺满不等于顶到窗框上，那样读起来局促。设计稿此处是 40px，那是在更宽的画布上。
-    let mut root = Element::col().fill().padding_xy(28, 16).spacing(12);
-    // 不可用时才占这一行：正常情况下不该为一个不会发生的故障留白。
-    if let Some(why) = unavailable {
-        root = root.child(unavailable_bar(&why));
-    }
-    root
-        // 补全驱动器：零尺寸、不可见，必须排在候选列表之前（on_update 按注册顺序广播）。
-        .child(
-            Element::leaf()
-                .reactive()
-                .widget(Completer {
-                    cursor: st.cursor,
-                    cand_rev: st.cand_rev,
-                    dict: st.dict.clone(),
-                    query: st.query,
-                    candidates: st.candidates,
-                    picked: st.picked.clone(),
-                    last_version: st.query.version(),
-                })
-                .height(0),
-        )
-        // 占位符不用「单词」「搜索」（均为术语表弃用词），但必须保住「中英皆可」
-        // 这条信息：查询方向由查询词自动判定，界面上没有方向选择器（ADR-0003），
-        // 用户无从知道这个框两种文字都收。也不与结果区提示重复——同一句话在开屏时
-        // 同屏出现两遍，占位符就白占了。
-        //
-        // 设计稿此处的查询框右侧有一组 `Ctrl` `K` 键帽，未照做：本项目的唤起热键是
-        // Ctrl+Alt+D（`main.rs`），而窗口内并没有 Ctrl+K 这个键位。画一组按了没用的
-        // 键帽比不画更糟。
-        .child(query_box(st.clone()))
-        .child(notice_bar(st.notice, None))
-        // 此处原有一条分隔线。拿掉了：候选区收起后它就紧贴查询框，把主列切成两截，
-        // 而它要分隔的两样东西（候选、结果）本就不会同时是空的。区域感交给留白。
-        //
-        // 结果与候选叠在一起：结果铺满，候选浮在其上、顶端对齐。`Layout::Frame` 用
-        // 单个 `align` 同时定横纵（windui `core.rs:arrange_frame`），故候选靠
-        // `width_match` 撑满横向、靠默认的 `Align::Start` 贴顶。
-        .child(
-            Element::stack()
-                // 不写 `.fill()`：它的高度分量会立刻被 `weight` 覆盖（`weight` 在竖向
-                // 父容器里落到高度维），写了等于留一句死代码。
-                .width_match()
-                .weight(1.0)
-                .child(result_area(st.clone()))
-                .child(candidate_panel(st)),
-        )
+/// 右栏：方向页签 + 释义。
+fn right_pane(st: Rc<State>) -> Element {
+    Element::col()
+        .fill()
+        // 顶上只有页签。前进/后退挪到了标题栏——`TabBar` 的高度是 `Match`，与任何
+        // 东西并排或叠放都会掉进交叉轴的坑：Match 在交叉轴上意味着「撑满父容器」，
+        // 而父容器高度又随内容，两边互相等，最后解析成一大截，页签直接掉到半屏高的
+        // 位置、结果区被挤没。它**只有独占竖向容器的一行**时才是对的——那时 Match
+        // 落在主轴上被降级为 Wrap（`core.rs` 的「主轴上的 Match 降级为 Wrap」），
+        // 高度才是那条标签条本身。
+        .child(dict_tab_bar(st.dict_tab))
+        .child(result_area(st).weight(1.0))
+}
+
+/// 前进 / 后退两枚按钮。
+///
+/// 摆在方向页签**左边**、释义正上方：它们管的是「看哪个词」，与页签管的「看这个词的
+/// 哪个方向」是同一层的东西，都属于右栏这一屏的导航。放标题栏则会与「设置」挤在一起，
+/// 而那一排是**应用级**入口，层级不同。
+///
+/// 包在 `host_signal` 里：两枚按钮的可用与否是构建期算的（图标颜色尤其——它在构建期
+/// 就解析成了具体色值，见 `crate::icon`），走一步就得重建。重建量是两个节点。
+fn nav_buttons(st: Rc<State>) -> Element {
+    Element::host_signal(st.nav_rev, move |_rev: u64| {
+        let (back, fwd) = (st.clone(), st.clone());
+        Element::row()
+            .cross(Align::Center)
+            .spacing(2)
+            .child(nav_button(
+                crate::icon::BACK,
+                st.can_go(false),
+                move |_ctx| back.go_nav(false),
+            ))
+            .child(nav_button(
+                crate::icon::FORWARD,
+                st.can_go(true),
+                move |_ctx| fwd.go_nav(true),
+            ))
+    })
+    // **必须显式给高度**，否则两枚箭头会贴着标题栏顶边排，与旁边的「设置」不在一条
+    // 视觉中线上。
+    //
+    // `host_signal` 的容器是 `col().fill()`，高度是 `Match`——在标题栏那个横向容器里
+    // 那是**交叉轴**，Match 意味着撑满整条 38px；而按钮行在这个 col 内部的纵向**主轴**
+    // 上是 Wrap，于是只占 26px 并贴顶。外层的 `cross(Center)` 对此无能为力：它要居中的
+    // 那个子节点本身已经撑满了，居中等于没动。
+    //
+    // 给它按钮的自然高度，`cross(Center)` 才有东西可居中。这与 `right_pane` 那段
+    // 「TabBar 不能与任何东西并排」是同一条规则的两次现形。
+    .height(NAV_BTN)
+}
+
+/// 一枚导航按钮。走不动时置灰。
+///
+/// 置灰只改颜色、**不摘掉回调**：`go_nav` 自己有边界检查，点了什么也不会发生。少一条
+/// 「两处都要判、漏一处就点出越界」的耦合。
+fn nav_button(
+    icon: &'static [u8],
+    enabled: bool,
+    on_click: impl FnMut(&mut EventCtx) + 'static,
+) -> Element {
+    let role = if enabled {
+        Role::TextMuted
+    } else {
+        Role::TextDisabled
+    };
+    crate::icon::button(icon, NAV_BTN, role).on_click(on_click)
+}
+
+/// 右栏顶部那排方向页签。
+///
+/// 直接搭一条 `TabBar`，而不用 `Element::tabs`：后者会把**每一页**都建进树、只给未
+/// 选中的挂 `visible_when`，而 `on_update` 的派发只看 `enabled` 不看 `visible`——
+/// 三个页面就是三份结果区跟着重建，每次查询都是三倍的节点。撤掉召回抽屉时刚修掉的
+/// 正是同一处浪费。
+///
+/// 而这排页签切的本来也不是「三个页面」，是同一个结果区的三种筛法（见 `DICT_ALL`
+/// 一族常量）——一份内容区才是它的实情，`TabBar` 只负责那条标签条。
+///
+/// 条高与贯穿基线由 `TabBar` 自己按主题决定，故此处不设固定高、也不另加分隔线。
+fn dict_tab_bar(selected: Signal<usize>) -> Element {
+    Element::leaf()
+        .widget(TabBar::new(
+            vec![
+                TabItem::new("全部".into()),
+                TabItem::new("英汉".into()),
+                TabItem::new("汉英".into()),
+            ],
+            selected,
+        ))
+        .width_match()
 }
 
 /// 设置页。
@@ -1613,7 +2748,9 @@ fn settings_body(st: Rc<State>) -> Element {
                 .spacing(28)
                 .child(notice_bar(st.settings_note, Some(st.settings_note_tone)))
                 .child(group("外观", skin_cards(st.clone())))
+                .child(group("布局", pane_w_row(st.clone())))
                 .child(group("唤起", hotkey_row(st.clone())))
+                .child(group("快捷键", shortcut_rows()))
                 .child(group("启动", autostart_row(st.clone())))
                 .child(group("词库", dict_rows(st.clone())))
                 .child(group("释义显示", expand_en_row(st.clone())))
@@ -1661,6 +2798,68 @@ fn data_rows(st: Rc<State>) -> Element {
                 .fg_role(Role::TextMuted),
         ),
     ])
+}
+
+/// 快捷键一览。**只读**：这一栏是说明书，不是改键的地方。
+///
+/// 不做成可改的：全局唤起热键值得让用户改（它要和别的软件抢一个组合），而窗口内的
+/// 快捷键没有这个冲突——它们只在本窗口有焦点时生效，改了反而丢掉「Ctrl+L 回到搜索框」
+/// 这类跨软件通用的肌肉记忆。真有人要改，那是另一套（带冲突检测的）交互。
+///
+/// 数据取自 `SHORTCUTS`，那张表同时是这套键位的说明书，见它的注释。
+fn shortcut_rows() -> Element {
+    card(
+        SHORTCUTS
+            .iter()
+            .map(|(keys, what)| {
+                Element::row()
+                    .width_match()
+                    .cross(Align::Center)
+                    .padding_xy(14, 11)
+                    .spacing(12)
+                    .child(
+                        Element::label(*what)
+                            .font_size(13.5)
+                            .fg_role(Role::Text)
+                            .weight(1.0),
+                    )
+                    .child(
+                        // 键位用淡底小胶囊，与释义里的词性标记同一套视觉语言——都是
+                        // 「一小段需要与正文区分开的记号」。
+                        Element::label(*keys)
+                            .font_size(12.5)
+                            .font_weight(500)
+                            .fg_role(Role::TextMuted)
+                            .bg_role(Role::SurfaceAlt)
+                            .corner(6.0)
+                            .padding_xy(9, 4),
+                    )
+            })
+            .collect(),
+    )
+}
+
+/// 布局设置：左栏宽度的当前值与重置。
+///
+/// 这里**只给重置，不给数值输入**。栏宽的正确值是「看着舒服」，那件事拖一下分隔条
+/// 当场就能判断，而填一个数字要来回试；此处真正需要的是一条退路——拖坏了、或换了
+/// 台屏幕之后回到一个已知可用的值。
+fn pane_w_row(st: Rc<State>) -> Element {
+    let w = st.settings.borrow().left_pane_w;
+    let reset_st = st.clone();
+    card(vec![row(
+        "左栏宽度",
+        Some(&format!(
+            "当前 {w}px。拖两栏之间的分隔线即可调整，默认 {}px",
+            crate::settings::LEFT_PANE_W_DEFAULT
+        )),
+        Element::button("重置").on_click(move |_ctx| {
+            reset_st.reset_left_w();
+            // 本行显示的是构建期取的数值，不重建就还停在旧值上——与皮肤卡片的选中环
+            // 是同一类问题，见 `State::settings_rev`。
+            reset_st.bump_settings();
+        }),
+    )])
 }
 
 /// 一个设置分组：小标题 + 内容卡片。
@@ -1784,7 +2983,11 @@ fn hotkey_row(st: Rc<State>) -> Element {
     let ctrl = signal(spec.ctrl);
     let alt = signal(spec.alt);
     let shift = signal(spec.shift);
-    let key = signal(spec.key.to_string());
+    let key = signal(spec.key.index());
+    let key_options: Vec<String> = crate::settings::HotkeyKey::all()
+        .into_iter()
+        .map(|k| k.to_string())
+        .collect();
     let editor = Element::leaf()
         .reactive()
         .widget(HotkeyEditor {
@@ -1803,7 +3006,7 @@ fn hotkey_row(st: Rc<State>) -> Element {
         .size(0, 0);
     card(vec![row(
         "唤起热键",
-        Some("全局生效，改完立即生效。至少要带一个修饰键"),
+        Some("全局生效，改完立即生效。F1–F12 可单独使用；字母与数字须配修饰键"),
         Element::row()
             .cross(Align::Center)
             .spacing(10)
@@ -1813,10 +3016,18 @@ fn hotkey_row(st: Rc<State>) -> Element {
             .child(Element::checkbox("Alt", alt))
             .child(Element::checkbox("Shift", shift))
             .child(
-                Element::text_input(key, "键")
-                    .width(48)
-                    .font_size(13.0)
-                    .text_align(Align::Center),
+                // 主键用下拉而非文本框。
+                //
+                // 文本框收的是**字符**，而 F1–F12 根本不产生字符：用户按 F1 时框里毫无
+                // 反应（`TextInput` 只把 Up/Down/Tab/PageUp/PageDown 转给 `on_nav_key`，
+                // `Key::Other` 到不了应用），只能手打「F1」两个字母——一个没人猜得到的
+                // 用法。做成按键捕获则要自绘一个控件（框架没有现成的），代价远超收益。
+                //
+                // 下拉框把这件事变回选择题：能选的都合法，选不到的都不合法，也没有
+                // 「填错字」这条错误路径。
+                Element::dropdown(key_options, key)
+                    .width(96)
+                    .font_size(13.0),
             ),
     )])
 }
@@ -2004,6 +3215,9 @@ fn query_box(st: Rc<State>) -> Element {
                 // ——那条限制上游已经解掉了（`675d6d5`），注释一并作废。
                 .autofocus_select_all()
                 .on_submit(move |_ctx| submit_st.submit())
+                // 焦点留在查询框时的键位。**Tab 一律放过**——它是所有 Windows 程序里
+                // 「把焦点交出去」的那个键，占着它，用户就没有任何办法用键盘走进左栏
+                // 列表。补全因此改绑 →，见 `State::accept_completion`。
                 .on_nav_key(move |_ctx, ev| match ev.key {
                     Key::Down => {
                         nav_st.move_cursor(true);
@@ -2013,9 +3227,14 @@ fn query_box(st: Rc<State>) -> Element {
                         nav_st.move_cursor(false);
                         true
                     }
-                    // **Shift+Tab 必须放过**：吞掉它，用户除了鼠标就没有任何办法把焦点
-                    // 移出查询框了。只认裸 Tab。
-                    Key::Tab if !ev.shift => {
+                    // 带 Ctrl 的方向键一律放行，交给窗口级快捷键（`handle_shortcut`
+                    // 里的前进/后退）。**必须排在下面那条裸 → 之前**——match 自上而下，
+                    // 裸 → 那条不看修饰键，排在前面会把 Ctrl+→ 一并吃掉；而在这里
+                    // 「吃掉」意味着 `on_nav_key` 返回 true，窗口级那层就再也收不到它。
+                    Key::Left | Key::Right if ev.ctrl => false,
+                    // 只在补全确实会改变输入时吞掉 →，否则放行让光标正常移动。
+                    // 这个判据是个能自我恢复的近似，理由见 `should_accept_completion`。
+                    Key::Right if nav_st.should_accept_completion() => {
                         nav_st.accept_completion();
                         true
                     }
@@ -2030,6 +3249,13 @@ fn query_box(st: Rc<State>) -> Element {
                 .align(Align::End)
                 .child(
                     crate::icon::button(crate::icon::CLOSE, 26, Role::TextDisabled)
+                        // **退出 Tab 环**。它是查询框的附属物，不是一站独立的目的地：
+                        // 用户按 Tab 是想离开输入框去列表，中间横着一个「清空」既挡路、
+                        // 又危险——焦点停在它上面时按空格/回车就把刚打的词清了。
+                        //
+                        // 鼠标照常可点，清空也仍有键盘路径（选中全部再删）。这不是把
+                        // 功能拿掉，是把它从**键盘导航的主路**上挪开。
+                        .focusable(false)
                         .on_click(move |_ctx| st.clear_query()),
                 )
                 // 空框上放一个「清空」按钮没有意义，且它会盖住占位符的尾部。
@@ -2037,94 +3263,58 @@ fn query_box(st: Rc<State>) -> Element {
         )
 }
 
-/// 候选浮层：点一条即「确定查询词」，触发查询。
-///
-/// **浮在结果之上，不占布局流**。此前它是主列 col 里的一段定高区，出现时把整个结果区
-/// 下推 160px——用户正读着某词的释义，多打一个字母，正文就跳走了。补全是「我想拼的是
-/// 哪个词」的辅助，不该打断「这个词什么意思」的阅读。有道词典也是这么处理的。
-///
-/// 代价不只是视觉遮挡——被盖住的区域**不可点击**（浮层不透明，本就不该穿透），含首张
-/// 卡片的收藏星标与结果区那一段的滚动条命中区；且指针停在浮层上时滚轮无响应，因为
-/// `result_area` 的滚动容器是浮层的**兄弟**而非祖先，冒泡到不了它。
-///
-/// 都可以接受：候选存在的那一刻，用户的注意力本就在选词上，而选中或清空都会立刻收起
-/// 浮层。滚轮那条也正是 `MAX_CANDIDATES` 收到 7 的理由之一——列表短到不需要滚。
-fn candidate_panel(st: Rc<State>) -> Element {
-    let candidates = st.candidates;
-    Element::col()
-        .width_match()
-        // 浮层要**不透明**才盖得住下面的正文。用 Surface 而非 Bg：浮层比底板高一层，
-        // 三套皮肤里 surface 都比 bg 略亮（深色皮肤则略浅），正好表达这层高度差。
-        .bg_role(Role::Surface)
-        .border_role(Role::Border, 1)
-        .corner(12.0)
-        .padding(6)
-        // 投影是「浮起来」的唯一视觉依据——没有它，浮层和被盖住的正文会糊成一片。
-        .shadow(Shadow::new(0.0, 6.0, 18.0, Color::rgba(0, 0, 0, 38)))
-        // `host_signal` 而非 `list_signal`：后者是 `scroll().fill()`，高度只能写死，
-        // 于是候选少时浮层是个大半截空着的盒子。`host_signal` 是普通 col，高度随内容
-        // ——候选几条，浮层就多高。
-        //
-        // 它的容器虽是 `col().fill()`（高度 `Match`），但线性布局会把**主轴上的
-        // `Match` 降级为 `Wrap`**（`core.rs:547-552`，「避免单个子独占整条主轴」），
-        // 故在竖向父容器里高度确实随内容。这是框架写死并带回归测试的规则，不是巧合。
-        //
-        // 上界全靠 `MAX_CANDIDATES` 收住——浮层自己不设限高。
-        // 绑重建计数而非 `candidates` 本身：行要知道自己的下标才能比对键盘游标，而
-        // windui 的列表回调只给 item 不给位置。改用「单元素 Vec 当触发器」这个手法
-        // （设置页同款，见 `bump`），一次回调里自己 `enumerate` 整张表。
-        //
-        // 游标一动也走这条重建：高亮底是构建期定的，只改信号不重建，高亮不会动。
-        // 候选最多 7 条，重建成本可忽略。
-        .child(Element::host_signal(st.cand_rev, move |_rev: u64| {
-            let mut col = Element::col().width_match();
-            let at = st.cursor.get();
-            for (i, c) in st.candidates.get().into_iter().enumerate() {
-                col = col.child(candidate_row(c, i == at, st.clone()));
-            }
-            col
-        }))
-        // 没有候选时**整块收起**。`visible_when` 会让 `measure` 直接返回 `Size::ZERO`
-        // （windui `core.rs` 的 measure 开头就短路），故是真的不占位，不是画成透明。
-        .visible_when(move || !candidates.get().is_empty())
-}
-
-/// 候选浮层的一行：词头 + 释义摘要。
+/// 左栏的一条补全候选：词头 + 释义摘要。
 ///
 /// 不用 `Element::nav_row`——它是「带 chevron 的钻入行」（windui `ui/nav.rs`），而 `›`
 /// 的语义是「进到下一层去」。点候选并不进入任何子页，只是把词填进查询框并查询，人还在
-/// 原地。这与 `side_row` 那里拒绝 `nav_row` 是同一条理由，此处此前漏了。
-fn candidate_row(c: Candidate, at_cursor: bool, st: Rc<State>) -> Element {
+/// 原地。这与 `recall_row` 那里拒绝 `nav_row` 是同一条理由。
+fn candidate_row(c: Candidate, at_cursor: bool, active: bool, st: Rc<State>) -> Element {
     let word = c.headword.as_str().to_string();
     let pick = word.clone();
     let mut row = Element::row()
         .width_match()
-        .height(38)
+        // 与召回行同高，理由见 `left_row`。
+        .height(36)
         .cross(Align::Center)
         .corner(9.0)
         .padding_xy(12, 0)
-        .spacing(12)
+        .spacing(10)
         .clickable()
+        // **退出 Tab 环**。行是 `Clickable`，默认可聚焦——不摘掉的话 Tab 会逐行走过
+        // 四十条候选，而整块列表只该占**一个**焦点位（roving tabindex，见
+        // `ListKeyNav`）：进来一次，之后交给 ↑↓。
+        //
+        // 鼠标点击不受影响：可聚焦与可点击是两件事。
+        .focusable(false)
         .on_click(move |_ctx| {
-            // 选中候选 = 查询词确定 → 此刻才查询源出场，且浮层收起。
-            st.select(&pick);
+            // 选中候选 = 查询词确定 → 此刻才查询源出场。游标一并挪过来，见
+            // `State::pick_candidate`。
+            st.pick_candidate(&pick);
         });
-    // 键盘游标所在的那条。与侧栏选中行同一套视觉（强调色淡底），因为回答的是同一个
-    // 问题：「回车会选中哪一条」。
-    if at_cursor {
+    // 两档淡底，回答两个不同的问题；同时成立时取满档（「正在看」压过「将要选」）。
+    // 取值与层次的理由见 `CURSOR_SOFT_A`。
+    if active {
         row = row.bg_role_alpha(Role::Accent, ACCENT_SOFT_A);
+    } else if at_cursor {
+        row = row.bg_role_alpha(Role::Accent, CURSOR_SOFT_A);
     }
     row = row.child(
         Element::label(word)
+            // 加粗只给 `active`：它标的是「正在看这条」，与召回行一致。游标那条靠淡底
+            // 就够——两处都加粗会让一列候选出现两个同样重的词，反而看不出主次。
             .font_size(14.0)
-            .font_weight(if at_cursor { 600 } else { 500 })
+            .font_weight(if active { 600 } else { 500 })
             .fg_role(Role::Text)
             // 定宽让释义摘要对齐成一栏。词头长短不一（`make` 与 `makeshift` 差一倍），
             // 不定宽的话每行的摘要起点各不相同，一列候选读下来是锯齿状的——而候选列表
             // 的用法正是**竖着快速扫**，对不齐直接抵消它的价值。
             //
-            // 超长词头照常把摘要推开，不截断：认出这是不是我要的那个词，靠的是词头本身。
-            .min_width(120),
+            // 从 120 收到 88：浮层年代这一行有整个主列的宽度，如今它在 280px 的左栏
+            // 里，扣掉内边距与间距只剩 236——留 120 给词头，摘要就只剩百来像素，
+            // 「一眼认出是不是我要的那个词」这件事做不成了。88 放得下六七个字母／三个
+            // 汉字，覆盖绝大多数词头，超长的照常把摘要推开、不截断：认出这是不是我要
+            // 的那个词，最终靠的是词头本身。
+            .min_width(88),
     );
     // 释义摘要单行截断：它是判断「是不是我要的那个词」的依据，不是正文。让它换行会把
     // 行高撑开，一屏就列不下几条了——而候选列表的价值恰恰在于一眼扫过多条。
@@ -2141,17 +3331,34 @@ fn candidate_row(c: Candidate, at_cursor: bool, st: Rc<State>) -> Element {
     row
 }
 
-/// 结果区：提示 + 词头卡片。
+/// 结果区：提示 + 页签空态 + 词头卡片。
+///
+/// 吃的是 `visible_cards` 而非 `cards`——前者是后者经右栏页签筛过的派生信号，见
+/// `State::refilter_cards`。
 fn result_area(st: Rc<State>) -> Element {
-    let cards = st.cards;
+    let (cards, fnote) = (st.visible_cards, st.filter_note);
     Element::col()
         .fill()
+        // 左右 28px。这个值管的是**正文与栏边缘**的距离，两侧对称——正文铺满不等于
+        // 顶到边框上，那样读起来局促。设计稿此处是 40px，那是在更宽的画布上。
+        // 它此前挂在主列上，两栏之后主列没了，落到这里。
+        .padding_xy(28, 14)
         .spacing(6)
         .child(
             Element::label_signal(st.hint)
                 .fg_role(Role::TextMuted)
                 .height(20)
                 .width_match(),
+        )
+        // 页签筛空时的说明，与 `hint` 各占一行、各说各的：`hint` 讲的是查询本身
+        // （未收录、经原形命中），这一行讲的是「你现在停在哪个页签」。塞进同一个信号
+        // 会让两种状态互相覆盖——而它们完全可能同时成立（查到了词、但停在空的方向页）。
+        .child(
+            Element::label_signal(fnote)
+                .font_size(13.0)
+                .fg_role(Role::TextMuted)
+                .width_match()
+                .visible_when(move || !fnote.get().is_empty()),
         )
         .child(scroll_area(
             Element::host_signal(cards, move |c: Card| card_view(c, st.clone())).width_match(),
@@ -2172,10 +3379,15 @@ fn card_view(c: Card, st: Rc<State>) -> Element {
             .width_match()
             .spacing(14)
             .child(
-                Element::label(hw.to_string())
-                    .font_size(HEADWORD_SIZE)
-                    .font_family(SERIF)
-                    .fg_role(Role::Text)
+                // 词头也走富文本，为的是它能被选中复制——查完一个词顺手复制词头是
+                // 常见动作，而它此前是唯一一处「看得见、选不中」的正文。
+                //
+                // 不与下方释义合成一篇：星标要与词头**同一行**并排，而富文本里放不进
+                // 一个按钮。代价是选区不能从词头一路拖到释义，可以接受。
+                Element::rich(headword_doc(&hw))
+                    .copy_menu(true)
+                    // 同 `selectable`：不进焦点环，Ctrl+C 就复制不了词头。
+                    .focusable(true)
                     .weight(1.0),
             )
             .child(star(c.fav, hw.clone(), st.clone())),
@@ -2198,6 +3410,19 @@ fn card_view(c: Card, st: Rc<State>) -> Element {
         col = col.child(note_field(hw, st));
     }
     col
+}
+
+/// 词头：全屏最大的那几个字。
+fn headword_doc(hw: &Headword) -> RichDoc {
+    RichDoc::new()
+        .style(
+            SPAN_HEADWORD,
+            SpanStyle::new()
+                .size(HEADWORD_SIZE)
+                .family(SERIF)
+                .fg(RichColor::Text),
+        )
+        .para(Para::new().styled(SPAN_HEADWORD, hw.as_str().to_string()))
 }
 
 /// 收藏备注输入框。
@@ -2295,28 +3520,17 @@ fn entry_view(e: Entry, expanded: Signal<bool>) -> Element {
             let mut col = Element::col().spacing(8).width_match();
             // 音标与词性同一行：它们都是「这个词是什么」的元信息，与释义分属两层。
             if x.phonetic.is_some() || x.pos.is_some() {
-                let mut meta = Element::row()
-                    .cross(Align::Center)
-                    .spacing(12)
-                    .width_match();
-                if let Some(p) = &x.phonetic {
-                    meta = meta.child(
-                        Element::label(format!("[{p}]"))
-                            .font_size(15.0)
-                            .fg_role(Role::TextMuted),
-                    );
-                }
-                // 词性用衬线 + 强调色。设计稿此处是斜体，而 windui 没有斜体 API
-                // （`font_style`/`italic` 全无），故改由字族与颜色承载这份身份。
-                if let Some(pos) = &x.pos {
-                    meta = meta.child(
-                        Element::label(pos.clone())
-                            .font_size(15.0)
-                            .font_family(SERIF)
-                            .fg_role(Role::Accent),
-                    );
-                }
-                col = col.child(meta);
+                col = col.child(selectable(en_meta_doc(&x)));
+            }
+            // 分级徽章紧跟音标：两者都在回答「这是个什么词」，而释义回答的是
+            // 「它什么意思」。放到词形变化之后会把这两段元信息劈开。
+            //
+            // **它与词形变化都留在富文本之外**，仍是 Element。两者是**徽章**不是正文：
+            // 星级是重复的星形、考试标签是一组彩色小块，它们的意义在形状与颜色里，
+            // 拖选出来只会得到一串没有上下文的短词（「牛津 3 CET4」）。可选中的是
+            // 释义，不是装饰。
+            if !x.grading.is_empty() {
+                col = col.child(grading_row(&x.grading));
             }
             // 词形变化：made / making / makes 这些数据一直躺在库里，界面上却一个字
             // 都没有。ADR-0001 当初选 ECDICT，理由之一正是它自带 `exchange`——只用在
@@ -2324,115 +3538,172 @@ fn entry_view(e: Entry, expanded: Signal<bool>) -> Element {
             if !x.inflections.derived.is_empty() {
                 col = col.child(inflection_row(&x.inflections.derived));
             }
-            // 中文释义按词性分节呈现。整块塞进一个 label 会让 `vt.` `n.` 沦为混在
-            // 中文里的普通字符，所有信息挤在同一层次——那正是「看着像一坨文本」的来源。
+            // 中文释义整块是**一段富文本**，各词性各成一 Para。整块而非逐行，正是为了
+            // 能从第一条释义一直拖选到最后一条——「复制这个词的全部释义」是查词典最
+            // 常见的一个动作，逐行切成独立控件就永远只能一条条来。
             if let Some(zh) = &x.zh_definition {
-                for g in crate::domain::parse_glosses(zh) {
-                    col = col.child(gloss_row(&g));
+                let glosses = crate::domain::parse_glosses(zh);
+                if !glosses.is_empty() {
+                    col = col.child(selectable(zh_def_doc(&glosses)));
                 }
             }
             // 英英释义默认折叠，用户主动展开才可见——这是刻意的产品决定，非偷懒。
+            //
+            // 用 `Element::collapsible` 而不是 `RichDoc::section`：后者的信号语义是
+            // **collapsed**（true = 收起），而本项目的 `ExpandedStates` 存的是
+            // expanded（true = 展开）。同一个信号不可能两种读法，而翻转语义要动
+            // `ExpandedStates` 及其那一串「展开态活过重建」的测试——为省一层嵌套去动
+            // 那块，不划算。
             if let Some(en) = &x.en_definition {
                 col = col.child(Element::collapsible(
                     "英英释义",
                     expanded,
                     // 这一段单独限宽，理由见 `EN_DEF_MAX_W`：整屏正文里只有它是成句的
                     // 英文散文，行长失控的风险是真的。
-                    Element::label(en.clone())
-                        .width_match()
-                        .max_width(EN_DEF_MAX_W)
-                        .line_height(BODY_LH),
+                    selectable(en_def_doc(en)).max_width(EN_DEF_MAX_W),
                 ));
             }
             col
         }
-        Entry::Chinese(x) => {
-            let mut col = Element::col().spacing(8).width_match();
-            // 拼音是中文词条的「音标」，与英汉分支同一层级，故用同一档字号。
-            col = col.child(
-                Element::label(format!("[{}]", x.pinyin))
-                    .font_size(15.0)
-                    .fg_role(Role::TextMuted)
-                    .width_match(),
-            );
-            // 繁体与词头不同才展示——相同时显示两遍是噪音。
-            if x.traditional != x.headword.as_str() {
-                col = col.child(
-                    Element::label(format!("繁体：{}", x.traditional))
-                        .fg_role(Role::TextMuted)
-                        .height(20)
-                        .width_match(),
-                );
-            }
-            // 英文释义按义项分行。`;` 分隔的是同一义项的不同措辞，不另起一行。
-            for (i, s) in x.senses.iter().enumerate() {
-                col = col.child(
-                    Element::label(format!("{}. {}", i + 1, join(s)))
-                        .font_size(18.0)
-                        .font_weight(500)
-                        .line_height(BODY_LH)
-                        .width_match(),
-                );
-            }
-            if !x.classifiers.is_empty() {
-                col = col.child(
-                    Element::label(format!("量词：{}", x.classifiers.join("、")))
-                        .fg_role(Role::TextMuted)
-                        .height(20)
-                        .width_match(),
-                );
-            }
-            col
-        }
+        // 汉英词条整条就是一段富文本——它没有徽章类内容（CC-CEDICT 只有繁简、拼音、
+        // 释义、量词四样，全是文字），故拼音到量词可以一气选到底。
+        Entry::Chinese(x) => selectable(chinese_doc(&x)).width_match(),
     }
 }
 
-/// 一组同词性的释义：词性胶囊 + 释义正文。
-fn gloss_row(g: &crate::domain::Gloss) -> Element {
-    let mut row = Element::row().width_match().cross(Align::Start).spacing(10);
-    if let Some(pos) = &g.pos {
-        row = row.child(pos_chip(pos));
+/// 把一篇富文本装成可选中、可复制的控件。
+///
+/// 三处词条内容都经由这里，为的是「能选中」这件事不会漏在某一段上——那种漏法在界面上
+/// 看不出来，只有用户去拖选时才发现某一段拖不动。
+///
+/// `copy_menu(true)` 开右键菜单（复制选区 / 全选）。仅靠 Ctrl+C 不够：这一屏没有别的
+/// 右键菜单，用户在释义上点右键期待的就是复制。
+fn selectable(doc: RichDoc) -> Element {
+    Element::rich(doc)
+        .copy_menu(true)
+        // **强制进焦点环**，否则 Ctrl+C 到不了它。
+        //
+        // windui 的 `RichText::focusable()` 只在文档含可折叠 Section 时为真（纯静态
+        // 文本不占焦点位，这个默认对绝大多数应用是对的）。而它的 `on_event` 里
+        // Ctrl+C / Ctrl+A 的处理是齐全的——键盘事件只发给焦点节点，于是那段代码在
+        // 词典正文上永远跑不到：能用鼠标划选、能用右键菜单复制，独独 Ctrl+C 没反应。
+        //
+        // 代价是 Tab 会经过右栏的每一段正文。可以接受：它们在左栏之后，不挡「输入框
+        // → 列表」那条主路；而「Tab 到一段正文、Ctrl+C 复制它」本身是合理的键盘路径。
+        .focusable(true)
+        .width_match()
+        .line_height(BODY_LH)
+}
+
+/// 英汉词条的元信息：音标 + 词性。
+fn en_meta_doc(x: &crate::domain::EnglishEntry) -> RichDoc {
+    let mut para = Para::new();
+    if let Some(p) = &x.phonetic {
+        para = para.styled(SPAN_PHONETIC, format!("[{p}]"));
     }
-    row.child(
+    // 词性用衬线 + 强调色。设计稿此处是斜体，而 windui 没有斜体 API
+    // （`font_style`/`italic` 全无），故改由字族与颜色承载这份身份。
+    if let Some(pos) = &x.pos {
+        if x.phonetic.is_some() {
+            para = para.text("  ");
+        }
+        para = para.span(
+            pos.clone(),
+            SpanStyle::new()
+                .size(15.0)
+                .family(SERIF)
+                .fg(RichColor::Accent),
+        );
+    }
+    RichDoc::new()
+        .style(
+            SPAN_PHONETIC,
+            SpanStyle::new().size(15.0).fg(RichColor::Muted),
+        )
+        .para(para)
+}
+
+/// 英汉词条的中文释义：每个词性一段，悬挂缩进对齐。
+fn zh_def_doc(glosses: &[crate::domain::Gloss]) -> RichDoc {
+    let mut doc = RichDoc::new()
+        // 词性胶囊。`chip()` 的底与圆角由 rich 主题给，故这里只定字号、字重与颜色——
+        // 保留强调色是因为词性是查词典时的主要扫视目标（「我要的是动词那一条」）。
+        .style(
+            SPAN_POS,
+            SpanStyle::new()
+                .size(12.5)
+                .weight(600)
+                .fg(RichColor::Accent)
+                .chip(),
+        )
+        .style(SPAN_BODY, SpanStyle::new().size(18.0).weight(500));
+    for (i, g) in glosses.iter().enumerate() {
+        let mut para = Para::new();
+        if let Some(pos) = &g.pos {
+            para = para.styled(SPAN_POS, pos.clone()).text(" ");
+        }
         // 释义之间用顿号而非原文的逗号：中文并列用顿号，且与释义内部可能出现的
         // 逗号区分得开。
-        Element::label(g.senses.join("、"))
-            .font_size(18.0)
-            .font_weight(500)
-            .line_height(BODY_LH)
-            .weight(1.0),
-    )
+        para = para
+            .styled(SPAN_BODY, g.senses.join("、"))
+            .hanging(GLOSS_HANGING);
+        // 段间距只加在第二段起：首段上面已经有容器的 spacing，再加一次就多出一截。
+        if i > 0 {
+            para = para.spacing_before(8);
+        }
+        doc = doc.para(para);
+    }
+    doc
 }
 
-/// 词性胶囊。
-///
-/// 改成淡底无边框，并与词形变化那排（`inflection_row`）用同一套底色与圆角——两者都是
-/// 「挂在释义旁边的小标记」，此前一个描边、一个填底，同屏并列时像两套不相干的控件。
-///
-/// **定宽**：`vt.` `vi.` `n.` `adj.` 宽度各不相同，不定宽的话每一节的释义正文起始位置
-/// 都错开，读下来左边缘是锯齿状的。给一个够装 `adj.` 的下限，释义便对齐成一栏。
-///
-/// 保留强调色：词性是查词典时的主要扫视目标（「我要的是动词那一条」），它值得一个
-/// 与正文不同的颜色。去掉的只是衬线——那份「典籍感」由词头独自承担就够了，散在
-/// 小胶囊上只是把界面搅得字族杂乱。
-fn pos_chip(pos: &str) -> Element {
-    Element::label(pos)
-        .font_size(12.5)
-        .font_weight(600)
-        .fg_role(Role::Accent)
-        .bg_role(Role::SurfaceAlt)
-        .corner(6.0)
-        .padding_xy(8, 4)
-        .min_width(42)
-        .text_align(Align::Center)
-        // 往下挪 4px 与释义首行对齐。
-        //
-        // 释义带 `BODY_LH`（1.7）行高，18px 的字排在一个约 31px 的行盒里、上下各留一段
-        // 空隙；胶囊只有约 23px 高且没有行高加成。父行是 `Align::Start`，两者**顶边**
-        // 对齐，于是胶囊的视觉中心比释义首行的高出约 4px——看起来像浮在字的上方。
-        // 差值补在这里，而不是去动 `cross`：改成 `Center` 会让多行释义把胶囊拽到段落
-        // 正中，那比偏上更糟。
-        .margin_xy(0, 4)
+/// 英英释义：一段成句的英文散文。
+fn en_def_doc(en: &str) -> RichDoc {
+    RichDoc::new()
+        .style(SPAN_BODY, SpanStyle::new().size(15.0))
+        .para(Para::new().styled(SPAN_BODY, en.to_string()))
+}
+
+/// 汉英词条的全部内容：拼音、繁体、义项、量词。
+fn chinese_doc(x: &crate::domain::ChineseEntry) -> RichDoc {
+    let mut doc = RichDoc::new()
+        // 拼音是中文词条的「音标」，与英汉分支同一层级，故用同一档字号。
+        .style(
+            SPAN_PHONETIC,
+            SpanStyle::new().size(15.0).fg(RichColor::Muted),
+        )
+        .style(SPAN_NOTE, SpanStyle::new().size(13.0).fg(RichColor::Muted))
+        .style(SPAN_INDEX, SpanStyle::new().size(18.0).fg(RichColor::Muted))
+        .style(SPAN_BODY, SpanStyle::new().size(18.0).weight(500))
+        .para(Para::new().styled(SPAN_PHONETIC, format!("[{}]", x.pinyin)));
+    // 繁体与词头不同才展示——相同时显示两遍是噪音。
+    if x.traditional != x.headword.as_str() {
+        doc = doc.para(
+            Para::new()
+                .styled(SPAN_NOTE, format!("繁体：{}", x.traditional))
+                .spacing_before(6),
+        );
+    }
+    // 英文释义按义项分段。`;` 分隔的是同一义项的不同措辞，不另起一段。
+    //
+    // 序号单独一个 span：它是界面加的编号、不是词典原文，用弱化色与释义拉开一档，
+    // 拖选复制时也仍在文本里——那正是用户想要的（「1. May」比孤零零一个 May 好读）。
+    for (i, s) in x.senses.iter().enumerate() {
+        doc = doc.para(
+            Para::new()
+                .styled(SPAN_INDEX, format!("{}. ", i + 1))
+                .styled(SPAN_BODY, join(s))
+                .hanging(24)
+                .spacing_before(if i == 0 { 10 } else { 6 }),
+        );
+    }
+    if !x.classifiers.is_empty() {
+        doc = doc.para(
+            Para::new()
+                .styled(SPAN_NOTE, format!("量词：{}", x.classifiers.join("、")))
+                .spacing_before(8),
+        );
+    }
+    doc
 }
 
 /// 词形变化一排。
@@ -2462,6 +3733,80 @@ fn inflection_row(derived: &[(crate::domain::InflectionKind, Headword)]) -> Elem
     row
 }
 
+/// 词汇分级一排：柯林斯星级、牛津核心词、考试大纲、词频排名。
+///
+/// 这些数据此前压根没进词库——构建期就被丢掉了（见 docs/adr/0010 的修订）。补回来
+/// 是因为它们回答的是查词时的**第二个问题：这词要紧吗**。柯林斯星级与牛津核心说的是
+/// 重要度，考试大纲说的是「什么阶段该会」，词频给的是客观排名。
+///
+/// 与 [`inflection_row`] 共用同一套底色、圆角与内边距：两者都是「挂在词条上的小标记」，
+/// 同屏并列时必须看起来属于同一类东西，否则界面像拼了两套不相干的控件。
+fn grading_row(g: &crate::domain::Grading) -> Element {
+    let mut row = Element::row().width_match().cross(Align::Center).spacing(8);
+
+    // 星级用实心星重复而非写数字：五颗星一眼可数，数字还要在心里换算一次。
+    //
+    // `min(5)` 不是多余的防御。词库可以被**外部文件整体替换**（设置页支持指定词库
+    // 路径，且本项目的 schema 已对齐上游格式，第三方库都能装进来），那些库里的
+    // collins 是否守在 1–5 内，不由我们说了算——不钳住就可能画出一屏的星。
+    if let Some(n) = g.collins {
+        row = row.child(
+            Element::row()
+                .cross(Align::Center)
+                .spacing(5)
+                .bg_role(Role::SurfaceAlt)
+                .corner(6.0)
+                .padding_xy(9, 4)
+                .child(
+                    Element::label("柯林斯")
+                        .font_size(11.5)
+                        .fg_role(Role::TextMuted),
+                )
+                .child(
+                    Element::label("★".repeat(n.min(5) as usize))
+                        .font_size(12.0)
+                        .fg_role(Role::Accent),
+                ),
+        );
+    }
+
+    // 牛津三千是个是非题、没有等级，故只在为真时出现。用强调色与考试大纲拉开层级：
+    // 它标的是「核心词汇」这一身份，比「考四级会考到」更根本。
+    if g.oxford {
+        row = row.child(grading_chip("牛津核心", Role::Accent, 600));
+    }
+
+    // 大纲标签已在领域层按学习阶段排好序（`ExamTag::rank`），此处照序渲染即可——
+    // 库里存的是录入顺序，直接铺出来读起来没有递进感。
+    for t in &g.tags {
+        row = row.child(grading_chip(t.label(), Role::TextMuted, 500));
+    }
+
+    // 只显示当代语料库词频（`frq`），不并列 BNC：两个都画就是两串没有单位的数字并排，
+    // 读者无从分辨谁是谁。BNC 已经存进库里（[`crate::domain::Grading::bnc`]），要用时
+    // 随时可取——它统计的是数百年间的英文资料，读旧书时比 `frq` 更有参考价值。
+    if let Some(f) = g.frq {
+        row = row.child(
+            Element::label(format!("词频 {f}"))
+                .font_size(11.5)
+                .fg_role(Role::TextDisabled),
+        );
+    }
+
+    row
+}
+
+/// 分级徽章：淡底小标签。
+fn grading_chip(text: &str, fg: Role, weight: u16) -> Element {
+    Element::label(text)
+        .font_size(11.5)
+        .font_weight(weight)
+        .fg_role(fg)
+        .bg_role(Role::SurfaceAlt)
+        .corner(6.0)
+        .padding_xy(9, 4)
+}
+
 /// 义项内的多种措辞用 `;` 连回去——它们是同一含义的不同说法，不是不同义项。
 fn join(s: &Sense) -> String {
     s.glosses.join("; ")
@@ -2470,12 +3815,11 @@ fn join(s: &Sense) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        expand_key, group_by_headword, headwords_to_record, scroll_area, signal, write_note,
-        ExpandedStates, Role,
+        card_in_tab, clamp_left_w, dict_tab_label, expand_key, group_by_headword,
+        headwords_to_record, scroll_area, signal, write_note, Card, ExpandedStates, NavPath, Role,
+        DICT_ALL, DICT_EN_ZH, DICT_ZH_EN, RIGHT_MIN_W,
     };
-    use crate::domain::{
-        ChineseEntry, EnglishEntry, Entry, Grading, Headword, Inflections, Sense,
-    };
+    use crate::domain::{ChineseEntry, EnglishEntry, Entry, Grading, Headword, Inflections, Sense};
 
     fn 英汉(词头: &str) -> Entry {
         Entry::English(EnglishEntry {
@@ -2674,6 +4018,211 @@ mod tests {
         write_note(text, tone, Role::Danger, "清空历史失败：库已锁定");
         assert_eq!(text.get(), "清空历史失败：库已锁定");
         assert_eq!(tone.get(), Role::Danger, "失败消息该是 Danger 角色");
+    }
+
+    fn 卡片(entries: Vec<Entry>) -> Card {
+        Card {
+            headword: entries[0].headword().clone(),
+            fav: false,
+            entries,
+        }
+    }
+
+    #[test]
+    fn 全部页收下两个方向的卡片() {
+        let en = 卡片(vec![英汉("apple")]);
+        let zh = 卡片(vec![汉英("苹果", "ping2 guo3")]);
+        assert!(card_in_tab(&en, DICT_ALL));
+        assert!(card_in_tab(&zh, DICT_ALL));
+    }
+
+    #[test]
+    fn 方向页只收该方向的卡片() {
+        let en = 卡片(vec![英汉("apple")]);
+        let zh = 卡片(vec![汉英("苹果", "ping2 guo3")]);
+        assert!(card_in_tab(&en, DICT_EN_ZH), "英汉卡片该留在英汉页");
+        assert!(!card_in_tab(&zh, DICT_EN_ZH), "汉英卡片不该出现在英汉页");
+        assert!(card_in_tab(&zh, DICT_ZH_EN), "汉英卡片该留在汉英页");
+        assert!(!card_in_tab(&en, DICT_ZH_EN), "英汉卡片不该出现在汉英页");
+    }
+
+    /// 页签越界不 panic，且**收全部**而非筛空。
+    ///
+    /// 越界本不该发生（页签由 `TabBar` 写，取值受标签数约束），但这条兜底的取向是
+    /// 刻意的：一屏该有的词条全在，比一屏莫名其妙的空白好查得多。
+    #[test]
+    fn 越界页签收全部而非筛空() {
+        let en = 卡片(vec![英汉("apple")]);
+        assert!(card_in_tab(&en, 99));
+        assert_eq!(dict_tab_label(99), "任何");
+    }
+
+    fn 走过(词们: &[&str]) -> NavPath {
+        let mut p = NavPath::default();
+        for w in 词们 {
+            p.push(w);
+        }
+        p
+    }
+
+    #[test]
+    fn 空路径哪边都走不动() {
+        let p = NavPath::default();
+        assert!(!p.can_go(false));
+        assert!(!p.can_go(true));
+    }
+
+    #[test]
+    fn 查了一个词仍无处可退() {
+        let p = 走过(&["apple"]);
+        assert!(!p.can_go(false), "只走过一步，脚下就是起点");
+        assert!(!p.can_go(true));
+    }
+
+    #[test]
+    fn 后退回到上一个词再前进回来() {
+        let mut p = 走过(&["apple", "banana", "cherry"]);
+        assert_eq!(p.go(false).as_deref(), Some("banana"));
+        assert_eq!(p.go(false).as_deref(), Some("apple"));
+        assert!(!p.can_go(false), "退到起点就不能再退");
+        assert_eq!(p.go(true).as_deref(), Some("banana"));
+        assert_eq!(p.go(true).as_deref(), Some("cherry"));
+        assert!(!p.can_go(true), "走到末端就不能再进");
+    }
+
+    /// 连查同一个词不该在路径上堆台阶——否则按后退会「原地不动」好几下。
+    #[test]
+    fn 重复查同一个词不堆台阶() {
+        let p = 走过(&["apple", "apple", "apple"]);
+        assert!(!p.can_go(false), "三次都是同一个词，路径上只该有一步");
+    }
+
+    /// 浏览器语义：回退之后再查新词，原先那段前进路径作废。
+    #[test]
+    fn 回退后查新词截断前进路径() {
+        let mut p = 走过(&["apple", "banana", "cherry"]);
+        p.go(false); // 退到 banana
+        assert!(p.can_go(true), "前提：此刻 cherry 还在前面");
+        p.push("durian");
+        assert!(!p.can_go(true), "查了新词，cherry 那段该没了");
+        assert_eq!(
+            p.go(false).as_deref(),
+            Some("banana"),
+            "后退仍回得到 banana"
+        );
+    }
+
+    /// 退回去之后**原地**再查同一个词：不该截断，也不该新增。
+    ///
+    /// 这一条守的是 `push` 里那两步的**顺序**——先判重、再截断。反过来的话，
+    /// 「后退到 banana 再点一次 banana」会把 cherry 截掉，而用户什么也没改变。
+    #[test]
+    fn 后退后重查当前词不动路径() {
+        let mut p = 走过(&["apple", "banana", "cherry"]);
+        p.go(false); // 退到 banana
+        p.push("banana");
+        assert!(p.can_go(true), "原地重查不该截断前进路径");
+        assert_eq!(p.go(true).as_deref(), Some("cherry"));
+    }
+
+    /// 栏宽的硬边界：设置库被手改成荒唐值时也不能让界面不可用。
+    #[test]
+    fn 栏宽钳在硬边界内() {
+        use crate::settings::{LEFT_PANE_W_MAX, LEFT_PANE_W_MIN};
+        // root_w = 0 表示「还没布局过」，此时只施加硬边界，不按一个不存在的窗口宽算。
+        assert_eq!(clamp_left_w(5, 0), LEFT_PANE_W_MIN);
+        assert_eq!(clamp_left_w(5000, 0), LEFT_PANE_W_MAX);
+        assert_eq!(clamp_left_w(300, 0), 300, "区间内的值原样通过");
+    }
+
+    /// 无论怎么拖，右栏都得留得下能读的宽度。
+    #[test]
+    fn 栏宽给右栏留足可读宽度() {
+        const 窗口宽: i32 = 900;
+        // 往右拖到底：左栏最多吃到 窗口宽 - RIGHT_MIN_W。
+        assert_eq!(clamp_left_w(9999, 窗口宽), 窗口宽 - RIGHT_MIN_W);
+        // 再往右一点也不行——这条断言守的是「拖到边界就停住」，不是某个具体数值。
+        assert!(
+            clamp_left_w(9999, 窗口宽) + RIGHT_MIN_W <= 窗口宽,
+            "左栏加右栏下限不该超过窗口"
+        );
+    }
+
+    /// 极窄窗口下两个下限打架时，左栏保住自己的下限。
+    ///
+    /// 720 是 `main.rs` 的窗口宽下限，此处特意取一个比它更窄的值：窗口尺寸下限是
+    /// 靠平台约束保证的，而这个函数不该依赖那个保证才不出错。
+    #[test]
+    fn 极窄窗口下左栏保住下限() {
+        use crate::settings::LEFT_PANE_W_MIN;
+        // 400 的窗口减去 RIGHT_MIN_W 已是负数，cap 会低于下限。
+        assert_eq!(clamp_left_w(300, 400), LEFT_PANE_W_MIN);
+        assert_eq!(clamp_left_w(50, 400), LEFT_PANE_W_MIN);
+    }
+
+    /// 左栏那份列表与设置页正文同构：`scroll_area` 装在竖向容器里靠 `weight` 拿高度，
+    /// 故同一个坑它也踩得到。
+    ///
+    /// 守的是结果：查询框、分段控件、空态行占掉固定高之后，列表的视口高必须**等于
+    /// 剩余**，底边落在栏内。若哪天误把 `weight` 写成 `.fill()`，视口会按整条栏高
+    /// 解析、底边越出栏外，症状是「左栏滚到底还差一截看不见」，差值恰好等于上方那些
+    /// 固定高兄弟之和。详见 `scroll_area` 的文档注释。
+    ///
+    /// 骨架照抄 `left_list` 的 `scroll_area(host_signal(…))`，**不是** `list_signal`
+    /// ——后者内部 `set_widget(DynList)` 会把 `Element::scroll()` 默认挂的
+    /// `ScrollWidget` 顶掉，滚动条画得出来却抓不住（滚轮仍可用，因为它走
+    /// `Tree::scroll_target`，只认 `Layout::Scroll`）。左栏一度就是这么写的，
+    /// 表现为「历史列表拖不动」。这条测试守不住那个缺陷（widget 类型在 `Tree` 层
+    /// 查不到），但骨架保持一致，至少读到这里的人不会再照着 `list_signal` 抄回去。
+    #[test]
+    fn 左栏列表的视口不越出栏底() {
+        use windui::core::Tree;
+        use windui::prelude::{signal, Element, Size};
+        use windui::text::NullTextEngine;
+
+        const 栏高: i32 = 400;
+        const 头部高: i32 = 90;
+        const 行高: i32 = 36;
+        const 行数: i32 = 30;
+
+        let rows = signal((0..行数).map(|i| format!("词{i}")).collect::<Vec<_>>());
+        // 左栏骨架：一块固定高的头部（查询框 + 分段控件）+ 靠 weight 拿高度的滚动列表。
+        let 栏 = Element::col()
+            .fill()
+            .child(Element::leaf().width_match().height(头部高))
+            .child(scroll_area(
+                Element::host_signal(rows, move |s: String| {
+                    Element::label(s).width_match().height(行高)
+                })
+                .width_match(),
+            ));
+
+        let mut tree = Tree::new();
+        let root = 栏.build(&mut tree);
+        tree.root = Some(root);
+        tree.layout_root(
+            Size::new(crate::settings::LEFT_PANE_W_DEFAULT, 栏高),
+            &mut NullTextEngine,
+        );
+
+        let 列表 = tree.get(root).unwrap().children[1];
+        assert_eq!(
+            tree.get(列表).unwrap().bounds.h,
+            栏高 - 头部高,
+            "视口高该是扣掉头部后的剩余；等于栏高说明主轴 Match 又拿了整条"
+        );
+        assert_eq!(
+            tree.get(列表).unwrap().bounds.bottom(),
+            栏高,
+            "视口底边不该越出栏底"
+        );
+
+        let (_, 最大滚动) = tree.scroll_range(列表).expect("scroll_area 应是滚动容器");
+        assert_eq!(
+            最大滚动,
+            行高 * 行数 - (栏高 - 头部高),
+            "可滚动量按真实视口高算；视口多算一截，这里就少一截"
+        );
     }
 
     /// 回归：设置页滚到底仍有一截正文看不见，差值恰好是页头的高度。
