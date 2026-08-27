@@ -88,7 +88,7 @@
 - Existing components to reuse:
   - title bar/window buttons, query input, candidate panel, result card, star button, settings rows, skin cards.
 - New/changed components:
-  - Left pane: query input, an empty-state line, one shared list, and the segmented 候选/历史/收藏 control at the bottom (below the list, so Tab out of the query field lands on the list).
+  - Left pane: query input, an empty-state line, one shared list, and the segmented 查询/历史/收藏 control (the first segment is labelled 查询, not 候选: 候选 is the internal term for what completion produces, and putting it on screen reads as a different thing) at the bottom (below the list, so Tab out of the query field lands on the list).
   - Right pane: direction tab bar (全部/英汉/汉英) filtering the already-fetched cards; it never re-routes the query. Entry bodies are rich text (selectable); grading and inflection badges remain regular elements.
   - Draggable splitter between the panes; it draws the divider line itself so it can thicken on hover.
   - Full-width notice strip at the bottom, since its sources span both panes.

@@ -1016,18 +1016,13 @@ impl ExpandedStates {
 }
 
 impl State {
-    /// 点一条候选：把键盘游标挪到它身上，然后查询。
-    ///
-    /// 挪游标不是可有可无的装饰。游标回答「回车会选中哪一条」，而用户刚用鼠标选定了
-    /// 一条——此刻若游标还停在原处，按回车会跳去查另一个词，这是实打实的错误动作。
-    /// 顺带也让两档高亮在鼠标路径下重合，见 `CURSOR_SOFT_A`。
-    ///
-    /// 按词头回查下标而不是把下标编进行数据：候选最多 `MAX_CANDIDATES` 条，一次线性
-    /// 查找的代价可以忽略，而多一个字段就多一处要与列表顺序保持同步的东西。
-    /// 点左栏的一行：把游标挪到它身上、把键盘焦点交给列表，然后查询并记历史。
+    /// 点左栏的一行：把游标挪到它身上、把键盘焦点交给列表，然后查询。
     ///
     /// **交焦点**是为了鼠标与键盘能接上：用户点了一行之后，多半接着想用 ↑↓ 继续看
     /// 相邻的词——若焦点还留在查询框（或哪儿都不在），方向键就落不到列表上。
+    ///
+    /// **挪游标**同样不是装饰，理由见 [`pick_candidate`](Self::pick_candidate)；
+    /// 按词头回查下标的取舍也一并写在那里。
     fn focus_row(&self, word: &str) {
         bump(self.focus_list);
         if let Some(i) = self
@@ -1049,6 +1044,14 @@ impl State {
         }
     }
 
+    /// 点一条候选：把键盘游标挪到它身上，然后查询。
+    ///
+    /// 挪游标不是可有可无的装饰。游标回答「回车会选中哪一条」，而用户刚用鼠标选定了
+    /// 一条——此刻若游标还停在原处，按回车会跳去查另一个词，这是实打实的错误动作。
+    /// 顺带也让两档高亮在鼠标路径下重合，见 `CURSOR_SOFT_A`。
+    ///
+    /// 按词头回查下标而不是把下标编进行数据：候选最多 `MAX_CANDIDATES` 条，一次线性
+    /// 查找的代价可以忽略，而多一个字段就多一处要与列表顺序保持同步的东西。
     fn pick_candidate(&self, word: &str) {
         // 点候选同样把焦点交给列表，理由见 `focus_row`。
         bump(self.focus_list);
@@ -1148,10 +1151,6 @@ impl State {
         self.row_word(self.cursor.get())
     }
 
-    /// Tab：把游标那条候选填进查询框，**不查询**。
-    ///
-    /// 这是 shell 的补全语义——Tab 补全词，回车才执行。对词典而言尤其顺：把词补全整了
-    /// 再接着改（`make` → `maker`），比先查一次再回来改省一步。
     /// 是否该由 → 接受补全。
     ///
     /// 只在**当前输入是游标那条候选的严格前缀**时才算数，且只在候选页。这是个近似——
@@ -1161,6 +1160,11 @@ impl State {
     /// 这个近似能**自我恢复**，所以可以接受：补全一次之后输入就等于候选、不再是严格
     /// 前缀，→ 随即放行、正常移动光标。真正会误伤的只有「输入恰是某候选的前缀、且用户
     /// 正想把光标往回移」这一种，而那时按一下 ← 就回来了。
+    ///
+    /// **前缀比对不分大小写**：补全查询走的是 `stardict_3` 索引上的 `COLLATE NOCASE`
+    /// （见 `store::ecdict::complete`），输入 `Ap` 完全可能拿到候选 `apple`。按字节
+    /// 严格比的话这里返回 false，→ 就成了「有时补全、有时移光标」——同一个键在看起来
+    /// 一样的情形下行为不同，比它干脆不工作更难用。
     fn should_accept_completion(&self) -> bool {
         if self.left_tab.get() != LEFT_CANDIDATES {
             return false;
@@ -1169,7 +1173,11 @@ impl State {
             return false;
         };
         let q = self.query.get();
-        !q.is_empty() && w.len() > q.len() && w.starts_with(&q)
+        // 只降 ASCII 大小写：候选与查询词的大小写差异只可能来自英文（中文没有大小写，
+        // `to_lowercase` 却要为它走一遍 Unicode 全表映射并分配）。
+        !q.is_empty()
+            && w.len() > q.len()
+            && w.as_bytes()[..q.len()].eq_ignore_ascii_case(q.as_bytes())
     }
 
     /// →：把游标那条候选填进查询框，**不查询**。
@@ -1359,11 +1367,6 @@ impl State {
         }
     }
 
-    /// 落盘当前设置。**失败当场告知**——设置是用户主动表达的意图，静默失败会让人
-    /// 以为改好了，下次启动才发现没变。与收藏写入失败同一条原则。
-    ///
-    /// 返回是否成功，供调用方决定要不要接着做别的（如改注册表）。
-    /// 宣告设置有变，令设置页重建。
     /// 报一条成功回执。
     fn note_ok(&self, text: impl Into<String>) {
         write_note(
@@ -1390,10 +1393,15 @@ impl State {
         self.settings_note.set(String::new());
     }
 
+    /// 宣告设置有变，令设置页重建。
     fn bump_settings(&self) {
         bump(self.settings_rev);
     }
 
+    /// 落盘当前设置。**失败当场告知**——设置是用户主动表达的意图，静默失败会让人
+    /// 以为改好了，下次启动才发现没变。与收藏写入失败同一条原则。
+    ///
+    /// 返回是否成功，供调用方决定要不要接着做别的（如改注册表）。
     fn save_settings(&self) -> bool {
         let UserDataState::Ready(u) = &self.user else {
             self.note_err("设置无法保存：用户数据未能打开");
@@ -1443,17 +1451,27 @@ impl State {
         }
     }
 
+    /// 离开设置页。**离开设置页只有这一个出口。**
+    ///
+    /// 它做的不止是切页：还要撤销「确认清空」那个待发状态。清空历史是两步确认的
+    /// （先「清空」变成「确认清空」，再点一次才真清），而副标题许诺的正是「切走本页
+    /// 取消」。
+    ///
+    /// 抽成一个方法，是因为出口不止一个——返回按钮之外还有 Esc，而 Esc 那条是后加的，
+    /// 当时只切了页。于是「点清空 → 按 Esc 离开 → 下次进设置页」这条路上，按钮仍举着
+    /// 「确认清空」等人误触，一下就抹掉全部历史，而那份数据不可再生（ADR-0011）。
+    /// 两处各写一遍必然还会漏第三处。
+    fn leave_settings(&self) {
+        self.confirm_clear.set(false);
+        self.page.set(PAGE_DICT);
+    }
+
     /// 把左栏宽度恢复成默认值并存盘。
     fn reset_left_w(&self) {
         self.set_left_w(crate::settings::LEFT_PANE_W_DEFAULT);
         self.save_left_w();
     }
 
-    /// 换皮肤。
-    ///
-    /// 目前**只能重启生效**：`ThemeHandle::set` 不重建元素树，而本应用的自绘区域色
-    /// （标题栏底、侧栏底、卡片底）在 windui 的 `Role` 里没有对应项，解析不出来。
-    /// 完整论证见 ADR-0012。这里如实告知用户，而不是让他点完毫无反应。
     /// 换皮肤。**立即生效**：界面无一处写死颜色，`ThemeHandle::set` 之后下一帧全树
     /// 按新色板重新解析。
     ///
@@ -1707,6 +1725,23 @@ impl State {
     ///
     /// 用户数据不可用或读取失败时给出空列表——顶部的警示条已说明原因，此处再报一遍
     /// 是噪音。
+    /// 行数变了之后把键盘游标收回表内。**每次铺完行都要调。**
+    ///
+    /// 游标存的是「第几行」，而行是会变少的：在收藏页逐条点 × 取消收藏，行数一路往下
+    /// 掉，游标却原地不动。`move_cursor` 只钳**新**值（`(i+1).min(n-1)`），钳不住已经
+    /// 越界的旧值——↓ 一步就跳回表内，↑ 却是 `saturating_sub(1)`，从 5 走到 4 仍在表外，
+    /// 得连按几下才回得来。这期间没有任何一行带高亮，`row_at_cursor()` 返回 None，
+    /// 按回车会落到「查输入框里的字」那条兜底上，查的是另一个词。
+    ///
+    /// 只在值真的越界时写：`Signal::set` 无条件涨版本，而 `ListKeyNav` 盯着 `cursor`
+    /// 做滚动跟随——每次铺行都写一次，列表就会在用户没碰键盘时自己跳。
+    fn clamp_cursor(&self, n: usize) {
+        let max = n.saturating_sub(1);
+        if self.cursor.get() > max {
+            self.cursor.set(max);
+        }
+    }
+
     fn reload_left(&self) {
         if self.left_tab.get() == LEFT_CANDIDATES {
             self.reload_candidates();
@@ -1717,12 +1752,13 @@ impl State {
 
     /// 候选页：把当前候选连同键盘游标、当前查看的词铺成行。
     fn reload_candidates(&self) {
+        let cands = self.candidates.get();
+        // 先收游标再读它：候选可能刚变少（见 `clamp_cursor`）。
+        self.clamp_cursor(cands.len());
         let at = self.cursor.get();
         // 「正在看的是哪个词」对候选行与召回行是同一个问题，故用同一个来源。
         let current = self.current_headword();
-        let rows: Vec<LeftRow> = self
-            .candidates
-            .get()
+        let rows: Vec<LeftRow> = cands
             .into_iter()
             .enumerate()
             .map(|(i, cand)| LeftRow::Candidate {
@@ -1752,6 +1788,7 @@ impl State {
     fn reload_recall(&self) {
         let on_favorites = self.left_tab.get() == LEFT_FAVORITES;
         let UserDataState::Ready(u) = &self.user else {
+            self.clamp_cursor(0);
             self.left_rows.set(Vec::new());
             self.left_note.set("用户数据未能打开".into());
             return;
@@ -1763,10 +1800,12 @@ impl State {
             u.history(RECALL_LIMIT)
                 .map(|v| v.into_iter().map(|h| h.headword).collect())
         };
+        let hws = hws.unwrap_or_default();
         let current = self.current_headword();
+        // 先收游标再读它：逐条取消收藏会让行数一路往下掉（见 `clamp_cursor`）。
+        self.clamp_cursor(hws.len());
         let at = self.cursor.get();
         let rows: Vec<LeftRow> = hws
-            .unwrap_or_default()
             .into_iter()
             .enumerate()
             .map(|(i, headword)| {
@@ -1898,25 +1937,6 @@ fn dict_tab_label(tab: usize) -> &'static str {
     }
 }
 
-/// 一次命中中应当进入历史记录的词头：**全部**，去重且保序。
-///
-/// 进历史的是**词头**而非查询词：查 `tried` 命中 `try` 时记的是 `try`。术语表把
-/// 历史定义为「查询过的词头序列」，而词头是词典中真实存在的那个词；`record` 收
-/// `&Headword` 的签名已从类型上强制了这一点。
-///
-/// 取全部而非第一条：汉英词库按 `WHERE simplified = ?1 OR traditional = ?1` 查询，
-/// 一个繁体查询词可能命中多行、而那些行的**简体列并不相同**——如 `餘` 同时命中
-/// `余` 与 `馀` 两个词头。界面本就把它们全部呈现（见 `cedict.rs` 的「谁排前面都是
-/// 错的」），历史只记第一条会与用户所见对不上。何况第一条取的是建库插入顺序，
-/// 不含任何「主要词头」语义。
-///
-/// 去重保序而非用集合：同一词头的多音字（`行[hang2]`/`行[xing2]`）会返回多条词条
-/// 但词头相同，只该记一次；而记录顺序应与界面呈现顺序一致，排序会打乱它。
-///
-/// 本函数**看不出**这些词条是直接命中还是经词形变化跟随原形得来的——到这一层
-/// `entries` 里的词头已经是原形（`ecdict.rs` 早已把原形词条换了进来）。故「查
-/// `tries` 记 `try`」这条语义由 `store::ecdict` 的 `变化形态无释义时跟随到原形`
-/// 负责验证，此处无从、也不该重复断言。
 /// 把词条按词头分组，组的顺序与组内顺序都保持原样。
 ///
 /// 分组的单位是词头而非词条，因为**收藏的单位是词头**：多音字（`行` 的 hang2 /
@@ -1939,6 +1959,25 @@ fn group_by_headword(entries: &[Entry]) -> Vec<(Headword, Vec<Entry>)> {
         .collect()
 }
 
+/// 一次命中中应当进入历史记录的词头：**全部**，去重且保序。
+///
+/// 进历史的是**词头**而非查询词：查 `tried` 命中 `try` 时记的是 `try`。术语表把
+/// 历史定义为「查询过的词头序列」，而词头是词典中真实存在的那个词；`record` 收
+/// `&Headword` 的签名已从类型上强制了这一点。
+///
+/// 取全部而非第一条：汉英词库按 `WHERE simplified = ?1 OR traditional = ?1` 查询，
+/// 一个繁体查询词可能命中多行、而那些行的**简体列并不相同**——如 `餘` 同时命中
+/// `余` 与 `馀` 两个词头。界面本就把它们全部呈现（见 `cedict.rs` 的「谁排前面都是
+/// 错的」），历史只记第一条会与用户所见对不上。何况第一条取的是建库插入顺序，
+/// 不含任何「主要词头」语义。
+///
+/// 去重保序而非用集合：同一词头的多音字（`行[hang2]`/`行[xing2]`）会返回多条词条
+/// 但词头相同，只该记一次；而记录顺序应与界面呈现顺序一致，排序会打乱它。
+///
+/// 本函数**看不出**这些词条是直接命中还是经词形变化跟随原形得来的——到这一层
+/// `entries` 里的词头已经是原形（`ecdict.rs` 早已把原形词条换了进来）。故「查
+/// `tries` 记 `try`」这条语义由 `store::ecdict` 的 `变化形态无释义时跟随到原形`
+/// 负责验证，此处无从、也不该重复断言。
 fn headwords_to_record(entries: &[Entry]) -> Vec<Headword> {
     let mut out: Vec<Headword> = Vec::new();
     for e in entries {
@@ -1950,10 +1989,6 @@ fn headwords_to_record(entries: &[Entry]) -> Vec<Headword> {
     out
 }
 
-/// 构建界面。
-///
-/// `user` 不可用时顶部常驻一条警示，说明历史记录失效及其原因（收藏有入口后一并
-/// 纳入，见 `unavailable_bar`）。
 /// `build` 的产物：界面树，加上一份窗口级快捷键处理器。
 ///
 /// 打包成一个结构而非让 `main` 各取一次，是因为两者共享同一个 `State`——分成两个函数
@@ -1967,6 +2002,10 @@ pub struct Ui {
 /// 窗口级快捷键处理器。抽成别名只为让 [`Ui`] 的字段读得下去。
 pub type ShortcutFn = Box<dyn FnMut(&mut ShortcutCtx, KeyEvent) -> bool>;
 
+/// 构建界面。
+///
+/// `user` 不可用时顶部常驻一条警示，说明历史记录失效及其原因（收藏有入口后一并
+/// 纳入，见 `unavailable_bar`）。
 pub fn build(
     dict: OfflineDictionary,
     user: UserDataState,
@@ -2093,7 +2132,7 @@ fn handle_shortcut(st: &Rc<State>, ctx: &mut ShortcutCtx, ev: KeyEvent) -> bool 
         // 收掉，而用户在设置页按 Esc 想的是「退出这一页」。返回 true 把这一键吃掉，
         // 兜底就轮不到了；不在设置页时返回 false 放行，Esc 照旧收起窗口（ADR-0007）。
         Key::Escape if st.page.get() == PAGE_SETTINGS => {
-            st.page.set(PAGE_DICT);
+            st.leave_settings();
             true
         }
         _ => false,
@@ -2188,7 +2227,7 @@ fn settings_entry(st: Rc<State>) -> Element {
 /// `HTCAPTION`，客户区连 `WM_LBUTTONDOWN` 都收不到。上游 `7b6ab36` 已把两侧判定统一
 /// 成一次父链遍历（`Tree::hit_role`），经过与结案记在 `docs/upstream-drag-hit-bubbles.md`。
 ///
-/// **不画激活态**。抽屉开着时它头部的分段控件已经写明当前停在哪一页，标题栏再标一次
+/// **不画激活态**。左栏底部那个分段控件已经写明当前停在哪一页，标题栏再标一次
 /// 是重复；而 windui 的 `bg_role` 是构建期定死的，要让它跟着信号变得多叠一个节点——
 /// 为一份冗余信息付这个代价不值。
 fn bar_entry(text: &str, on_click: impl FnMut(&mut EventCtx) + 'static) -> Element {
@@ -2613,11 +2652,8 @@ fn right_pane(st: Rc<State>) -> Element {
         .child(result_area(st).weight(1.0))
 }
 
-/// 前进 / 后退两枚按钮。
-///
-/// 摆在方向页签**左边**、释义正上方：它们管的是「看哪个词」，与页签管的「看这个词的
-/// 哪个方向」是同一层的东西，都属于右栏这一屏的导航。放标题栏则会与「设置」挤在一起，
-/// 而那一排是**应用级**入口，层级不同。
+/// 前进 / 后退两枚按钮。落点在标题栏左上角，理由见 [`title_bar`] 里那段注释
+/// （曾经打算摆在右栏方向页签旁边，`TabBar` 的交叉轴高度失控让那条路走不通）。
 ///
 /// 包在 `host_signal` 里：两枚按钮的可用与否是构建期算的（图标颜色尤其——它在构建期
 /// 就解析成了具体色值，见 `crate::icon`），走一步就得重建。重建量是两个节点。
@@ -2698,8 +2734,7 @@ fn dict_tab_bar(selected: Signal<usize>) -> Element {
 /// 两组没有对应数据源，不画；换来的是设计稿没有的热键、开机自启、词库路径——那才是
 /// 一个常驻词典真正要让用户调的东西。
 fn settings_page(st: Rc<State>) -> Element {
-    let page = st.page;
-    let confirm = st.confirm_clear;
+    let back_st = st.clone();
     Element::col()
         .fill()
         .child(
@@ -2713,11 +2748,8 @@ fn settings_page(st: Rc<State>) -> Element {
                 .border_role(Role::Divider, 1)
                 .border_edges(Edges::BOTTOM)
                 .child(
-                    crate::icon::button(crate::icon::BACK, 32, Role::Text).on_click(move |_ctx| {
-                        // 离开即撤销确认态：回来时不该还举着「确认清空」等人误触。
-                        confirm.set(false);
-                        page.set(PAGE_DICT);
-                    }),
+                    crate::icon::button(crate::icon::BACK, 32, Role::Text)
+                        .on_click(move |_ctx| back_st.leave_settings()),
                 )
                 .child(
                     Element::label("设置")
@@ -2791,8 +2823,8 @@ fn data_rows(st: Rc<State>) -> Element {
         row(
             "收藏",
             Some(&format!("已收藏 {favs} 条")),
-            // 「侧栏」这个词在界面上已经没有对应物很久了——先改成抽屉，这次连抽屉的
-            // 入口也移到了标题栏。指路的文案必须指得到，否则不如不写。
+            // 指路的文案必须指得到，否则不如不写。这句话先后指过「侧栏」和「抽屉」，
+            // 两者在界面上都已经没有对应物；收藏现在是左栏那个分段控件的第三段。
             Element::label("在「收藏」里逐条取消")
                 .font_size(12.5)
                 .fg_role(Role::TextMuted),
@@ -2977,7 +3009,10 @@ fn swatch_chip(c: Color) -> Element {
         .border_role(Role::Border, 1)
 }
 
-/// 唤起热键。当前**只读展示**——改键需要框架支持运行时重注册，见下方注释。
+/// 唤起热键：三个修饰键复选框 + 主键下拉，改完当场重注册。
+///
+/// 这里曾长期是**只读展示**，因为改键要框架支持运行期重注册；`HotkeyHandle::rebind`
+/// 补上之后才活过来，改动落在 [`HotkeyEditor`] 里。
 fn hotkey_row(st: Rc<State>) -> Element {
     let spec = st.settings.borrow().hotkey;
     let ctrl = signal(spec.ctrl);
@@ -3529,8 +3564,8 @@ fn entry_view(e: Entry, expanded: Signal<bool>) -> Element {
             // 星级是重复的星形、考试标签是一组彩色小块，它们的意义在形状与颜色里，
             // 拖选出来只会得到一串没有上下文的短词（「牛津 3 CET4」）。可选中的是
             // 释义，不是装饰。
-            if !x.grading.is_empty() {
-                col = col.child(grading_row(&x.grading));
+            if let Some(r) = grading_row(&x.grading) {
+                col = col.child(r);
             }
             // 词形变化：made / making / makes 这些数据一直躺在库里，界面上却一个字
             // 都没有。ADR-0001 当初选 ECDICT，理由之一正是它自带 `exchange`——只用在
@@ -3741,8 +3776,16 @@ fn inflection_row(derived: &[(crate::domain::InflectionKind, Headword)]) -> Elem
 ///
 /// 与 [`inflection_row`] 共用同一套底色、圆角与内边距：两者都是「挂在词条上的小标记」，
 /// 同屏并列时必须看起来属于同一类东西，否则界面像拼了两套不相干的控件。
-fn grading_row(g: &crate::domain::Grading) -> Element {
+///
+/// **一个徽章都没有时返回 `None`，判空与渲染因此是同一段代码。** 不能让调用方拿
+/// [`Grading::is_empty`](crate::domain::Grading::is_empty) 当闸门：那是「有没有数据」，
+/// 而这里问的是「画不画得出东西」，两者在 `bnc` 上就分家了——它存进了库却**刻意不
+/// 渲染**（理由见下方 `frq` 那段）。只有 bnc 有值的词并不罕见（两个语料库覆盖面不同），
+/// 而那样的词会通过数据闸门、拿到一个零子节点的 row，在词条上留下一道 8px 的空隙。
+fn grading_row(g: &crate::domain::Grading) -> Option<Element> {
     let mut row = Element::row().width_match().cross(Align::Center).spacing(8);
+    // 数子节点而不是重新判一遍字段：判据只有一处，下面加一个新徽章时不必记得回来改。
+    let mut n_badges = 0;
 
     // 星级用实心星重复而非写数字：五颗星一眼可数，数字还要在心里换算一次。
     //
@@ -3750,6 +3793,7 @@ fn grading_row(g: &crate::domain::Grading) -> Element {
     // 路径，且本项目的 schema 已对齐上游格式，第三方库都能装进来），那些库里的
     // collins 是否守在 1–5 内，不由我们说了算——不钳住就可能画出一屏的星。
     if let Some(n) = g.collins {
+        n_badges += 1;
         row = row.child(
             Element::row()
                 .cross(Align::Center)
@@ -3773,12 +3817,14 @@ fn grading_row(g: &crate::domain::Grading) -> Element {
     // 牛津三千是个是非题、没有等级，故只在为真时出现。用强调色与考试大纲拉开层级：
     // 它标的是「核心词汇」这一身份，比「考四级会考到」更根本。
     if g.oxford {
+        n_badges += 1;
         row = row.child(grading_chip("牛津核心", Role::Accent, 600));
     }
 
     // 大纲标签已在领域层按学习阶段排好序（`ExamTag::rank`），此处照序渲染即可——
     // 库里存的是录入顺序，直接铺出来读起来没有递进感。
     for t in &g.tags {
+        n_badges += 1;
         row = row.child(grading_chip(t.label(), Role::TextMuted, 500));
     }
 
@@ -3786,6 +3832,7 @@ fn grading_row(g: &crate::domain::Grading) -> Element {
     // 读者无从分辨谁是谁。BNC 已经存进库里（[`crate::domain::Grading::bnc`]），要用时
     // 随时可取——它统计的是数百年间的英文资料，读旧书时比 `frq` 更有参考价值。
     if let Some(f) = g.frq {
+        n_badges += 1;
         row = row.child(
             Element::label(format!("词频 {f}"))
                 .font_size(11.5)
@@ -3793,7 +3840,7 @@ fn grading_row(g: &crate::domain::Grading) -> Element {
         );
     }
 
-    row
+    (n_badges > 0).then_some(row)
 }
 
 /// 分级徽章：淡底小标签。
@@ -3815,11 +3862,60 @@ fn join(s: &Sense) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        card_in_tab, clamp_left_w, dict_tab_label, expand_key, group_by_headword,
+        card_in_tab, clamp_left_w, dict_tab_label, expand_key, grading_row, group_by_headword,
         headwords_to_record, scroll_area, signal, write_note, Card, ExpandedStates, NavPath, Role,
         DICT_ALL, DICT_EN_ZH, DICT_ZH_EN, RIGHT_MIN_W,
     };
-    use crate::domain::{ChineseEntry, EnglishEntry, Entry, Grading, Headword, Inflections, Sense};
+    use crate::domain::{
+        ChineseEntry, EnglishEntry, Entry, ExamTag, Grading, Headword, Inflections, Sense,
+    };
+
+    // ── 分级徽章 ──────────────────────────────────────────
+
+    /// 只有 `bnc` 的词条**画不出任何徽章**，那一行整个不该建。
+    ///
+    /// `bnc` 存进了库却刻意不渲染（两串没有单位的数字并排读者分不清谁是谁），而
+    /// `Grading::is_empty` 把它算作「有数据」。拿那个当闸门，只有 bnc 的词就会拿到一个
+    /// 零子节点的 row，在词条上留下一道 8px 的空隙——ECDICT 里 bnc 有值而 frq 为 NULL
+    /// 的词并不罕见，两个语料库的覆盖面本就不同。
+    #[test]
+    fn 只有词频语料库排名时不建徽章行() {
+        let g = Grading {
+            bnc: Some(8906),
+            ..Default::default()
+        };
+        assert!(!g.is_empty(), "前提：按数据算它不是空的");
+        assert!(
+            grading_row(&g).is_none(),
+            "但一个徽章都画不出，那一行不该建"
+        );
+        assert!(grading_row(&Grading::default()).is_none(), "全空同理");
+    }
+
+    /// 四种徽章各自单独出现时都要建出那一行——判空与渲染同源，漏一种就是少一行。
+    #[test]
+    fn 任一徽章有值就建徽章行() {
+        for g in [
+            Grading {
+                collins: Some(5),
+                ..Default::default()
+            },
+            Grading {
+                oxford: true,
+                ..Default::default()
+            },
+            Grading {
+                tags: vec![ExamTag::Cet4],
+                ..Default::default()
+            },
+            Grading {
+                frq: Some(524),
+                ..Default::default()
+            },
+        ] {
+            assert!(grading_row(&g).is_some(), "有徽章可画：{g:?}");
+        }
+    }
 
     fn 英汉(词头: &str) -> Entry {
         Entry::English(EnglishEntry {

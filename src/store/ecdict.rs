@@ -231,8 +231,13 @@ fn row_to_entry(row: &Row<'_>) -> rusqlite::Result<EnglishEntry> {
 ///
 /// 与 `rank_u32` 同理——上游 `collins` 的默认值是 `0` 而非 `NULL`，读官方库时
 /// 未评级的词取到的是 0。若原样传给界面，会画出「0 颗星」这种东西。
+///
+/// 装不进 `u8` 的值退回 `None` 而不是 `as u8` 截断：`as` 是环绕的，256 会变成 0——
+/// 恰好绕回「未评级」那个值，却还带着 `Some`，界面于是画出一个有「柯林斯」标签、
+/// 零颗星的空壳。词库可被外部文件整体替换，值域不由我们说了算，而**退回 None 是
+/// 如实的**（「这个值我读不懂」），截断则是编造。
 fn rank_u8(v: Option<i64>) -> Option<u8> {
-    v.filter(|n| *n > 0).map(|n| n as u8)
+    v.filter(|n| *n > 0).and_then(|n| u8::try_from(n).ok())
 }
 
 /// 词频排名：`NULL` 与 `0` 都作「未进榜」。
@@ -677,5 +682,21 @@ mod tests {
         seed_graded(&db, "weird", 99, 1, None, None, None);
         let g = only(db.lookup(&q("weird")).unwrap()).grading;
         assert_eq!(g.collins, Some(99));
+    }
+
+    /// 装不进 `u8` 的星级退回 `None`，**不截断**。
+    ///
+    /// `as u8` 会把 256 环绕成 0——恰好绕回「未评级」那个值，却还带着 `Some`，于是
+    /// 界面画出一个有「柯林斯」标签、零颗星的空壳。这条与上一条不矛盾：如实呈现的
+    /// 前提是这个值确实表示得出来，表示不出来时说「不知道」才是如实。
+    #[test]
+    fn 装不下的星级退回未评级而非截断() {
+        let db = Ecdict::in_memory().unwrap();
+        for (w, n) in [("wrap256", 256i64), ("wrap512", 512), ("huge", 100_000)] {
+            seed_graded(&db, w, n, 0, None, None, None);
+            let g = only(db.lookup(&q(w)).unwrap()).grading;
+            assert_eq!(g.collins, None, "{w}（collins={n}）应读作未评级");
+            assert!(g.is_empty(), "{w} 的分级须视为空，界面据此不画那一行");
+        }
     }
 }
