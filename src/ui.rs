@@ -31,7 +31,7 @@ use windui::ui::containers::{TabBar, TabItem};
 
 use crate::domain::{Candidate, Dictionary, Entry, Headword, Lookup, Query, Sense, Wordlist};
 use crate::settings::Settings;
-use crate::skin::SkinKind;
+use crate::skin::{SkinMode, SkinStyle};
 use crate::source::offline::OfflineDictionary;
 use crate::store::userdata::{now_secs, UserDataState};
 
@@ -931,6 +931,16 @@ struct State {
     confirm_clear: Signal<bool>,
     /// 换肤重建计数。图标的颜色是构建期解析的，换肤后必须重建整树才会跟上，见 `build`。
     skin_rev: Signal<Vec<u64>>,
+    /// 系统此刻是否偏好暗色。
+    ///
+    /// 缓存而非每次现查：`SkinMode::System` 下每一次解析配色都要用到它，而查它要读
+    /// 注册表。真正让它必须是**可变**的，是运行期跟随——用户在系统设置里切了暗色，
+    /// windui 会回调 `on_system_theme_changed`（见 `build` 的返回值），那时把这一位
+    /// 更新掉，配色就跟着翻过去了。
+    ///
+    /// 用 `Cell` 而非信号：它不该自己驱动重建。翻转它之后要做的事与用户手动换风格
+    /// 完全一样（`apply_skin`），走同一条路才不会两边漂移。
+    system_dark: std::cell::Cell<bool>,
     /// 设置页的重建计数。
     ///
     /// 设置页上有若干**构建时求值**的显示——皮肤卡片的选中环、词库路径文字。它们
@@ -1472,21 +1482,66 @@ impl State {
         self.save_left_w();
     }
 
-    /// 换皮肤。**立即生效**：界面无一处写死颜色，`ThemeHandle::set` 之后下一帧全树
-    /// 按新色板重新解析。
+    /// 系统此刻是否偏好暗色（见 `State::system_dark`）。
+    fn system_dark(&self) -> bool {
+        self.system_dark.get()
+    }
+
+    /// 当前设置解析出来的明暗档。`SkinMode::System` 时看系统那一位。
+    fn dark(&self) -> bool {
+        self.settings.borrow().mode.is_dark(self.system_dark())
+    }
+
+    /// 把当前的风格 × 明暗兑现到界面上。**换配色只有这一条路。**
     ///
-    /// 先换后存：换肤是纯视觉、可随时再换，让用户当场看到结果比「先确保存住」更重要；
-    /// 存失败时如实告知「本次有效、重启后回退」，而不是回滚掉一个用户已经看到的变化。
-    fn set_skin(&self, kind: SkinKind) {
-        self.settings.borrow_mut().skin = kind;
-        self.theme.set(kind.skin().theme);
-        // 文字与色块靠 `Role` 每帧自己跟上，图标不行——它的颜色在构建期就解析成了具体
-        // 色值（见 `crate::icon`）。重建整树是唯一能让图标跟上的办法，理由见 `build`。
+    /// 三个入口都汇到这里：改风格、改明暗、系统外观变了。分开写的话，早晚有一个入口
+    /// 漏掉重建那一步——而漏掉的表现是「文字变了色、图标没变」，看起来像渲染出了问题，
+    /// 不像是少调了一个函数。
+    ///
+    /// **立即生效**：正文与色块靠 `Role` 每帧自己跟上；图标不行——它的颜色在构建期就
+    /// 解析成了具体色值（见 `crate::icon`），只能靠重建整树跟上，理由见 `build`。
+    fn apply_skin(&self) {
+        let (style, dark) = (self.settings.borrow().style, self.dark());
+        self.theme.set(style.theme(dark));
         bump(self.skin_rev);
+    }
+
+    /// 换风格。
+    ///
+    /// 先换后存：换配色是纯视觉、可随时再换，让用户当场看到结果比「先确保存住」更
+    /// 重要；存失败时如实告知「本次有效、重启后回退」，而不是回滚掉一个用户已经看到
+    /// 的变化。
+    fn set_style(&self, style: SkinStyle) {
+        self.settings.borrow_mut().style = style;
+        self.apply_skin();
+        self.save_skin("配色已切换");
+    }
+
+    /// 换明暗档（含「跟随系统」）。
+    fn set_mode(&self, mode: SkinMode) {
+        self.settings.borrow_mut().mode = mode;
+        self.apply_skin();
+        self.save_skin("明暗已切换");
+    }
+
+    /// 系统的外观偏好变了。只在 `SkinMode::System` 下真正换色。
+    ///
+    /// 不在别的档下换色，但**照样记下这一位**：用户可能过一会儿才切到「跟随系统」，
+    /// 那时得用上最新的值，而不是启动时读到的那个。
+    fn system_theme_changed(&self, dark: bool) {
+        if self.system_dark.replace(dark) == dark {
+            return;
+        }
+        if self.settings.borrow().mode == SkinMode::System {
+            self.apply_skin();
+        }
+    }
+
+    fn save_skin(&self, what: &str) {
         if self.save_settings() {
             self.note_clear();
         } else {
-            self.note_err("皮肤已切换，但未能保存，重启后会回到原来的皮肤");
+            self.note_err(format!("{what}，但未能保存，重启后会回到原来的配色"));
         }
     }
 
@@ -1997,10 +2052,18 @@ pub struct Ui {
     pub root: Element,
     /// 交给 [`windui::app::App::on_shortcut`]。
     pub shortcut: ShortcutFn,
+    /// 交给 [`windui::app::App::on_system_theme_changed`]。
+    ///
+    /// 只在 `SkinMode::System` 下真正换色，但任何时候都记下系统那一位——用户可能过
+    /// 一会儿才切到「跟随系统」，那时该用最新的值。
+    pub system_theme: SystemThemeFn,
 }
 
 /// 窗口级快捷键处理器。抽成别名只为让 [`Ui`] 的字段读得下去。
 pub type ShortcutFn = Box<dyn FnMut(&mut ShortcutCtx, KeyEvent) -> bool>;
+
+/// 系统外观变化的处理器。同上。
+pub type SystemThemeFn = Box<dyn FnMut(&mut EventCtx, bool)>;
 
 /// 构建界面。
 ///
@@ -2011,6 +2074,9 @@ pub fn build(
     user: UserDataState,
     theme: ThemeHandle,
     hotkey: HotkeyHandle,
+    // 系统此刻是否偏好暗色。由 `main` 查好传进来而非在此现查：它是 OS 状态，
+    // 而本模块的其余部分只碰自己的状态。
+    system_dark: bool,
 ) -> Ui {
     let dict = Rc::new(dict);
     let unavailable = match &user {
@@ -2055,6 +2121,7 @@ pub fn build(
         confirm_clear: signal(false),
         settings_rev: signal(vec![0]),
         skin_rev: signal(vec![0]),
+        system_dark: std::cell::Cell::new(system_dark),
     });
     // 开屏即把左栏填上：驱动器要到第一次 layout 才跑，在那之前列表是空的，
     // 而开屏那一眼正好落在这里。
@@ -2076,6 +2143,7 @@ pub fn build(
     // 只包一层、不逐处细分：漏掉任何一处含图标的子树，就会出现「有的跟了有的没跟」，
     // 那是最难查的一类不一致。整树重建换来的是「不可能漏」。
     let sc_st = st.clone();
+    let sys_st = st.clone();
     let root = Element::host_signal(st.skin_rev, move |_rev: u64| {
         // `host_signal` 的回调是 `Fn`，会被反复调用，故每次都得拿一份自己的。
         window_root(st.clone(), unavailable.clone())
@@ -2083,6 +2151,7 @@ pub fn build(
     Ui {
         root,
         shortcut: Box::new(move |ctx, ev| handle_shortcut(&sc_st, ctx, ev)),
+        system_theme: Box::new(move |_ctx, dark| sys_st.system_theme_changed(dark)),
     }
 }
 
@@ -2779,7 +2848,7 @@ fn settings_body(st: Rc<State>) -> Element {
                 .padding_xy(40, 26)
                 .spacing(28)
                 .child(notice_bar(st.settings_note, Some(st.settings_note_tone)))
-                .child(group("外观", skin_cards(st.clone())))
+                .child(group("外观", appearance_group(st.clone())))
                 .child(group("布局", pane_w_row(st.clone())))
                 .child(group("唤起", hotkey_row(st.clone())))
                 .child(group("快捷键", shortcut_rows()))
@@ -2953,16 +3022,113 @@ fn row(title: &str, subtitle: Option<&str>, control: Element) -> Element {
         .child(control)
 }
 
-/// 皮肤卡片三选一。
-fn skin_cards(st: Rc<State>) -> Element {
+/// 外观分组：风格卡片 + 亮暗分段。
+///
+/// 两个控件而非一排六张卡片。六张卡片要求用户在「哪一族颜色」和「亮还是暗」两件事上
+/// 同时做决定，而它们本就是正交的——拆成两个控件之后，换个明暗不必重新挑一遍风格。
+/// 六张卡片还表达不了「跟随系统」：那不是第七套配色，是把明暗这一维交给系统。
+fn appearance_group(st: Rc<State>) -> Element {
+    Element::col()
+        .width_match()
+        .child(mode_row(st.clone()))
+        .child(Element::divider())
+        .child(
+            Element::col()
+                .width_match()
+                .padding_xy(18, 14)
+                .child(style_cards(st)),
+        )
+}
+
+/// 亮 / 暗 / 跟随系统。
+///
+/// 排在风格卡片**之前**：它决定卡片上的预览色块画成什么样（`SkinStyle::swatch` 收
+/// `dark`），先选明暗再挑风格，读起来才是因果顺序。
+fn mode_row(st: Rc<State>) -> Element {
+    let cur = st.settings.borrow().mode;
+    let sel = signal(SkinMode::ALL.iter().position(|&m| m == cur).unwrap_or(0));
+    let seg_st = st.clone();
+    Element::row()
+        .width_match()
+        .cross(Align::Center)
+        .padding_xy(18, 14)
+        .spacing(12)
+        .child(
+            Element::col()
+                .weight(1.0)
+                .child(
+                    Element::label("明暗")
+                        .font_size(14.0)
+                        .fg_role(Role::Text)
+                        .width_match(),
+                )
+                .child(
+                    Element::label(if cur == SkinMode::System {
+                        "跟随系统的「应用模式」，改了当场跟上"
+                    } else {
+                        "不随系统变化"
+                    })
+                    .font_size(12.0)
+                    .fg_role(Role::TextMuted)
+                    .width_match(),
+                ),
+        )
+        .child(
+            Element::leaf()
+                .reactive()
+                .widget(ModeWatcher {
+                    st: seg_st,
+                    sel,
+                    last: sel.version(),
+                })
+                .size(0, 0),
+        )
+        .child(
+            Element::segmented(
+                SkinMode::ALL.iter().map(|m| m.label()).collect::<Vec<_>>(),
+                sel,
+            )
+            .width(220),
+        )
+}
+
+/// 把分段控件的选择回写成设置。
+///
+/// 与 `SettingToggle` 同构：`Element::segmented` 只认信号，而设置住在 `RefCell` 里；
+/// 中间要一个驱动器把信号的变化搬过去。不能在构建期读一次了事——那时用户还没点。
+struct ModeWatcher {
+    st: Rc<State>,
+    sel: Signal<usize>,
+    last: u64,
+}
+
+impl Widget for ModeWatcher {
+    fn on_update(&mut self, _ctx: &mut EventCtx) {
+        let v = self.sel.version();
+        if v == self.last {
+            return;
+        }
+        self.last = v;
+        let Some(&m) = SkinMode::ALL.get(self.sel.get()) else {
+            return;
+        };
+        if self.st.settings.borrow().mode != m {
+            self.st.set_mode(m);
+        }
+    }
+}
+
+/// 风格卡片三选一。预览色块按**当前明暗档**画，点下去得到的就是看到的那套。
+fn style_cards(st: Rc<State>) -> Element {
+    let dark = st.dark();
     let mut row = Element::row()
         .width_match()
         .spacing(14)
         .cross(Align::Stretch);
-    for kind in SkinKind::ALL {
+    for kind in SkinStyle::ALL {
         let st = st.clone();
-        let current = st.settings.borrow().skin == kind;
-        let sw = kind.skin().swatch;
+        let current = st.settings.borrow().style == kind;
+        let sw = kind.swatch(dark);
         row = row.child(
             Element::col()
                 .weight(1.0)
@@ -2972,7 +3138,7 @@ fn skin_cards(st: Rc<State>) -> Element {
                 .padding(14)
                 .spacing(4)
                 .clickable()
-                .on_click(move |_ctx| st.set_skin(kind))
+                .on_click(move |_ctx| st.set_style(kind))
                 .child(
                     // 三色预览块。
                     // 每块都描边：浅色皮肤的底色块与卡片底同为近白，不描边就看不见，
@@ -2991,7 +3157,7 @@ fn skin_cards(st: Rc<State>) -> Element {
                         .fg_role(Role::Text),
                 )
                 .child(
-                    Element::label(kind.desc())
+                    Element::label(kind.desc(dark))
                         .font_size(12.0)
                         .fg_role(Role::TextMuted),
                 ),

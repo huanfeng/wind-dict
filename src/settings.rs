@@ -17,7 +17,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use crate::skin::SkinKind;
+use crate::skin::{SkinMode, SkinStyle};
 
 /// 热键的主键。
 ///
@@ -230,8 +230,10 @@ pub struct Settings {
     pub hotkey: HotkeySpec,
     /// 是否开机自启。
     pub autostart: bool,
-    /// 皮肤。
-    pub skin: SkinKind,
+    /// 配色风格（用哪一族颜色）。与 `mode` 正交，见 [`crate::skin`]。
+    pub style: SkinStyle,
+    /// 亮 / 暗 / 跟随系统。
+    pub mode: SkinMode,
     /// 词条是否默认展开英英释义。
     ///
     /// 只影响**默认**展开与否，不影响该区是否存在——英英释义始终可展开，这是
@@ -254,7 +256,8 @@ impl Default for Settings {
         Self {
             hotkey: HotkeySpec::default(),
             autostart: false,
-            skin: SkinKind::Light,
+            style: SkinStyle::Plain,
+            mode: SkinMode::System,
             expand_en: false,
             ecdict: None,
             cedict: None,
@@ -267,7 +270,10 @@ impl Default for Settings {
 pub mod keys {
     pub const HOTKEY: &str = "hotkey";
     pub const AUTOSTART: &str = "autostart";
-    pub const SKIN: &str = "skin";
+    pub const SKIN_STYLE: &str = "skin_style";
+    pub const SKIN_MODE: &str = "skin_mode";
+    /// 旧版的皮肤键，**只读不写**。见 `super::legacy`。
+    pub const LEGACY_SKIN: &str = "skin";
     pub const EXPAND_EN: &str = "expand_en";
     pub const ECDICT: &str = "ecdict";
     pub const CEDICT: &str = "cedict";
@@ -289,9 +295,16 @@ impl Settings {
             autostart: get(keys::AUTOSTART)
                 .map(|s| s == "1")
                 .unwrap_or(d.autostart),
-            skin: get(keys::SKIN)
-                .and_then(|s| skin_from_str(&s))
-                .unwrap_or(d.skin),
+            // 风格与明暗各自独立解析，任一项读不到就退回默认——包括从旧版的
+            // 单一 `skin` 键迁移过来的那一半（见 `skin_from_legacy`）。
+            style: get(keys::SKIN_STYLE)
+                .and_then(|s| style_from_str(&s))
+                .or_else(|| legacy(&get).map(|(st, _)| st))
+                .unwrap_or(d.style),
+            mode: get(keys::SKIN_MODE)
+                .and_then(|s| mode_from_str(&s))
+                .or_else(|| legacy(&get).map(|(_, m)| m))
+                .unwrap_or(d.mode),
             expand_en: get(keys::EXPAND_EN)
                 .map(|s| s == "1")
                 .unwrap_or(d.expand_en),
@@ -316,7 +329,8 @@ impl Settings {
         vec![
             (keys::HOTKEY, self.hotkey.to_string()),
             (keys::AUTOSTART, bool_str(self.autostart).into()),
-            (keys::SKIN, skin_str(self.skin).into()),
+            (keys::SKIN_STYLE, style_str(self.style).into()),
+            (keys::SKIN_MODE, mode_str(self.mode).into()),
             (keys::EXPAND_EN, bool_str(self.expand_en).into()),
             (keys::ECDICT, path_str(&self.ecdict)),
             (keys::CEDICT, path_str(&self.cedict)),
@@ -339,21 +353,55 @@ fn path_str(p: &Option<PathBuf>) -> String {
         .unwrap_or_default()
 }
 
-/// 皮肤的存储表示。用稳定的短名而非序号——序号会在 `SkinKind` 增删成员时错位，
-/// 让用户的皮肤莫名其妙变成另一套。
-fn skin_str(k: SkinKind) -> &'static str {
+/// 风格的存储表示。用稳定的短名而非序号——序号会在枚举增删成员时错位，让用户的
+/// 配色莫名其妙变成另一套。
+fn style_str(k: SkinStyle) -> &'static str {
     match k {
-        SkinKind::Light => "light",
-        SkinKind::Paper => "paper",
-        SkinKind::Dark => "dark",
+        SkinStyle::Plain => "plain",
+        SkinStyle::Paper => "paper",
+        SkinStyle::Focus => "focus",
     }
 }
 
-fn skin_from_str(s: &str) -> Option<SkinKind> {
+fn style_from_str(s: &str) -> Option<SkinStyle> {
     match s {
-        "light" => Some(SkinKind::Light),
-        "paper" => Some(SkinKind::Paper),
-        "dark" => Some(SkinKind::Dark),
+        "plain" => Some(SkinStyle::Plain),
+        "paper" => Some(SkinStyle::Paper),
+        "focus" => Some(SkinStyle::Focus),
+        _ => None,
+    }
+}
+
+fn mode_str(m: SkinMode) -> &'static str {
+    match m {
+        SkinMode::Light => "light",
+        SkinMode::Dark => "dark",
+        SkinMode::System => "system",
+    }
+}
+
+fn mode_from_str(s: &str) -> Option<SkinMode> {
+    match s {
+        "light" => Some(SkinMode::Light),
+        "dark" => Some(SkinMode::Dark),
+        "system" => Some(SkinMode::System),
+        _ => None,
+    }
+}
+
+/// 把旧版那个单一的 `skin` 键拆成风格 + 明暗。
+///
+/// 旧版三选一（`light`/`paper`/`dark`）把风格与明暗揉在了一起，新版拆开之后每一项
+/// 都有唯一对应：`light` 就是简约的亮档，`dark` 就是专注的暗档。
+///
+/// **必须迁移而不是让它退回默认**：用户数据要跨部署存活（ADR-0011），而一个用了半年
+/// 深色的人升级后被扔回浅色，是这条原则最直观的反例。旧键只读不写——新版存的是两个
+/// 新键，那条旧记录留在库里无人问津，也无害。
+fn legacy(get: &impl Fn(&str) -> Option<String>) -> Option<(SkinStyle, SkinMode)> {
+    match get(keys::LEGACY_SKIN)?.as_str() {
+        "light" => Some((SkinStyle::Plain, SkinMode::Light)),
+        "paper" => Some((SkinStyle::Paper, SkinMode::Light)),
+        "dark" => Some((SkinStyle::Focus, SkinMode::Dark)),
         _ => None,
     }
 }
@@ -463,7 +511,8 @@ mod tests {
         let s = Settings {
             hotkey: "Ctrl+Shift+K".parse().unwrap(),
             autostart: true,
-            skin: SkinKind::Dark,
+            style: SkinStyle::Focus,
+            mode: SkinMode::Dark,
             expand_en: true,
             ecdict: Some(PathBuf::from(r"D:\a\ec.db")),
             cedict: None,
@@ -491,20 +540,72 @@ mod tests {
     fn 无法识别的值退回默认() {
         let bad = |k: &str| match k {
             keys::HOTKEY => Some("这不是热键".to_string()),
-            keys::SKIN => Some("neon".to_string()),
+            keys::SKIN_STYLE => Some("neon".to_string()),
+            keys::SKIN_MODE => Some("sepia".to_string()),
+            // 旧键也给个坏值：迁移那条兜底同样不许让程序起不来。
+            keys::LEGACY_SKIN => Some("neon".to_string()),
             _ => None,
         };
         let s = Settings::from_pairs(bad);
         assert_eq!(s.hotkey, HotkeySpec::default());
-        assert_eq!(s.skin, SkinKind::Light);
+        assert_eq!(s.style, SkinStyle::Plain);
+        assert_eq!(s.mode, SkinMode::System);
     }
 
-    /// 皮肤按稳定短名存储：`SkinKind` 增删成员时用户的选择不会错位到另一套。
+    /// 配色按稳定短名存储：枚举增删成员时用户的选择不会错位到另一套。
     #[test]
-    fn 皮肤按名字存而非序号() {
-        for k in SkinKind::ALL {
-            assert_eq!(skin_from_str(skin_str(k)), Some(k));
+    fn 配色按名字存而非序号() {
+        for k in SkinStyle::ALL {
+            assert_eq!(style_from_str(style_str(k)), Some(k));
         }
-        assert_eq!(skin_str(SkinKind::Paper), "paper");
+        for m in SkinMode::ALL {
+            assert_eq!(mode_from_str(mode_str(m)), Some(m));
+        }
+        assert_eq!(style_str(SkinStyle::Paper), "paper");
+    }
+
+    /// 旧版的单一 `skin` 键要能迁移成风格 + 明暗。
+    ///
+    /// 用户数据跨部署存活是硬约束（ADR-0011）。没有这条迁移，一个用了半年深色的人
+    /// 升级后会被扔回浅色——而那看起来像是设置丢了，不像是升级。
+    #[test]
+    fn 旧版皮肤键迁移为风格加明暗() {
+        for (旧, 风格, 明暗) in [
+            ("light", SkinStyle::Plain, SkinMode::Light),
+            ("paper", SkinStyle::Paper, SkinMode::Light),
+            ("dark", SkinStyle::Focus, SkinMode::Dark),
+        ] {
+            let s = Settings::from_pairs(|k| (k == keys::LEGACY_SKIN).then(|| 旧.to_string()));
+            assert_eq!(s.style, 风格, "旧值 {旧} 的风格");
+            assert_eq!(s.mode, 明暗, "旧值 {旧} 的明暗");
+        }
+    }
+
+    /// 新键在场时压过旧键：迁移只在新键缺席时兜底，否则用户改过的设置会被一条
+    /// 早该退休的旧记录顶回去。
+    #[test]
+    fn 新键优先于旧版皮肤键() {
+        let s = Settings::from_pairs(|k| match k {
+            keys::LEGACY_SKIN => Some("dark".to_string()),
+            keys::SKIN_STYLE => Some("paper".to_string()),
+            keys::SKIN_MODE => Some("system".to_string()),
+            _ => None,
+        });
+        assert_eq!(s.style, SkinStyle::Paper);
+        assert_eq!(s.mode, SkinMode::System);
+    }
+
+    /// 旧键写不进库：`to_pairs` 只产出新键，否则每次存盘都把那条旧记录重新写活，
+    /// 迁移就永远收不了尾。
+    #[test]
+    fn 旧版皮肤键不再写入() {
+        let 键: Vec<&str> = Settings::default()
+            .to_pairs()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(!键.contains(&keys::LEGACY_SKIN), "旧键不该再被写出：{键:?}");
+        assert!(键.contains(&keys::SKIN_STYLE));
+        assert!(键.contains(&keys::SKIN_MODE));
     }
 }

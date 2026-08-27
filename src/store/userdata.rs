@@ -370,14 +370,15 @@ mod tests {
     #[test]
     fn 设置跨重开持久化且可覆盖() {
         use crate::settings::{HotkeySpec, Settings};
-        use crate::skin::SkinKind;
+        use crate::skin::{SkinMode, SkinStyle};
         let path = std::env::temp_dir().join(format!("wind_dict_set_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         let mut s = Settings {
             hotkey: "Ctrl+Shift+K".parse().unwrap(),
             autostart: true,
-            skin: SkinKind::Dark,
+            style: SkinStyle::Focus,
+            mode: SkinMode::Dark,
             expand_en: true,
             ecdict: Some(std::path::PathBuf::from(r"D:\ec.db")),
             cedict: None,
@@ -391,10 +392,10 @@ mod tests {
             let db = UserData::open(&path).unwrap();
             assert_eq!(db.settings(), s, "设置须跨重开原样存活");
             // 只改一项后重写，其余项不得被抹掉。
-            s.skin = SkinKind::Paper;
+            s.style = SkinStyle::Paper;
             db.save_settings(&s).unwrap();
             let back = db.settings();
-            assert_eq!(back.skin, SkinKind::Paper);
+            assert_eq!(back.style, SkinStyle::Paper);
             assert_eq!(back.hotkey, "Ctrl+Shift+K".parse::<HotkeySpec>().unwrap());
             assert!(back.autostart, "未改动的项不该被覆盖");
         }

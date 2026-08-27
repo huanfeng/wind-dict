@@ -78,7 +78,9 @@ fn main() {
     // 皮肤取自设置，**运行期可换**：界面里没有一处写死颜色，全部走主题角色，故
     // `ThemeHandle::set` 之后下一帧全树跟随，不必重建元素树。ADR-0012 当初判断
     // 「接不上」，症结其实不在框架，而在我们把本可用角色表达的颜色写成了具体色值。
-    let skin = settings.skin.skin();
+    // 启动时读一次系统偏好；之后的变化由 `on_system_theme_changed` 跟（见下）。
+    let system_dark = windui::event::system_prefers_dark();
+    let theme = settings.style.theme(settings.mode.is_dark(system_dark));
 
     // 窗口 920 宽：界面是左右两栏（`ui::dict_page`），左栏定宽 280，故释义那一栏拿到
     // 640——正文限宽已撤（见 `ui::EN_DEF_MAX_W`），一行排满正好是舒适的阅读宽度。
@@ -95,7 +97,7 @@ fn main() {
         // 渲染，后者是**报错终止**——那条语义是给排障用的（静默回退会让人拿两张软渲染
         // 的截图得出「软硬一致」），交付给用户的构建不该带。
         .renderer(Renderer::Auto)
-        .theme(skin.theme.clone())
+        .theme(theme.clone())
         .tray(tray)
         // 常驻：关闭只收起，进程始终活着等热键。见 ADR-0006。
         .hide_on_close()
@@ -114,7 +116,7 @@ fn main() {
     }
 
     // 两个句柄都必须在 `content` **之前**取到——界面要拿着它们才能即时换肤、改键。
-    let theme = app.theme_handle();
+    let theme_handle = app.theme_handle();
     // 热键**切换**显隐，不是只管唤起。
     //
     // 「按一下出来、再按一下收回去」是常驻工具热键的通常语义（Listary、uTools 皆然），
@@ -133,8 +135,13 @@ fn main() {
         }
     });
 
-    let ui = ui::build(dict, user, theme, hotkey);
-    app.on_shortcut(ui.shortcut).content(ui.root).run();
+    let ui = ui::build(dict, user, theme_handle, hotkey, system_dark);
+    app.on_shortcut(ui.shortcut)
+        // 运行期跟随系统亮暗。常驻工具尤其需要：一次会话可能横跨日出日落，而进程
+        // 一直不重启——只在启动时读一次的话，用户在系统里切了暗色得把词典重开。
+        .on_system_theme_changed(ui.system_theme)
+        .content(ui.root)
+        .run();
 }
 
 /// 报告一条**启动期致命错误**后退出。

@@ -7,7 +7,7 @@
 - Evidence reviewed:
   - `CONTEXT.md`: product terminology and query-source boundaries.
   - `src/ui.rs`: current main window, history/favorites sidebar, completion popover, result card, settings page.
-  - `src/skin.rs`: light, paper, and dark skin palettes.
+  - `src/skin.rs`: three styles (plain / paper / focus) x light and dark = six palettes.
   - `docs/adr/0005-windows-first.md`: Windows-first delivery constraint.
   - `docs/adr/0007-esc-hides-focus-loss-does-not.md`: main window remains visible for reading/copying.
   - `docs/adr/0011-user-data-outlives-deployment.md`: history and favorites persistence.
@@ -54,7 +54,7 @@
 - Core routes/screens:
   - Lookup screen, two panes: left pane holds the query input and one list (candidates / history / favorites, segmented); right pane holds the direction tabs (全部 / 英汉 / 汉英) and the result content with per-word actions.
   - Recall lives in the left pane, not a drawer: history and favorites are the same list as completion candidates, switched by the segmented control. The list defaults to history when the query is empty.
-  - Settings screen: skin, hotkey, startup, dictionary paths, data management.
+  - Settings screen: appearance (style + light/dark/follow-system), pane width, hotkey, shortcut list, startup, dictionary paths, data management.
   - Empty and no-result screens: quiet current-query states, not history dashboards.
   - Translation source screen: generated/source-produced content with explicit trust labeling.
 - Content hierarchy:
@@ -77,7 +77,8 @@
 - Terminology is product logic. Use "查询", "补全", "词头", "历史记录", "收藏", "查询源"; never use "生词本".
 
 ## Visual Language
-- Color: neutral light as default, paper and dark as skins; avoid one-hue domination and decorative gradients.
+- Color: style and light/dark are two independent choices, not one list. Style picks the colour family (plain = neutral + blue, paper = warm + ochre, focus = cool grey + teal); the mode picks light, dark, or follow-the-system. Collapsing them into a single six-item list would make "I like paper, but dark at night" unexpressible, and could not express follow-the-system at all -- that is not a seventh palette, it is handing the mode over to the OS. Avoid one-hue domination and decorative gradients.
+- The accent differs between a style's light and dark palette: same hue, different lightness (light ~L0.52 for white text on it, dark ~L0.70-0.82 for dark text on it). One value cannot serve both -- a light-mode accent on a dark ground drops to 3.5:1 and the buttons blur into the background.
 - Typography: Segoe UI / Microsoft YaHei UI for UI; Georgia for English headwords and part-of-speech chips.
 - Spacing/layout rhythm: compact desktop density with 8px rhythm; result text capped to readable width.
 - Shape/radius/elevation: 6-8px for most controls/cards; elevation only for floating completion and drawers.
@@ -86,14 +87,14 @@
 
 ## Components
 - Existing components to reuse:
-  - title bar/window buttons, query input, candidate panel, result card, star button, settings rows, skin cards.
+  - title bar/window buttons, query input, candidate panel, result card, star button, settings rows, style cards.
 - New/changed components:
   - Left pane: query input, an empty-state line, one shared list, and the segmented 查询/历史/收藏 control (the first segment is labelled 查询, not 候选: 候选 is the internal term for what completion produces, and putting it on screen reads as a different thing) at the bottom (below the list, so Tab out of the query field lands on the list).
   - Right pane: direction tab bar (全部/英汉/汉英) filtering the already-fetched cards; it never re-routes the query. Entry bodies are rich text (selectable); grading and inflection badges remain regular elements.
   - Draggable splitter between the panes; it draws the divider line itself so it can thicken on hover.
   - Full-width notice strip at the bottom, since its sources span both panes.
   - Source/status strip that does not compete with the result.
-  - Empty-state panel, no-result actions, translation-source warning banner, settings skin picker.
+  - Empty-state panel, no-result actions, translation-source warning banner, settings appearance group (light/dark segmented + style cards).
 - Variants and states:
   - Left pane on each of its three tabs, each with its own empty state; direction tab holding no cards for the current lookup; empty history; unavailable user data; active favorite; unselected favorite; query-source warning for generated content.
 - Token/component ownership:
@@ -104,7 +105,7 @@
 - Window-level shortcuts (listed read-only in Settings, and in the SHORTCUTS table in ui.rs): Ctrl+L focuses the query field and selects its contents; Ctrl+R re-runs the current lookup; Ctrl+Left/Right walk the lookup path; Ctrl+W collapses the window (it does not quit — the tray keeps running); Escape returns from Settings rather than collapsing the window. These are dispatched only after the focused control declines the key, so typing is never intercepted.
 - The wake hotkey accepts a single function key. F1–F12 do not take part in text entry, so they are safe on their own; letters and digits still require a modifier, or they would swallow that character in every application.
 - Keyboard/focus behavior: waking the window returns focus to the query field and re-selects its contents, even if focus had been left on another control. Up/Down move the left-pane row cursor and look the row up live (without recording history); Right accepts the completion into the query field; Enter looks the row up and records history. Tab is left to focus navigation and goes query -> list -> segmented: the clear button is out of the tab ring (it is an attachment to the field, not a destination, and landing on it puts a destructive action under the space bar), and so are the individual rows, so the list takes focus as one unit and moves by Up/Down inside it (roving tabindex). Clicking a row also hands focus to the list, so the mouse and the keyboard connect. Escape hides the window.
-- Contrast/readability: muted text must remain readable on all skins; do not use low-contrast decorative labels for required information.
+- Contrast/readability: muted text must remain readable in all six palettes; do not use low-contrast decorative labels for required information. `skin.rs` carries tests asserting AA on accent text, 7:1 on body text over every ground, and 3:1 accent-vs-ground.
 - Screen-reader semantics: icon buttons need labels; segmented history/favorites tabs need selected state.
 - Reduced motion and sensory considerations: tab-indicator and popover animation should be short; nothing animates continuously.
 
@@ -137,7 +138,7 @@
 - Design-token constraints: app UI should use `Role` / `RoleAlpha`; literal colors belong in `skin.rs` or static mockups only.
 - Performance constraints: no polling; completion remains reactive and capped.
 - Compatibility constraints: Windows-first native behavior; main window is not focus-loss-hidden.
-- Test/screenshot expectations: before native UI changes, capture at default 920x620 and minimum 720x480 for all skins.
+- Test/screenshot expectations: before native UI changes, capture at default 920x620 and minimum 720x480 for all six palettes. Screenshot runs must point `LOCALAPPDATA` at a sandbox -- `--click` writes real history and settings.
 
 ## Open Questions
 - [ ] Should the default main window show a compact recent-chip row when no query is active, or stay fully blank except for the query prompt? Owner: product/design. Impact: empty-state density.
