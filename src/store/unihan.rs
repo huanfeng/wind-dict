@@ -34,7 +34,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 
-use crate::domain::Glyph;
+use crate::domain::{CharTier, Glyph};
 
 /// 字形库的表结构。**构建工具与测试共用此定义**。
 ///
@@ -48,7 +48,9 @@ CREATE TABLE IF NOT EXISTS glyph (
     extra_strokes INTEGER NOT NULL,
     total_strokes INTEGER NOT NULL,
     simplified    TEXT    NOT NULL DEFAULT '',
-    traditional   TEXT    NOT NULL DEFAULT ''
+    traditional   TEXT    NOT NULL DEFAULT '',
+    readings      TEXT    NOT NULL DEFAULT '',
+    tier          INTEGER
 );";
 
 /// 康熙 214 部首的字形，按部首号 1–214 顺序排列。
@@ -96,6 +98,39 @@ pub fn parse_rs(field: &str) -> Option<RadicalStroke> {
         simplified_level: u8::try_from(apostrophes).ok()?,
         extra_strokes: tail.parse().ok()?,
     })
+}
+
+/// 从 `kXHC1983` / `kTGHZ2013` / `kMandarin` 的一个值里取出读音列表。
+///
+/// 前两者的每项形如 `0442.080:háng`，冒号前是原字典的页码位置；`kMandarin` 则是
+/// 光秃秃的 `xíng`。页码**可以逗号分隔多个**（实测 143 条，如 `049.010,049.020:chǒu`），
+/// 故按最后一个冒号切，不按第一个——按第一个会把 `049.020:chǒu` 整段当成读音。
+///
+/// 顺带去重：同一个读音在不同页出现是可能的，展示两遍是噪音。
+pub fn parse_readings(field: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tok in field.split_whitespace() {
+        let py = tok.rsplit_once(':').map_or(tok, |(_, p)| p);
+        if !py.is_empty() && !out.iter().any(|x| x == py) {
+            out.push(py.to_string());
+        }
+    }
+    out
+}
+
+/// 从 `kHanyuPinlu` 里取「读音 → 出现次数」，用于给读音排序。
+///
+/// 值形如 `xíng(2943) háng(218)`。它只覆盖 3,799 字，故仅作排序依据、不作读音来源：
+/// 拿它当来源会让绝大多数字一个读音都没有。
+pub fn parse_pinlu(field: &str) -> Vec<(String, u32)> {
+    field
+        .split_whitespace()
+        .filter_map(|tok| {
+            let (py, rest) = tok.split_once('(')?;
+            let n = rest.strip_suffix(')')?.parse().ok()?;
+            Some((py.to_string(), n))
+        })
+        .collect()
 }
 
 /// 拿 Unihan 数据反验 [`KANGXI_RADICALS`]：每个部首字自身的 `kRSUnicode` 必须是
@@ -160,7 +195,8 @@ impl Unihan {
     /// 有意义的问题，故让它在类型上就无法表达（同 [`Glyph`] 的文档）。
     pub fn get(&self, ch: char) -> Result<Option<Glyph>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT radical, radical_no, extra_strokes, total_strokes, simplified, traditional
+            "SELECT radical, radical_no, extra_strokes, total_strokes, simplified, traditional,
+                    readings, tier
              FROM glyph WHERE ch = ?1",
         )?;
         let mut rows = stmt.query([ch.to_string()])?;
@@ -176,6 +212,14 @@ impl Unihan {
             total_strokes: row.get(3)?,
             simplified: row.get::<_, String>(4)?.chars().collect(),
             traditional: row.get::<_, String>(5)?.chars().collect(),
+            // 空格分隔。构建期已排好序、去过重，读取时不再加工。
+            readings: row
+                .get::<_, String>(6)?
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+            // 库里存的是整数，来路未必可信，故经 `from_level` 过一道而非直接转型。
+            tier: row.get::<_, Option<u8>>(7)?.and_then(CharTier::from_level),
         }))
     }
 }
@@ -258,6 +302,60 @@ mod tests {
         assert_eq!(radical_char(215, None), None);
     }
 
+    #[test]
+    fn 读音要剥掉页码前缀() {
+        assert_eq!(
+            parse_readings("0442.080:háng 1290.030:xíng"),
+            ["háng", "xíng"]
+        );
+        // kMandarin 没有页码，裸读音也得认。
+        assert_eq!(parse_readings("xíng"), ["xíng"]);
+        assert!(parse_readings("").is_empty());
+    }
+
+    /// 143 条记录的页码是逗号分隔的多个。按**第一个**冒号切会把
+    /// `049.020:chǒu` 整段当成读音，得到 `049.020:chǒu` 这种垃圾。
+    #[test]
+    fn 逗号分隔的多页码不影响取读音() {
+        assert_eq!(parse_readings("049.010,049.020:chǒu"), ["chǒu"]);
+        assert_eq!(
+            parse_readings("0758.081,0758.091:ma 0770.150:me 1340.041:yāo"),
+            ["ma", "me", "yāo"]
+        );
+    }
+
+    #[test]
+    fn 同一读音只留一个() {
+        assert_eq!(
+            parse_readings("001.010:yī 002.020:yī 003.030:èr"),
+            ["yī", "èr"]
+        );
+    }
+
+    #[test]
+    fn 读音频次解析得出() {
+        assert_eq!(
+            parse_pinlu("xíng(2943) háng(218)"),
+            [("xíng".to_string(), 2943), ("háng".to_string(), 218)]
+        );
+        // 畸形项跳过而不是整条报废——少一个排序依据，不该连累其余读音。
+        assert_eq!(
+            parse_pinlu("xíng(abc) háng(218)"),
+            [("háng".to_string(), 218)]
+        );
+        assert!(parse_pinlu("").is_empty());
+    }
+
+    #[test]
+    fn 字级只认一到三() {
+        assert_eq!(CharTier::from_level(1), Some(CharTier::Level1));
+        assert_eq!(CharTier::from_level(3), Some(CharTier::Level3));
+        assert_eq!(CharTier::from_level(0), None);
+        assert_eq!(CharTier::from_level(4), None);
+        assert_eq!(CharTier::Level1.label(), "一级字");
+        assert_eq!(CharTier::Level2.level(), 2);
+    }
+
     /// 拿**真实建出来的库**跑一遍。
     ///
     /// 上面那些测的都是纯函数，证明不了「建库工具写进去的东西读得回来」——解析对、
@@ -291,6 +389,28 @@ mod tests {
         // 这两个是「从数据推基本形」那条错路会挑错的位置，用真实库再钉一遍。
         assert_eq!(db.get('田').unwrap().unwrap().radical, '田');
         assert_eq!(db.get('爿').unwrap().unwrap().radical, '爿');
+
+        // 读音：普通话调号、大陆标准、按常用度排序。
+        // `行` 的 xíng 在频率词典里 2943 次、háng 218 次，故 xíng 必须在前——
+        // 若退回原字典页码序，出来的是 háng 打头，那是按拼音字母排的，与常用度无关。
+        let g = db.get('行').unwrap().unwrap();
+        assert_eq!(g.readings.first().map(String::as_str), Some("xíng"));
+        assert!(g.readings.iter().any(|r| r == "háng"));
+
+        // 取 kXHC1983 而非 kTGHZ2013 的验证点：后者对 `语` 只给 yǔ，而 CC-CEDICT
+        // 在同一张卡片下列着 yu3 与 yu4 两条词条。少给一个音，卡片就自相矛盾。
+        assert_eq!(db.get('语').unwrap().unwrap().readings, ["yǔ", "yù"]);
+
+        // ü 必须是调号形式，不是 v 也不是 u:。
+        assert_eq!(db.get('女').unwrap().unwrap().readings, ["nǚ"]);
+
+        // 字级：一级 3500 常用字。
+        assert_eq!(
+            db.get('好').unwrap().unwrap().tier,
+            Some(crate::domain::CharTier::Level1)
+        );
+        // 48 画的生僻字不在《通用规范汉字表》里，没有字级——这是 None 而非报错。
+        assert_eq!(db.get('龘').unwrap().unwrap().tier, None);
 
         // 未收录的字返回 None，不是报错——字形缺失是常态，不是故障。
         assert!(db.get('A').unwrap().is_none());

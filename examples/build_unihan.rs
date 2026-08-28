@@ -2,8 +2,11 @@
 //!
 //! ```bash
 //! # 先解压 https://www.unicode.org/Public/UCD/latest/ucd/Unihan.zip
-//! cargo run --release --example build_unihan -- <解压目录> unihan.db
+//! cargo run --release --example build_unihan -- <解压目录> unihan.db [字级表目录]
 //! ```
+//!
+//! 字级表目录含 `level-1.txt` / `level-2.txt` / `level-3.txt`（《通用规范汉字表》，
+//! 见 docs/adr/0014）。**可省**：省掉则 `tier` 全为 NULL，其余照建。
 //!
 //! ## 为什么扫整个目录而不按文件名取字段
 //!
@@ -38,7 +41,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 use wind_dict::store::unihan::{
-    parse_rs, radical_char, verify_kangxi_table, RadicalStroke, SCHEMA,
+    parse_pinlu, parse_readings, parse_rs, radical_char, verify_kangxi_table, RadicalStroke, SCHEMA,
 };
 
 /// 从一份 Unihan 文本目录里收集所需字段。
@@ -110,6 +113,68 @@ fn variants(field: Option<&String>, self_cp: u32) -> String {
         .collect()
 }
 
+/// 读《通用规范汉字表》的三个分级文件，返回 `字 → 级号`。
+///
+/// 文件是整块汉字（每行一个或连排都可），故按字符收而非按行收。目录不存在就返回空表：
+/// 字级是纯增益，缺了只是不显示「一级字」，不该让整个建库失败。
+fn read_tiers(dir: Option<&std::path::Path>) -> HashMap<char, u8> {
+    let mut out = HashMap::new();
+    let Some(dir) = dir else { return out };
+    for level in 1u8..=3 {
+        let path = dir.join(format!("level-{level}.txt"));
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!("  [跳过] 读不到 {}", path.display());
+            continue;
+        };
+        for ch in text.chars().filter(|c| !c.is_whitespace()) {
+            // 先到先得：一个字只该出现在一个级里，重复说明字表文件有问题，
+            // 但不值得为此中断——保留级别更低（更常用）的那个。
+            out.entry(ch).or_insert(level);
+        }
+    }
+    out
+}
+
+/// 把一个字的读音定下来：来源优先级 + 常用度排序。
+///
+/// **来源** 取 `kXHC1983`（《现代汉语词典》，11,072 字）优先于更新的 `kTGHZ2013`
+/// （《通用规范汉字字典》，8,105 字）。理由不在数据而在界面：后者对 `语` 只给 `yǔ`，
+/// 而 CC-CEDICT 在同一张卡片下列着 `[yu3]` 与 `[yu4]` 两条词条——字形行的读音少于
+/// 下面列出的词条，卡片就自相矛盾。二者都缺时退到 `kMandarin`（44,348 字，至多两个）。
+///
+/// **排序** 优先按 `kHanyuPinlu` 的出现次数降序（`行` 的 `xíng` 2943 次远超 `háng`
+/// 218 次）；没有频次数据时，把 `kMandarin` 标记的「最常用读音」提到最前。都没有就
+/// 保持原序——那是按原字典页码排的，与常用度无关，但至少是确定的。
+fn resolve_readings(
+    xhc: Option<&String>,
+    tghz: Option<&String>,
+    mandarin: Option<&String>,
+    pinlu: Option<&String>,
+) -> Vec<String> {
+    let mut readings = xhc
+        .map(|v| parse_readings(v))
+        .filter(|v| !v.is_empty())
+        .or_else(|| tghz.map(|v| parse_readings(v)).filter(|v| !v.is_empty()))
+        .or_else(|| mandarin.map(|v| parse_readings(v)))
+        .unwrap_or_default();
+
+    if let Some(freq) = pinlu.map(|v| parse_pinlu(v)) {
+        if !freq.is_empty() {
+            // 未进频次表的读音排在所有有频次的之后，彼此保持原序（sort_by_key 稳定）。
+            readings.sort_by_key(|py| {
+                std::cmp::Reverse(freq.iter().find(|(p, _)| p == py).map_or(0, |(_, n)| *n))
+            });
+            return readings;
+        }
+    }
+    if let Some(main) = mandarin.and_then(|v| parse_readings(v).into_iter().next()) {
+        if let Some(i) = readings.iter().position(|py| *py == main) {
+            readings[..=i].rotate_right(1);
+        }
+    }
+    readings
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let (Some(src), Some(dst)) = (args.next(), args.next()) else {
@@ -117,6 +182,8 @@ fn main() -> Result<()> {
         std::process::exit(2);
     };
     let dir = std::path::Path::new(&src);
+    let tier_dir = args.next();
+    let tiers = read_tiers(tier_dir.as_deref().map(std::path::Path::new));
 
     println!("读取 Unihan 数据…");
     let data = collect(
@@ -126,6 +193,13 @@ fn main() -> Result<()> {
             "kTotalStrokes",
             "kSimplifiedVariant",
             "kTraditionalVariant",
+            // 以下四项是**大陆来源**的读音数据。kXHC1983 出自《现代汉语词典》、
+            // kTGHZ2013 出自《通用规范汉字字典》、kHanyuPinlu 出自《現代漢語頻率詞典》。
+            // 只是拼音与页码索引，不含释义，故不触及这些辞书的版权。
+            "kXHC1983",
+            "kTGHZ2013",
+            "kMandarin",
+            "kHanyuPinlu",
         ],
     )?;
     let rs_raw = &data["kRSUnicode"];
@@ -199,10 +273,11 @@ fn main() -> Result<()> {
 
     let tx = conn.transaction()?;
     let (mut ok, mut no_strokes, mut no_radical) = (0u32, 0u32, 0u32);
+    let mut with_readings = 0u32;
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO glyph (ch, radical, radical_no, extra_strokes, total_strokes, simplified, traditional)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO glyph (ch, radical, radical_no, extra_strokes, total_strokes, simplified, traditional, readings, tier)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
         for (cp, rs) in &parsed {
             let Some(ch) = char::from_u32(*cp) else {
@@ -238,7 +313,21 @@ fn main() -> Result<()> {
                 total,
                 variants(data["kSimplifiedVariant"].get(cp), *cp),
                 variants(data["kTraditionalVariant"].get(cp), *cp),
+                resolve_readings(
+                    data["kXHC1983"].get(cp),
+                    data["kTGHZ2013"].get(cp),
+                    data["kMandarin"].get(cp),
+                    data["kHanyuPinlu"].get(cp),
+                )
+                .join(" "),
+                tiers.get(&ch),
             ])?;
+            if data["kXHC1983"].contains_key(cp)
+                || data["kTGHZ2013"].contains_key(cp)
+                || data["kMandarin"].contains_key(cp)
+            {
+                with_readings += 1;
+            }
             ok += 1;
             if ok % 20_000 == 0 {
                 print!("\r已插入 {ok} 字…");
@@ -251,6 +340,10 @@ fn main() -> Result<()> {
 
     let size = std::fs::metadata(&dst)?.len() as f64 / 1024.0 / 1024.0;
     println!("\r字形库建成：{ok} 字，{size:.1}MB → {dst}");
+    println!(
+        "  其中 {with_readings} 字有普通话读音，{} 字有《通用规范汉字表》字级",
+        tiers.len()
+    );
     if no_strokes > 0 {
         println!("  跳过 {no_strokes} 字（无总笔画）");
     }

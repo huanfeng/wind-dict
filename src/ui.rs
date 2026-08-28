@@ -30,7 +30,7 @@ use windui::render::{Canvas, Paint};
 use windui::ui::containers::{TabBar, TabItem};
 
 use crate::domain::{
-    Candidate, Dictionary, Entry, Glyph, Headword, Lookup, Query, Sense, Wordlist,
+    Candidate, CharTier, Dictionary, Entry, Glyph, Headword, Lookup, Query, Sense, Wordlist,
 };
 use crate::settings::Settings;
 use crate::skin::{SkinMode, SkinStyle};
@@ -3637,14 +3637,34 @@ fn card_view(c: Card, st: Rc<State>) -> Element {
     col
 }
 
-/// 字形一行：部首、部外笔画、总笔画。
+/// 字形一行：读音、部首、笔画、字级。
 ///
 /// 画在**卡片**上而非词条里，理由见 [`Card::glyph`]：`行` 有三条词条却只有一副字形，
 /// 放进 `chinese_doc` 就会重复三遍。数据模型里避开的重复，在渲染层重新引入等于白避。
 ///
-/// 用普通标签而非富文本：它是元信息，不是释义。DESIGN.md 把「能选中」这条留给正文，
-/// 而「部首 讠」单独被复制出来是没有上下文的碎片——同星级、考纲徽章的处置。
+/// 用普通标签与徽章而非富文本：它是元信息，不是释义。DESIGN.md 把「能选中」这条留给
+/// 正文，而「部首 讠」单独被复制出来是没有上下文的碎片——同星级、考纲徽章的处置。
+///
+/// 读音用普通话调号（`yǔ`）而非 CC-CEDICT 的数字调（`yu3`），且是**字**的读音全集；
+/// 每条词条各自的拼音仍归词条。二者不重复：一个答「这个字怎么念」，一个答
+/// 「这条词条读哪个音」。
 fn glyph_row(g: &Glyph) -> Element {
+    // 组间距 16：读音与检字数据各自内部都用 `·` 分隔，靠太近时两组会连成一条长链，
+    // 读的人分不出哪几个是读音。颜色差做了一半的活，间距补另一半。
+    let mut row = Element::row()
+        .width_match()
+        .cross(Align::Center)
+        .spacing(16);
+
+    // 读音排最前且不弱化：整行里只有它是用户念得出来的东西，其余都是检字信息。
+    if !g.readings.is_empty() {
+        row = row.child(
+            Element::label(g.readings.join(" · "))
+                .font_size(13.5)
+                .fg_role(Role::Text),
+        );
+    }
+
     let mut parts = vec![format!("部首 {}", g.radical)];
     // 部外笔画为负时略去。那 32 个字比自身部首还少一笔，Unihan 记负数是诚实的，
     // 但「部外 -1 画」没人看得懂，而总笔画已经把该说的说完了。
@@ -3652,10 +3672,24 @@ fn glyph_row(g: &Glyph) -> Element {
         parts.push(format!("部外 {} 画", g.extra_strokes));
     }
     parts.push(format!("共 {} 画", g.total_strokes));
-    Element::label(parts.join("  ·  "))
-        .font_size(12.5)
-        .fg_role(Role::TextMuted)
-        .width_match()
+    row = row.child(
+        Element::label(parts.join("  ·  "))
+            .font_size(12.5)
+            .fg_role(Role::TextMuted),
+    );
+
+    // 字级做成徽章而非行内文字，与英文词的考纲徽章同一套语言：它标的是「这个字有多
+    // 常用」这一身份，与左边那串检字数据不是一类，混进同一串 `·` 会被读丢。
+    // 一级字用强调色——3500 个常用字是这套分级里唯一对普通读者有意义的那档。
+    if let Some(t) = g.tier {
+        let first = t == CharTier::Level1;
+        row = row.child(grading_chip(
+            t.label(),
+            if first { Role::Accent } else { Role::TextMuted },
+            if first { 600 } else { 400 },
+        ));
+    }
+    row
 }
 
 /// 词头：全屏最大的那几个字。

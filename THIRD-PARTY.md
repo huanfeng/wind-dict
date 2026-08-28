@@ -9,6 +9,7 @@
 | `ecdict.db` | ECDICT | MIT |
 | `cedict.db` | CC-CEDICT | CC BY-SA 4.0 |
 | `unihan.db` | Unicode Han Database (Unihan) | Unicode License V3 |
+| `unihan.db` 的字级 | 《通用规范汉字表》 | 不适用著作权法（见下） |
 
 ---
 
@@ -77,3 +78,20 @@ authorization of the copyright holder.
 ```
 
 许可全文：<https://www.unicode.org/license.txt>
+
+`unihan.db` 中的普通话读音取自 Unihan 的 `kXHC1983` / `kTGHZ2013` / `kHanyuPinlu`
+字段。它们分别是《现代汉语词典》《通用规范汉字字典》《現代漢語頻率詞典》的**拼音与
+页码索引**，不含释义，随 Unihan 一并以 Unicode License 分发。
+
+## 通用规范汉字表
+
+`unihan.db` 中的字级（一级 / 二级 / 三级）取自《通用规范汉字表》，中华人民共和国
+国务院 **国发〔2013〕23 号**，2013 年 6 月 5 日发布。
+
+该字表属《中华人民共和国著作权法》第五条所指「国家机关的……行政性质的文件」，
+**不适用著作权法**，故可自由使用。此处列出是为了交代出处，不是为了履行许可义务——
+它没有许可义务。
+
+本项目取用的数据文件来自
+<https://github.com/shengdoushi/common-standard-chinese-characters-table>，
+已核对为 3500 / 3000 / 1605 = 8105 字，与官方数字一致。

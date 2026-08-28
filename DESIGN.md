@@ -8,11 +8,12 @@
   - `CONTEXT.md`: product terminology and query-source boundaries.
   - `src/ui.rs`: current main window, history/favorites sidebar, completion popover, result card, settings page.
   - `src/skin.rs`: three styles (plain / paper / focus) x light and dark = six palettes.
-  - `src/store/unihan.rs`: glyph data (radical, strokes, variants) from the Unicode Unihan database.
+  - `src/store/unihan.rs`: glyph data (radical, strokes, variants, mainland-standard readings, character tier) from the Unicode Unihan database and the PRC General Standard Chinese Characters Table.
   - `docs/adr/0005-windows-first.md`: Windows-first delivery constraint.
   - `docs/adr/0007-esc-hides-focus-loss-does-not.md`: main window remains visible for reading/copying.
   - `docs/adr/0011-user-data-outlives-deployment.md`: history and favorites persistence.
   - `docs/adr/0013-glyph-belongs-to-the-character-not-the-entry.md`: glyph is a property of the character, rendered once per card.
+  - `docs/adr/0014-mainland-standard-readings-and-tiers.md`: readings come from the mainland source whose coverage matches the entries shown below them; tier from the PRC standard table.
   - `docs/ui-redesign-mockups.html`: first-round UI exploration with visible history sidebar.
   - `docs/ui-redesign-search-first.html`: search-first redesign with floating completion and recall drawers.
   - `docs/ui-redesign-screens.html`: screen-state gallery for empty, no-result, Chinese entry, favorites drawer, settings, and translation source views.
@@ -90,7 +91,7 @@
 ## Components
 - Existing components to reuse:
   - title bar/window buttons, query input, candidate panel, result card, star button, settings rows, style cards.
-- Glyph line (radical, residual strokes, total strokes) sits on the headword card, between the divider and the first entry. It renders **once per card, never per entry**: a character has one glyph but may have several readings, so `行` would otherwise print it three times. It answers "what character is this", which belongs with the headword, not after the definitions. Plain muted label, not rich text -- "部首 讠" copied on its own is a context-free fragment, so it is treated like the star rating and exam-tag badges rather than like body text.
+- Glyph line (readings, radical, residual strokes, total strokes, tier badge) sits on the headword card, between the divider and the first entry. It renders **once per card, never per entry**: a character has one glyph but may have several readings, so `行` would otherwise print it three times. It answers "what character is this", which belongs with the headword, not after the definitions. Plain muted label, not rich text -- "部首 讠" copied on its own is a context-free fragment, so it is treated like the star rating and exam-tag badges rather than like body text.
 - New/changed components:
   - Left pane: query input, an empty-state line, one shared list, and the segmented 查询/历史/收藏 control (the first segment is labelled 查询, not 候选: 候选 is the internal term for what completion produces, and putting it on screen reads as a different thing) at the bottom (below the list, so Tab out of the query field lands on the list).
   - Right pane: direction tab bar (全部/英汉/汉英) filtering the already-fetched cards; it never re-routes the query. Entry bodies are rich text (selectable); grading and inflection badges remain regular elements.

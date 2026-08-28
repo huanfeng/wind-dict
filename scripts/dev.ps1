@@ -43,6 +43,9 @@ $EcdictUrl = "https://raw.githubusercontent.com/skywind3000/ECDICT/master/ecdict
 $CedictUrl = "https://www.mdbg.net/chinese/export/cedict/cedict_1_0_ts_utf-8_mdbg.txt.gz"
 # 字形源。Unihan 是 Unicode 官方数据, latest 随标准每年更新。
 $UnihanUrl = "https://www.unicode.org/Public/UCD/latest/ucd/Unihan.zip"
+# 《通用规范汉字表》(国务院 国发〔2013〕23 号) 的三级字表。
+# 该字表属《著作权法》第五条所指行政性质文件, 不适用著作权法, 故可自由使用。
+$TghzBase = "https://raw.githubusercontent.com/shengdoushi/common-standard-chinese-characters-table/master"
 
 # ---------- 部署目标 (可在 deploy.local.ps1 覆盖) ----------
 #
@@ -120,6 +123,14 @@ function Do-GenData {
         Expand-Archive -Path $unihanZip -DestinationPath $unihanDir -Force
     }
 
+    # 字级表: 三个小文本, 缺了 build_unihan 会照建, 只是没有「一级字」这类标记。
+    $tghzDir = "$SrcDir\tghz"
+    New-Item -ItemType Directory -Path $tghzDir -Force | Out-Null
+    foreach ($lv in 1..3) {
+        $f = "$tghzDir\level-$lv.txt"
+        if (-not (Test-Path $f)) { Get-File "$TghzBase/level-$lv.txt" $f "通用规范汉字表 $lv 级" | Out-Null }
+    }
+
     $ecdictDb = "$DictDir\ecdict.db"
     $cedictDb = "$DictDir\cedict.db"
     $unihanDb = "$DictDir\unihan.db"
@@ -139,7 +150,7 @@ function Do-GenData {
 
         if ((-not (Test-Path $unihanDb)) -or (Test-Newer $unihanZip $unihanDb)) {
             Say "`n构建字形库 (~10 万字)..."
-            cargo run --release --example build_unihan -- $unihanDir $unihanDb
+            cargo run --release --example build_unihan -- $unihanDir $unihanDb $tghzDir
             if ($LASTEXITCODE -ne 0) { ErrMsg "build_unihan 失败!"; return $false }
         } else { Gray "[skip] unihan.db 已最新" }
     } finally { Pop-Location }

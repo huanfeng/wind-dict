@@ -420,6 +420,65 @@ pub struct Glyph {
     pub simplified: Vec<char>,
     /// 对应的繁体写法。本字已是繁体时为空。可能多于一个。
     pub traditional: Vec<char>,
+    /// 普通话读音，带调号（`yǔ`），按常用度排序。**大陆标准**。
+    ///
+    /// 取自 Unihan 的 `kXHC1983`（《现代汉语词典》）而非更新的 `kTGHZ2013`
+    /// （《通用规范汉字字典》，2013），理由来自界面而非数据：后者对 `语` 只给 `yǔ`，
+    /// 而 CC-CEDICT 在同一张卡片下列着 `[yu3]` 与 `[yu4]` 两条词条。字形行的读音若
+    /// 少于下面列出的词条，卡片就在自相矛盾。详见 docs/adr/0014。
+    ///
+    /// 与 [`ChineseEntry::pinyin`] 不重复也不冲突：那是**词条**的读音（每条一个，
+    /// 数字调），这是**字**的读音全集（带调号）。同 `Glyph` 与 `Entry` 的分工。
+    pub readings: Vec<String>,
+    /// 《通用规范汉字表》的级别。`None` = 不在这 8105 字之内。
+    pub tier: Option<CharTier>,
+}
+
+/// 《通用规范汉字表》（国务院 国发〔2013〕23 号）的字级。
+///
+/// 这是**大陆官方**对「哪些字重要」的回答，作用等同于 [`Grading`] 之于英文词——
+/// 一级 3500 字是义务教育与日常出版的常用字，三级多为姓氏、地名、科技术语用字。
+///
+/// 该字表属《著作权法》第五条所指「国家机关的……行政性质的文件」，不适用著作权法，
+/// 故可自由使用。这一点与其载体仓库挂什么许可无关：没有人能对政府规范性文件主张权利。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CharTier {
+    /// 一级字，3500 个。
+    Level1,
+    /// 二级字，3000 个。
+    Level2,
+    /// 三级字，1605 个。
+    Level3,
+}
+
+impl CharTier {
+    /// 由级号构造。1/2/3 之外返回 `None`——库里存的是整数，不能假定它一定合法。
+    pub fn from_level(n: u8) -> Option<Self> {
+        match n {
+            1 => Some(Self::Level1),
+            2 => Some(Self::Level2),
+            3 => Some(Self::Level3),
+            _ => None,
+        }
+    }
+
+    /// 级号，1–3。
+    pub fn level(self) -> u8 {
+        match self {
+            Self::Level1 => 1,
+            Self::Level2 => 2,
+            Self::Level3 => 3,
+        }
+    }
+
+    /// 界面用的短标签。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Level1 => "一级字",
+            Self::Level2 => "二级字",
+            Self::Level3 => "三级字",
+        }
+    }
 }
 
 // ── 查询词与方向 ──────────────────────────────────────────────
