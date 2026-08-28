@@ -35,7 +35,8 @@ Unihan 是 **Unicode License V3**（可用、可改、可再分发、可商用�
 候选里最热门的两个都不能用，且都不是因为质量：
 
 - **pwxcoo/chinese-xinhua**（16,142 字，star 最多）：仓库挂 MIT，README 却写着「数据都是我从网上收集整理的……本仓库无任何商业目的！如果有侵权行为将及时删除！」。内容抓自《新华字典》，商务印书馆的版权仍在有效期内。仓库作者无权对自己没有的东西授权。
-- **g0v/moedict 中華大辭典**：CC BY-**NC-ND**。ND 禁止改编——按 ADR-0010 自建 SQLite 正是改编；NC 禁止商用。双重出局。
+- **g0v/moedict 中華大辭典**：CC BY-**NC-ND**。NC 禁止商用，这一条即已出局。
+- **教育部四部國語辭典**：CC BY-ND 3.0 TW，**允许商用**，比上一条宽松得多。卡住它的不是「自建 SQLite」——按 CC 官方说明，单纯的格式转换不构成改编，ND 允许（"in any media or format... even if you have applied a NoDerivatives license"）。卡住它的是**繁简转换**：本项目词头恒为简体（术语表），而繁→简是字词层面的替换，比格式转换离「翻译」近得多，那正是 ND 明确禁止的那一类。判据是「有没有创造性转换」，不是「换没换格式」。
 - **mapull/chinese-dictionary**：字段最全（含结构、频率），但 README 自陈「无法确认数据的最初来源，使用它们可能存在风险」。
 
 选 Unihan 的首要理由不是字段多（它的 `kDefinition` 是英文且极简，`kMandarin` 每字只给一个音，多音字上明显不如已有的 CC-CEDICT），而是**它是唯一一个来源完全可追溯、且不会哪天被下架的**。故只取其字形，音义仍走 CC-CEDICT。
