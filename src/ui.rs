@@ -29,7 +29,9 @@ use windui::render::{Canvas, Paint};
 // 连内容区一起打包的 `Element::tabs`。理由见 `dict_tab_bar`。
 use windui::ui::containers::{TabBar, TabItem};
 
-use crate::domain::{Candidate, Dictionary, Entry, Headword, Lookup, Query, Sense, Wordlist};
+use crate::domain::{
+    Candidate, Dictionary, Entry, Glyph, Headword, Lookup, Query, Sense, Wordlist,
+};
 use crate::settings::Settings;
 use crate::skin::{SkinMode, SkinStyle};
 use crate::source::offline::OfflineDictionary;
@@ -371,6 +373,11 @@ struct Card {
     /// 是否已收藏。取值时刻即卡片构建时刻，由 `revision` 驱动重建保持新鲜。
     fav: bool,
     entries: Vec<Entry>,
+    /// 字形。仅当词头**恰好一个字**时才有——「苹果的部首」不是有意义的问题。
+    ///
+    /// 挂在卡片上而不是挂在词条上：`行` 有三条词条（hang2/heng2/xing2）却只有一副
+    /// 字形，放进 [`Entry`] 会存三份、也会画三遍。见 `domain::Glyph` 的文档。
+    glyph: Option<Glyph>,
 }
 
 /// `LeftPaneLoader` 上一轮见到的各信号版本。
@@ -1300,6 +1307,7 @@ impl State {
             .into_iter()
             .map(|(hw, entries)| Card {
                 fav: self.is_favorite(&hw),
+                glyph: self.glyph_of(&hw),
                 headword: hw,
                 entries,
             })
@@ -1330,6 +1338,17 @@ impl State {
             })
             .collect();
         self.cards.set(cards);
+    }
+
+    /// 词头的字形。词头不是**单个字**时没有字形，不是「查不到」。
+    ///
+    /// 判据写成「恰好一个 char」而非 `len() == 1`：后者是字节数，任何一个汉字都过不了。
+    fn glyph_of(&self, hw: &Headword) -> Option<Glyph> {
+        let mut it = hw.as_str().chars();
+        match (it.next(), it.next()) {
+            (Some(ch), None) => self.dict.glyph(ch),
+            _ => None,
+        }
     }
 
     /// 词头是否已收藏。读不到时按「未收藏」呈现——星标必须画成某个样子，而空心星
@@ -3596,6 +3615,11 @@ fn card_view(c: Card, st: Rc<State>) -> Element {
     // 词头区与释义区之间的分隔线，与设计稿一致。两者是不同层次的信息——上面回答
     // 「这是哪个词」，下面回答「它什么意思」，一条线比单纯拉开间距更能说明这件事。
     col = col.child(Element::divider());
+    // 字形在释义之前：它回答「这是个什么字」，与上方词头同属「这是哪个词」那一层，
+    // 排在释义之后就与阅读顺序拧着了。
+    if let Some(g) = &c.glyph {
+        col = col.child(glyph_row(g));
+    }
     for (i, e) in c.entries.into_iter().enumerate() {
         // 只查表，不新建：本函数跑在重建作用域内，在这里 `signal()` 出来的句柄活不过
         // 下一次重建。信号由 `rebuild_cards` 预先备好，详见 `ExpandedStates`。
@@ -3611,6 +3635,27 @@ fn card_view(c: Card, st: Rc<State>) -> Element {
         col = col.child(note_field(hw, st));
     }
     col
+}
+
+/// 字形一行：部首、部外笔画、总笔画。
+///
+/// 画在**卡片**上而非词条里，理由见 [`Card::glyph`]：`行` 有三条词条却只有一副字形，
+/// 放进 `chinese_doc` 就会重复三遍。数据模型里避开的重复，在渲染层重新引入等于白避。
+///
+/// 用普通标签而非富文本：它是元信息，不是释义。DESIGN.md 把「能选中」这条留给正文，
+/// 而「部首 讠」单独被复制出来是没有上下文的碎片——同星级、考纲徽章的处置。
+fn glyph_row(g: &Glyph) -> Element {
+    let mut parts = vec![format!("部首 {}", g.radical)];
+    // 部外笔画为负时略去。那 32 个字比自身部首还少一笔，Unihan 记负数是诚实的，
+    // 但「部外 -1 画」没人看得懂，而总笔画已经把该说的说完了。
+    if g.extra_strokes >= 0 {
+        parts.push(format!("部外 {} 画", g.extra_strokes));
+    }
+    parts.push(format!("共 {} 画", g.total_strokes));
+    Element::label(parts.join("  ·  "))
+        .font_size(12.5)
+        .fg_role(Role::TextMuted)
+        .width_match()
 }
 
 /// 词头：全屏最大的那几个字。
@@ -4287,6 +4332,9 @@ mod tests {
             headword: entries[0].headword().clone(),
             fav: false,
             entries,
+            // 这些测试考的是页签筛选，与字形无关。字形要靠打开字形库才拿得到，
+            // 而单测里没有库文件——留空正是「字形库缺席」那条路径的样子。
+            glyph: None,
         }
     }
 

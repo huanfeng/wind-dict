@@ -6,9 +6,10 @@
 
 use anyhow::{Context, Result};
 
-use crate::domain::{Candidate, Dictionary, Direction, Lookup, Query, Wordlist};
+use crate::domain::{Candidate, Dictionary, Direction, Glyph, Lookup, Query, Wordlist};
 use crate::store::cedict::Cedict;
 use crate::store::ecdict::Ecdict;
+use crate::store::unihan::Unihan;
 
 /// 离线词典。
 pub struct OfflineDictionary {
@@ -16,6 +17,8 @@ pub struct OfflineDictionary {
     ecdict: Ecdict,
     /// 汉英方向的词库。
     cedict: Cedict,
+    /// 字形库。**可缺**，理由见 [`OfflineDictionary::open`]。
+    unihan: Option<Unihan>,
 }
 
 impl OfflineDictionary {
@@ -24,11 +27,30 @@ impl OfflineDictionary {
     /// 二者缺一不可：缺了任一份，对应方向的查询就只能谎称「未收录」——而术语表里
     /// 「一无所获」的意思是**词典确实没有这个词**，不是「我没能力查」。与其在运行时
     /// 撒谎，不如在这里失败。
-    pub fn open(ecdict_path: &std::path::Path, cedict_path: &std::path::Path) -> Result<Self> {
+    ///
+    /// 字形库则**允许缺席**，且这不是双重标准。上面那条理由是「缺了会让程序说谎」，
+    /// 它不迁移到字形：少一份字形，界面只是不显示部首笔画，没有任何一句话变成假的。
+    /// 让一个纯增益的数据有权阻止程序启动，代价是所有尚未重建数据的部署直接打不开。
+    pub fn open(
+        ecdict_path: &std::path::Path,
+        cedict_path: &std::path::Path,
+        unihan_path: &std::path::Path,
+    ) -> Result<Self> {
         Ok(Self {
             ecdict: Ecdict::open(ecdict_path)?,
             cedict: Cedict::open(cedict_path)?,
+            // 打不开就当没有。这里吞掉错误是刻意的——它与「词库路径设错」不同，
+            // 用户没有配置过字形库，也就无从「设错」。
+            unihan: Unihan::open(unihan_path).ok(),
         })
+    }
+
+    /// 查一个字的字形。字形库缺席、或该字未收录时返回 `None`。
+    ///
+    /// 只接受单个 `char`：字形是**字**的属性，「苹果的部首」不是有意义的问题。
+    /// 这一条在类型上挡住，而不是靠调用方自觉。
+    pub fn glyph(&self, ch: char) -> Option<Glyph> {
+        self.unihan.as_ref()?.get(ch).ok().flatten()
     }
 }
 

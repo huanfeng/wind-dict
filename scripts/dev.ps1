@@ -4,7 +4,8 @@
 #   .\scripts\dev.ps1            # 交互式菜单
 #   .\scripts\dev.ps1 <命令>...  # 直调, 可连续: .\scripts\dev.ps1 gd 1 p
 #
-# wind-dict 是绿色单目录应用: 产物 = wind-dict.exe + 两个词库 (ecdict.db / cedict.db)。
+# wind-dict 是绿色单目录应用: 产物 = wind-dict.exe + 两个词库 (ecdict.db / cedict.db)
+#                                     + 一个字形库 (unihan.db, 可缺)。
 # 词库由 examples/build_ecdict|build_cedict 从下载的 ECDICT(CSV) / CC-CEDICT(txt) 构建,
 # 太大不入库 (见 .gitignore), 由 gen-data 生成到 .cache/dict/。
 #
@@ -12,7 +13,7 @@
 #   b / d        Dev 构建 → build_dev/ (exe + 词库软复制)
 #   1 / r        Release 构建 → build/
 #   run          Dev 构建并运行
-#   gd           gen-data: 下载词库源 + 构建 ecdict.db / cedict.db → .cache/dict/
+#   gd           gen-data: 下载词库源 + 构建 ecdict.db / cedict.db / unihan.db → .cache/dict/
 #   p / pd       部署 release / dev → 目标目录 (复制 + 可选开机自启)
 #   u / ud       卸载 release / dev (删目录 + 移除自启)
 #   k=check  l=clippy  t=test  f=fmt  fc=fmt-check  ci(=fc+l+t)  clean
@@ -33,13 +34,15 @@ $ScriptDir   = $PSScriptRoot
 $Root        = Split-Path $ScriptDir -Parent
 $CacheDir    = "$Root\.cache"          # 下载源 + 构建的 .db (不入库)
 $SrcDir      = "$CacheDir\src"         # 下载的 ecdict.csv / cedict.txt
-$DictDir     = "$CacheDir\dict"        # 构建的 ecdict.db / cedict.db
+$DictDir     = "$CacheDir\dict"        # 构建的 ecdict.db / cedict.db / unihan.db
 $BuildDir    = "$Root\build"           # release 产物 (= 部署内容)
 $BuildDevDir = "$Root\build_dev"       # dev 产物
 
 # 词库源。
 $EcdictUrl = "https://raw.githubusercontent.com/skywind3000/ECDICT/master/ecdict.csv"
 $CedictUrl = "https://www.mdbg.net/chinese/export/cedict/cedict_1_0_ts_utf-8_mdbg.txt.gz"
+# 字形源。Unihan 是 Unicode 官方数据, latest 随标准每年更新。
+$UnihanUrl = "https://www.unicode.org/Public/UCD/latest/ucd/Unihan.zip"
 
 # ---------- 部署目标 (可在 deploy.local.ps1 覆盖) ----------
 #
@@ -107,8 +110,19 @@ function Do-GenData {
     if (-not (Get-File $CedictUrl $cedictGz  "汉英 (~4MB gz)")) { return $false }
     if (-not (Test-Path $cedictTxt)) { Gray "[gz  ] 解压 cedict.txt.gz"; Expand-Gzip $cedictGz $cedictTxt }
 
+    # Unihan 是 zip 里的一组 .txt, 解压到子目录 (build_unihan 扫整个目录取字段)。
+    $unihanZip = "$SrcDir\Unihan.zip"
+    $unihanDir = "$SrcDir\unihan"
+    if (-not (Get-File $UnihanUrl $unihanZip "字形 (~8MB zip)")) { return $false }
+    if ((-not (Test-Path $unihanDir)) -or (Test-Newer $unihanZip $unihanDir)) {
+        Gray "[zip ] 解压 Unihan.zip"
+        if (Test-Path $unihanDir) { Remove-Item -Recurse -Force $unihanDir }
+        Expand-Archive -Path $unihanZip -DestinationPath $unihanDir -Force
+    }
+
     $ecdictDb = "$DictDir\ecdict.db"
     $cedictDb = "$DictDir\cedict.db"
+    $unihanDb = "$DictDir\unihan.db"
     Push-Location $Root
     try {
         if ((-not (Test-Path $ecdictDb)) -or (Test-Newer $ecdictCsv $ecdictDb)) {
@@ -122,6 +136,12 @@ function Do-GenData {
             cargo run --release --example build_cedict -- $cedictTxt $cedictDb
             if ($LASTEXITCODE -ne 0) { ErrMsg "build_cedict 失败!"; return $false }
         } else { Gray "[skip] cedict.db 已最新" }
+
+        if ((-not (Test-Path $unihanDb)) -or (Test-Newer $unihanZip $unihanDb)) {
+            Say "`n构建字形库 (~10 万字)..."
+            cargo run --release --example build_unihan -- $unihanDir $unihanDb
+            if ($LASTEXITCODE -ne 0) { ErrMsg "build_unihan 失败!"; return $false }
+        } else { Gray "[skip] unihan.db 已最新" }
     } finally { Pop-Location }
     Say "`ngen-data 完成 → $DictDir"
     return $true
@@ -159,9 +179,13 @@ function Build-App ([string]$profile = "release") {
     Copy-Item $exe "$outdir\wind-dict.exe" -Force
     Copy-Item "$DictDir\ecdict.db" "$outdir\ecdict.db" -Force
     Copy-Item "$DictDir\cedict.db" "$outdir\cedict.db" -Force
+    # 字形库允许缺席 (OfflineDictionary::open 打不开就当没有), 故不因它失败。
+    if (Test-Path "$DictDir\unihan.db") {
+        Copy-Item "$DictDir\unihan.db" "$outdir\unihan.db" -Force
+    } else { Warn "unihan.db 缺失, 本次产物没有部首笔画 (跑 gd 可补上)" }
 
     $sz = [math]::Round((Get-Item "$outdir\wind-dict.exe").Length / 1MB, 2)
-    Gray "已组装 → $outdir  (exe ${sz}MB + ecdict.db + cedict.db)"
+    Gray "已组装 → $outdir  (exe ${sz}MB + ecdict.db + cedict.db + unihan.db)"
     return $true
 }
 
@@ -204,7 +228,9 @@ function Deploy ([string]$profile = "release") {
     Start-Sleep -Milliseconds 400
 
     New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
-    foreach ($f in @("wind-dict.exe", "ecdict.db", "cedict.db")) {
+    foreach ($f in @("wind-dict.exe", "ecdict.db", "cedict.db", "unihan.db")) {
+        # unihan.db 可缺: 它是纯增益数据, 少了只是不显示部首笔画。
+        if (-not (Test-Path "$outdir\$f")) { Gray "  - $f (跳过, 不存在)"; continue }
         Copy-Item "$outdir\$f" "$targetDir\$f" -Force
         Gray "  - $f"
     }

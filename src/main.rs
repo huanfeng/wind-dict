@@ -50,7 +50,7 @@ fn main() {
     // 词库缺失是致命的：离线词典是本工具的主体，没有它整个程序没有意义。
     // 与其起一个查什么都「未收录」的空壳（那是在撒谎——术语表里「一无所获」的意思是
     // 词典确实没有这个词，不是「我没词库」），不如直接失败。
-    let dict = match OfflineDictionary::open(&ecdict, &cedict) {
+    let dict = match OfflineDictionary::open(&ecdict, &cedict, &unihan_path(&ecdict)) {
         Ok(d) => d,
         Err(e) => {
             fatal(&format!(
@@ -288,10 +288,7 @@ fn dict_paths(settings: &Settings) -> (PathBuf, PathBuf) {
     if let Some(pair) = positional_dicts(&args) {
         return pair;
     }
-    let dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(PathBuf::from))
-        .unwrap_or_default();
+    let dir = exe_dir();
     let ec = settings
         .ecdict
         .clone()
@@ -301,6 +298,29 @@ fn dict_paths(settings: &Settings) -> (PathBuf, PathBuf) {
         .clone()
         .unwrap_or_else(|| dir.join("cedict.db"));
     (ec, ce)
+}
+
+/// exe 所在目录。工作目录不可信——常驻工具从托盘/热键启动时它是什么完全不可控。
+fn exe_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(PathBuf::from))
+        .unwrap_or_default()
+}
+
+/// 字形库的位置。**没有设置项**，故只按约定找，找不到就没有。
+///
+/// 先看英汉词库旁边，再退到 exe 目录：前者让开发期 `wind-dict .cache/dict/ecdict.db
+/// .cache/dict/cedict.db` 这种跑法自动捡到同目录的字形库，后者是正式部署的样子。
+///
+/// 不给它设置项是刻意的：另外两份词库可以换（用户可能想塞一份更大的 ECDICT），
+/// 字形库没有第二个版本可换——它就是 Unihan。多一个换不了东西的设置项只是噪音。
+fn unihan_path(ecdict: &std::path::Path) -> PathBuf {
+    let beside = ecdict.parent().map(|d| d.join("unihan.db"));
+    match beside {
+        Some(p) if p.exists() => p,
+        _ => exe_dir().join("unihan.db"),
+    }
 }
 
 /// 命令行里那对词库路径。**命令行含任何开关时一律不认**，返回 `None`。

@@ -17,7 +17,13 @@ fn main() -> anyhow::Result<()> {
     };
 
     let t = Instant::now();
-    let dict = OfflineDictionary::open(std::path::Path::new(&ec), std::path::Path::new(&ce))?;
+    // 字形库对本工具无所谓：它探的是查询与补全，字形不参与。给个不存在的路径，
+    // `open` 会当作没有——这正是那个「可缺」设计要保证的行为。
+    let dict = OfflineDictionary::open(
+        std::path::Path::new(&ec),
+        std::path::Path::new(&ce),
+        std::path::Path::new("unihan.db"),
+    )?;
     println!("打开「{}」：{:?}\n", dict.name(), t.elapsed());
 
     // 方向由查询词自动判定——同一个入口，用户从不选方向。
