@@ -19,6 +19,7 @@ pub const APP_TITLE: &str = "清风词典";
 
 pub mod autostart;
 pub mod domain;
+pub mod html;
 pub mod icon;
 pub mod settings;
 pub mod skin;
