@@ -234,6 +234,32 @@ impl UserData {
     }
 }
 
+/// 用户数据目录，必要时建出来。数据库、崩溃日志、以及自带词典的默认存放处都在这里。
+///
+/// 位置由两条否定性约束确定——**不在部署目录内**（`dev.ps1` 卸载会
+/// `Remove-Item -Recurse -Force` 整个部署目录）、**不在漫游目录内**（登录/注销的
+/// 整体同步会拷走写到一半的库）。完整论证与被拒方案见 `docs/adr/0011`。
+///
+/// 放在库里而不是 `main.rs`：自带词典的默认目录挂在它下面
+/// （`source::user::default_dir`），而「用户数据在哪」这件事写两遍就等着漂移——
+/// 漂移的后果是卸载一次把用户的词库删了。
+pub fn data_dir() -> Result<std::path::PathBuf, String> {
+    let base = std::env::var_os("LOCALAPPDATA").ok_or("环境变量 LOCALAPPDATA 未设置")?;
+    // `wind-dict-data` 而非 `wind-dict`：后者是部署目录，卸载时会被整个删除。
+    //
+    // dev 与 release 分库，与 `dev.ps1` 分离两个部署目录的方式对齐：跑 dev 构建
+    // 调试不该往日常使用的历史记录里塞垃圾词；更要紧的是 `SCHEMA` 日后演进（加列、
+    // 迁移）时，dev 构建会就地改掉 release 正在用的那个库——现在两边 schema 相同，
+    // `CREATE TABLE IF NOT EXISTS` 恰好掩盖了这个风险。
+    let dir = std::path::PathBuf::from(base).join(if cfg!(debug_assertions) {
+        "wind-dict-data-dev"
+    } else {
+        "wind-dict-data"
+    });
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败：{}（{e}）", dir.display()))?;
+    Ok(dir)
+}
+
 /// 当前 Unix 纪元秒。生产代码取时间的唯一入口——存储层的方法都收时间参数以便测试确定，
 /// 由调用方在这里取「现在」。
 pub fn now_secs() -> i64 {
@@ -382,7 +408,8 @@ mod tests {
             expand_en: true,
             ecdict: Some(std::path::PathBuf::from(r"D:\ec.db")),
             cedict: None,
-            user_dicts: vec![std::path::PathBuf::from(r"D:\Oxford.mdx")],
+            user_dict_dir: Some(std::path::PathBuf::from(r"D:\我的词库")),
+            disabled_dicts: vec!["Oxford.mdx".into()],
             left_pane_w: 340,
         };
         {

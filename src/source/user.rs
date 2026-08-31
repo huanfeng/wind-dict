@@ -15,8 +15,15 @@
 //! 用户那本词典里有而它没有的词，屈指可数。
 //!
 //! 存储层的 `Mdx::prefix` 仍然留着——将来若要做「只在这本词典里搜」，那是它的用途。
+//!
+//! ## 为什么是「扫目录」而不是「逐个添加」
+//!
+//! 词典是用户往一个目录里丢的，不是在设置页里逐个登记的。丢进去就能用、拿走就没了,
+//! 这与「装一本词典」是同一件事；逐个登记则要求用户在文件管理器与设置页之间把同一
+//! 件事做两遍，而第二遍纯属向程序汇报。设置页因此只剩两件事可做：**换目录**和
+//! **开关某一本**。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -25,9 +32,9 @@ use crate::store::mdx::Mdx;
 
 pub struct UserDictionary {
     name: String,
-    /// 加进来时的那个路径。留着是为了设置页能把「设置里的一条路径」与「已经开着的
-    /// 这本词典」对上——按下标对会在中间某本打不开时整体错位。
-    path: std::path::PathBuf,
+    /// 这本词典的文件路径。留着是为了设置页能把「扫到的一个文件」与「已经开着的
+    /// 这本词典」对上——按下标对会在中间某本被关掉或打不开时整体错位。
+    path: PathBuf,
     mdx: Mdx,
 }
 
@@ -41,7 +48,7 @@ impl UserDictionary {
         })
     }
 
-    pub fn path(&self) -> &std::path::Path {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
@@ -74,6 +81,94 @@ fn display_name(path: &Path, mdx: &Mdx) -> String {
 /// 与 `offline::probe_dict` 同样的理由：只看扩展名等于没校验。MDX 里有一半特性我们
 /// 不支持（LZO 压缩、正文加密），而那些词典**能打开、能列出词条数**，只在解压正文时
 /// 才失败。设置页当场拦住，好过用户以为加好了、查词时得到一堆报错。
+/// 词典目录里认哪种文件。
+const EXT: &str = "mdx";
+
+/// 递归的层数上限。
+///
+/// 不是 1 也不是无限：MDX 常常以「一本词典一个文件夹」的形式分发（`.mdx` 加同名的
+/// `.mdd` 资源包和一个 `.css`），只扫平铺会把这类整包漏掉；而无限深会在用户把词典
+/// 目录指到某个大目录（下载文件夹、整块盘）时变成一次全盘遍历。三层够装下
+/// 「词库/英语/牛津/Oxford.mdx」这种归类习惯。
+const MAX_DEPTH: usize = 3;
+
+/// 默认的词典目录：用户数据目录下的 `dicts`。
+///
+/// **不在部署目录内**是硬要求，不是偏好：`dev.ps1` 卸载会
+/// `Remove-Item -Recurse -Force` 整个部署目录，而这里放的是用户自己下载的、
+/// 动辄几百 MB 的文件。把默认目录放进去，等于让「卸载程序」顺手删掉用户的词库。
+/// 这与 ADR-0011 把收藏与历史挪出部署目录是同一条理由。
+pub fn default_dir() -> Result<PathBuf> {
+    let base = crate::store::userdata::data_dir().map_err(|e| anyhow::anyhow!(e))?;
+    Ok(base.join("dicts"))
+}
+
+/// 扫出目录下的全部词典，按路径排序。
+///
+/// 排序是必需的而非整洁癖：目录遍历的次序由文件系统决定，而这个次序会成为查询结果里
+/// 各本词典的先后。不排的话，同一批词典在不同机器、甚至同一台机器的不同时刻，
+/// 排出来的顺序可能不同。
+///
+/// 目录不存在、读不动都返回空表而不是报错：一个还没建出来的词典目录是**正常状态**
+/// （用户还没往里放东西），不是故障。
+pub fn scan(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    walk(dir, 0, &mut out);
+    out.sort();
+    out
+}
+
+fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth >= MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        match e.file_type() {
+            Ok(t) if t.is_dir() => walk(&path, depth + 1, out),
+            // 扩展名比较忽略大小写：Windows 的文件系统本就不区分，而词典包里
+            // `.MDX` 与 `.mdx` 都见得到。
+            Ok(t)
+                if t.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|x| x.eq_ignore_ascii_case(EXT)) =>
+            {
+                out.push(path);
+            }
+            // 符号链接与其它类型一概不跟：跟软链会绕出词典目录，甚至绕成环。
+            _ => {}
+        }
+    }
+}
+
+/// 扫出目录、剔掉关掉的、逐本打开。词典目录到「当前生效的词典」之间的全部逻辑。
+///
+/// 拎成自由函数而非留在界面层，是为了它能被测：这三步里每一步都可能悄悄出错——扫漏
+/// 一层子目录、开关按错了键、打不开的那本把整批带崩——而界面层的 `State` 拖着一份
+/// 真实的 SQLite 词库，进不了单元测试。
+///
+/// 打不开的**跳过**而不是让整批失败：它们是用户的文件，随时可能损坏或用了我们不支持
+/// 的压缩方式，而一本坏词典不该连累其余几本。设置页会单独把它标出来（那里会为每本
+/// 重开一次并显示失败原因），所以这里的静默是有去处的，不是把错误吞了。
+pub fn load(dir: &Path, disabled: &[String]) -> Vec<UserDictionary> {
+    scan(dir)
+        .into_iter()
+        .filter(|p| !disabled.contains(&key_of(p)))
+        .filter_map(|p| UserDictionary::open(&p).ok())
+        .collect()
+}
+
+/// 从路径取出用作开关键的文件名。
+pub fn key_of(path: &Path) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 pub fn probe(path: &Path) -> Result<UserDictionary> {
     let d = UserDictionary::open(path)?;
     // 查什么词无所谓，要的是走通「解压 key block + 解压 record block」这条路。
@@ -186,6 +281,99 @@ mod tests {
         let d = UserDictionary::open(&fixture("v2.mdx")).unwrap();
         assert_eq!(d.name(), "wind-dict 测试样本");
         assert!(!d.name().contains('<'));
+    }
+
+    /// 目录里混着子目录、非 mdx 文件与大小写不一的扩展名。
+    #[test]
+    fn 扫目录认得出词典且忽略无关文件() {
+        let root = std::env::temp_dir().join(format!("wind-dict-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let nested = root.join("英语").join("牛津");
+        std::fs::create_dir_all(&nested).unwrap();
+        // 一本词典常常是「一个文件夹装 mdx + mdd + css」，故子目录必须扫到。
+        std::fs::copy(fixture("v2.mdx"), nested.join("Oxford.MDX")).unwrap();
+        std::fs::copy(fixture("v1.mdx"), root.join("a.mdx")).unwrap();
+        std::fs::write(root.join("Oxford.mdd"), b"resource").unwrap();
+        std::fs::write(root.join("readme.txt"), b"hi").unwrap();
+
+        let got = scan(&root);
+        let names: Vec<String> = got.iter().map(|p| key_of(p)).collect();
+        assert_eq!(
+            names,
+            ["a.mdx", "Oxford.MDX"],
+            "扫到的应当只有这两本：{got:?}"
+        );
+
+        // 超出深度上限的不扫——否则把词典目录指到下载文件夹会变成全盘遍历。
+        let deep = root.join("a").join("b").join("c").join("d");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::copy(fixture("v2.mdx"), deep.join("too-deep.mdx")).unwrap();
+        assert_eq!(scan(&root).len(), 2, "第四层不该被扫到");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 目录还没建出来是**正常状态**（用户还没放东西），不是故障。
+    #[test]
+    fn 目录不存在时扫出空表() {
+        assert!(scan(Path::new(r"Z:\\这个目录不存在\\dicts")).is_empty());
+    }
+
+    #[test]
+    fn 开关按文件名记() {
+        assert_eq!(key_of(Path::new(r"D:\\a\\b\\Oxford.mdx")), "Oxford.mdx");
+        assert_eq!(key_of(Path::new("")), "");
+    }
+
+    /// 建一个词典目录：`dicts/英语/牛津.mdx` + `dicts/a.mdx`。
+    fn 造词典目录(tag: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("wind-dict-load-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sub = root.join("英语");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::copy(fixture("v2.mdx"), sub.join("牛津.mdx")).unwrap();
+        std::fs::copy(fixture("v1.mdx"), root.join("a.mdx")).unwrap();
+        root
+    }
+
+    /// 没有禁用名单时，目录里的全部词典都该加载——**新丢进去的默认就能用**，
+    /// 这是「扫目录」相对「逐个添加」的全部意义。
+    #[test]
+    fn 默认加载目录里的全部词典() {
+        let root = 造词典目录("all");
+        assert_eq!(load(&root, &[]).len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 关掉的按**文件名**认，且只影响那一本。
+    #[test]
+    fn 关掉的不加载而其余照旧() {
+        let root = 造词典目录("off");
+        let got = load(&root, &["牛津.mdx".to_string()]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(key_of(got[0].path()), "a.mdx");
+
+        // 名单里有个根本不存在的名字，不该影响任何一本。
+        assert_eq!(load(&root, &["不存在.mdx".to_string()]).len(), 2);
+        // 全关掉就一本都不加载。
+        let all = ["牛津.mdx".to_string(), "a.mdx".to_string()];
+        assert!(load(&root, &all).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 一本坏词典不该连累其余几本。
+    #[test]
+    fn 打不开的那本被跳过() {
+        let root = 造词典目录("broken");
+        std::fs::write(root.join("坏的.mdx"), b"not an mdx at all").unwrap();
+        assert_eq!(
+            scan(&root).len(),
+            3,
+            "坏的也该被扫到，否则设置页里就看不见它"
+        );
+        assert_eq!(load(&root, &[]).len(), 2, "但加载时跳过");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

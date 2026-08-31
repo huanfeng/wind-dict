@@ -259,22 +259,10 @@ fn userdata_path() -> Result<PathBuf, String> {
     Ok(userdata_dir()?.join("userdata.db"))
 }
 
-/// 用户数据目录，必要时建出来。库与崩溃日志都落在这里。
+/// 用户数据目录。实现在库里（`store::userdata::data_dir`）——自带词典的默认目录
+/// 也要落在它下面，而「这个目录在哪」写两遍就等着漂移。
 fn userdata_dir() -> Result<PathBuf, String> {
-    let base = std::env::var_os("LOCALAPPDATA").ok_or("环境变量 LOCALAPPDATA 未设置")?;
-    // `wind-dict-data` 而非 `wind-dict`：后者是部署目录，卸载时会被整个删除。
-    //
-    // dev 与 release 分库，与 `dev.ps1` 分离两个部署目录的方式对齐：跑 dev 构建
-    // 调试不该往日常使用的历史记录里塞垃圾词；更要紧的是 `SCHEMA` 日后演进（加列、
-    // 迁移）时，dev 构建会就地改掉 release 正在用的那个库——现在两边 schema 相同，
-    // `CREATE TABLE IF NOT EXISTS` 恰好掩盖了这个风险。
-    let dir = PathBuf::from(base).join(if cfg!(debug_assertions) {
-        "wind-dict-data-dev"
-    } else {
-        "wind-dict-data"
-    });
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败：{}（{e}）", dir.display()))?;
-    Ok(dir)
+    wind_dict::store::userdata::data_dir()
 }
 
 /// 词库路径。优先级：命令行参数 > 设置 > exe 同目录。

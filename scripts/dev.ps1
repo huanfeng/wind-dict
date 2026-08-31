@@ -14,6 +14,7 @@
 #   1 / r        Release 构建 → build/
 #   run          Dev 构建并运行
 #   gd           gen-data: 下载词库源 + 构建 ecdict.db / cedict.db / unihan.db → .cache/dict/
+#   gm           下载一本示例 MDX (~70MB), 供手动测试"自带词典"; 部署时自动装进词典目录
 #   p / pd       部署 release / dev → 目标目录 (复制 + 可选开机自启)
 #   u / ud       卸载 release / dev (删目录 + 移除自启)
 #   k=check  l=clippy  t=test  f=fmt  fc=fmt-check  ci(=fc+l+t)  clean
@@ -35,6 +36,7 @@ $Root        = Split-Path $ScriptDir -Parent
 $CacheDir    = "$Root\.cache"          # 下载源 + 构建的 .db (不入库)
 $SrcDir      = "$CacheDir\src"         # 下载的 ecdict.csv / cedict.txt
 $DictDir     = "$CacheDir\dict"        # 构建的 ecdict.db / cedict.db / unihan.db
+$MdxDir      = "$CacheDir\mdx"         # 下载的示例 .mdx (不入库)
 $BuildDir    = "$Root\build"           # release 产物 (= 部署内容)
 $BuildDevDir = "$Root\build_dev"       # dev 产物
 
@@ -46,6 +48,14 @@ $UnihanUrl = "https://www.unicode.org/Public/UCD/latest/ucd/Unihan.zip"
 # 《通用规范汉字表》(国务院 国发〔2013〕23 号) 的三级字表。
 # 该字表属《著作权法》第五条所指行政性质文件, 不适用著作权法, 故可自由使用。
 $TghzBase = "https://raw.githubusercontent.com/shengdoushi/common-standard-chinese-characters-table/master"
+
+# 示例自带词典 (MDX)。用于手动测试"把词典丢进目录就能查"这条路, 不随产品分发。
+#
+# 取 ECDICT 自己发布的 MDX 而非别的: 它是本仓库唯一能自动下载的、授权明确 (MIT/CC)
+# 的 MDX。选 headless (无音标) 版是刻意的 —— 它与随程序分发的 ecdict.db 内容同源,
+# 若取带音标的版本, 两者显示出来几乎一模一样, 反而看不出自带词典那一段是不是真的
+# 走通了; 无音标版一眼能分辨。
+$ExampleMdxUrl = "https://github.com/skywind3000/ECDICT/releases/download/1.0.28/ecdict-mdx-headless-28.zip"
 
 # ---------- 部署目标 (可在 deploy.local.ps1 覆盖) ----------
 #
@@ -158,6 +168,56 @@ function Do-GenData {
     return $true
 }
 
+# ---------- 自带词典目录 ----------
+#
+# 与 src/store/userdata.rs 的 data_dir() 必须一致: %LOCALAPPDATA%\wind-dict-data[-dev]\dicts。
+# 这个目录**不在部署目录内**, 故 u/ud 卸载碰不到它 —— 里头是用户自己下载的词典,
+# 动辄几百 MB, 卸载程序顺手删掉是不能接受的 (同 ADR-0011)。
+function Dict-Dir ([string]$profile) {
+    $data = if ($profile -eq "dev") { "wind-dict-data-dev" } else { "wind-dict-data" }
+    return "$env:LOCALAPPDATA\$data\dicts"
+}
+
+# 下载示例 MDX → .cache\mdx\。仅供手动测试, 不参与构建, 不随产品分发。
+function Do-GetMdx {
+    New-Item -ItemType Directory -Path $SrcDir, $MdxDir -Force | Out-Null
+    if (Get-ChildItem $MdxDir -Filter *.mdx -ErrorAction SilentlyContinue) {
+        Gray "[skip] 示例词典已存在 → $MdxDir"; return $true
+    }
+    $zip = "$SrcDir\ecdict-mdx.zip"
+    if (-not (Get-File $ExampleMdxUrl $zip "示例 MDX (~70MB)")) { return $false }
+
+    # zip 里的文件名是 GBK 编码的中文, Expand-Archive 解出来是乱码 —— 解到临时目录
+    # 再按"目录里唯一的那个 .mdx"重命名, 不去猜它原本叫什么。
+    $tmp = "$MdxDir\_unzip"
+    if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+    Gray "[zip ] 解压示例词典"
+    Expand-Archive -Path $zip -DestinationPath $tmp -Force
+    $found = Get-ChildItem $tmp -Recurse -File | Where-Object { $_.Extension -ieq ".mdx" } | Select-Object -First 1
+    if (-not $found) { ErrMsg "压缩包里没有 .mdx"; Remove-Item -Recurse -Force $tmp; return $false }
+    Move-Item $found.FullName "$MdxDir\ecdict-example.mdx" -Force
+    Remove-Item -Recurse -Force $tmp
+    Say "示例词典就绪 → $MdxDir\ecdict-example.mdx"
+    return $true
+}
+
+# 把示例词典装进词典目录。已有任何 .mdx 就不动 —— 那是用户的东西。
+function Install-ExampleMdx ([string]$profile) {
+    $dst = Dict-Dir $profile
+    New-Item -ItemType Directory -Path $dst -Force | Out-Null
+    if (Get-ChildItem $dst -Recurse -Filter *.mdx -ErrorAction SilentlyContinue) {
+        Gray "  - 词典目录已有词典, 不动 ($dst)"; return
+    }
+    $src = Get-ChildItem $MdxDir -Filter *.mdx -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $src) {
+        Gray "  - 词典目录为空; 跑 'gm' 可下载一本示例词典用于测试"
+        Gray "    $dst"
+        return
+    }
+    Copy-Item $src.FullName (Join-Path $dst $src.Name) -Force
+    Gray "  - 示例词典 → $dst\$($src.Name)"
+}
+
 # 确保词库存在; 缺则触发 gen-data。
 function Ensure-Dict {
     if ((Test-Path "$DictDir\ecdict.db") -and (Test-Path "$DictDir\cedict.db")) { return $true }
@@ -246,6 +306,8 @@ function Deploy ([string]$profile = "release") {
         Gray "  - $f"
     }
     Set-AutoStart $targetDir $autoName
+    # 自带词典不进部署目录: 它属于用户数据那一侧, 卸载不该删 (见 Dict-Dir)。
+    Install-ExampleMdx $profile
     Say "`n部署完成. 启动: $targetDir\wind-dict.exe"
     return $true
 }
@@ -288,6 +350,7 @@ function Invoke-Command ([string]$cmd) {
         { $_ -in "1", "r" }  { return (Build-App "release") }
         "run"                { return (Do-Run) }
         "gd"                 { return (Do-GenData) }
+        "gm"                 { return (Do-GetMdx) }
         "p"                  { return (Deploy "release") }
         "pd"                 { return (Deploy "dev") }
         "u"                  { return (Uninstall "release") }
@@ -309,6 +372,7 @@ function Show-Menu {
     Write-Host "  构建/运行:"
     Write-Host "    b   Dev 构建 → build_dev/       1   Release 构建 → build/"
     Write-Host "    run Dev 构建并运行              gd  生成词库 (下载 + 构建 .db)"
+    Write-Host "    gm  下载示例 MDX (自带词典手动测试用)"
     Write-Host "  部署:"
     Write-Host "    p   部署 release                pd  部署 dev"
     Write-Host "    u   卸载 release                ud  卸载 dev"

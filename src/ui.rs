@@ -1701,58 +1701,63 @@ impl State {
         }
     }
 
-    /// 添加一本自带词典。
+    /// 当前生效的词典目录：设置里指定的，否则默认目录。
     ///
-    /// 与换词库路径（`set_dict_path`）不同，这个**当场生效**，不用重启：那两个库的
+    /// 每次现算而不是开机存一份：用户可以改目录，而存一份就要在改动时同步两处。
+    fn user_dict_dir(&self) -> Option<std::path::PathBuf> {
+        self.settings
+            .borrow()
+            .user_dict_dir
+            .clone()
+            .or_else(|| crate::source::user::default_dir().ok())
+    }
+
+    /// 换词典目录。`None` = 恢复默认。
+    ///
+    /// 与换词库路径（`set_dict_path`）不同，这个**当场生效**不用重启：那两个库的
     /// 连接在 `main` 里打开后就交给了界面，而自带词典由 `State` 自己持有。
-    fn add_user_dict(&self, path: std::path::PathBuf) {
-        if self.settings.borrow().user_dicts.contains(&path) {
-            self.note_err("这本词典已经加过了");
-            return;
-        }
-        // **先校验再落库**，与 `set_dict_path` 同一条理由，只是代价形状不同：这里
-        // 选错不会让程序起不来，但会让用户以为加成功了，直到查词时才发现哪本都不响。
-        // MDX 里有一批特性我们不支持（LZO 压缩、正文加密），那些文件**打得开、
-        // 报得出词条数**，只在解压正文时才失败——非真查一次不可。
-        if let Err(e) = crate::source::user::probe(&path) {
-            self.note_err(format!("这个文件不能用作词典：{e:#}"));
-            return;
-        }
-        self.settings.borrow_mut().user_dicts.push(path);
+    fn set_user_dict_dir(&self, dir: Option<std::path::PathBuf>) {
+        self.settings.borrow_mut().user_dict_dir = dir;
         if self.save_settings() {
             self.reload_user_dicts();
-            self.note_ok("词典已添加");
+            let n = self.user_dicts.borrow().len();
+            self.note_ok(format!("词典目录已更改，扫到 {n} 本"));
             self.bump_settings();
         }
     }
 
-    /// 移除第 `i` 本自带词典。只从设置里去掉这一项，用户的文件一个字节都不动。
-    fn remove_user_dict(&self, i: usize) {
+    /// 开关一本自带词典。`file` 是文件名，见 `Settings::disabled_dicts`。返回是否落实。
+    ///
+    /// **不触发设置页重建**：这一条是从 widget 的 `on_update` 里调进来的，而重建会把
+    /// 调用者所在的那棵子树连同它读的信号一起回收。开关本身已经把状态画出来了，
+    /// 那一行的其余文字（词典名、词条数）描述的是这个文件，与开关与否无关。
+    fn toggle_user_dict(&self, file: &str, on: bool) -> bool {
         {
             let mut s = self.settings.borrow_mut();
-            if i >= s.user_dicts.len() {
-                return;
+            s.disabled_dicts.retain(|x| x != file);
+            if !on {
+                s.disabled_dicts.push(file.to_string());
             }
-            s.user_dicts.remove(i);
         }
-        if self.save_settings() {
-            self.reload_user_dicts();
-            self.note_ok("词典已移除");
-            self.bump_settings();
+        if !self.save_settings() {
+            return false;
         }
+        self.reload_user_dicts();
+        true
     }
 
-    /// 按设置里的路径重开全部自带词典。
+    /// 重扫词典目录并打开启用的那些。
     ///
-    /// 整个重开而不是增量增删：设置是唯一的真相，而增量维护要求两处的下标始终对齐，
-    /// 那是迟早会错位一次的东西。重开一本实测 2 ms 量级（索引只有几十 KB），
-    /// 而这条路径只在用户按下增删时才走。
+    /// 整个重来而不是增量增删：目录才是唯一的真相——用户可能在程序开着的时候往里
+    /// 拖了一本、或者删掉一本，增量维护的那份列表根本不知道。重开一本实测 2 ms
+    /// 量级（索引只有几十 KB），而这条路径只在开机与用户动设置时才走。
     fn reload_user_dicts(&self) {
-        let paths = self.settings.borrow().user_dicts.clone();
-        *self.user_dicts.borrow_mut() = paths
-            .iter()
-            .filter_map(|p| UserDictionary::open(p).ok())
-            .collect();
+        let Some(dir) = self.user_dict_dir() else {
+            self.user_dicts.borrow_mut().clear();
+            return;
+        };
+        let disabled = self.settings.borrow().disabled_dicts.clone();
+        *self.user_dicts.borrow_mut() = crate::source::user::load(&dir, &disabled);
     }
 
     /// 从当前页签移除一行：历史页删历史条目，收藏页取消收藏。
@@ -2215,17 +2220,11 @@ pub fn build(
         UserDataState::Ready(u) => u.settings(),
         UserDataState::Unavailable(_) => Settings::default(),
     };
-    // 自带词典在设置读出来之后才开得了：路径就存在设置里。打不开的跳过而不是让程序
-    // 起不来——它们是用户的文件，随时可能被移走，而 ADR-0011 那条「用户数据独立于
-    // 部署存活」在这里的推论就是「别让用户的文件决定程序能不能启动」。
-    let user_dicts: Vec<UserDictionary> = settings
-        .user_dicts
-        .iter()
-        .filter_map(|p| UserDictionary::open(p).ok())
-        .collect();
     let st = Rc::new(State {
         dict: dict.clone(),
-        user_dicts: RefCell::new(user_dicts),
+        // 先建空的，`State` 造好之后再扫——扫描要读设置里的目录与开关，那是
+        // `State` 的方法。
+        user_dicts: RefCell::new(Vec::new()),
         user,
         query: signal(String::new()),
         candidates: signal(Vec::new()),
@@ -2259,6 +2258,9 @@ pub fn build(
         skin_rev: signal(vec![0]),
         system_dark: std::cell::Cell::new(system_dark),
     });
+    // 扫词典目录。放在 `State` 造好之后，是因为扫描要读设置里的目录与开关，
+    // 那两样都得先有 `State` 才拿得到。
+    st.reload_user_dicts();
     // 开屏即把左栏填上：驱动器要到第一次 layout 才跑，在那之前列表是空的，
     // 而开屏那一眼正好落在这里。
     st.reload_left();
@@ -3467,6 +3469,17 @@ fn dict_row(st: Rc<State>, is_ec: bool) -> Element {
     row(title, Some(&shown), right)
 }
 
+/// 打开一个目录（资源管理器）。
+///
+/// 设置页给这个入口，是因为「把词典放进去」这件事只能在文件管理器里做——而让用户
+/// 照着一行灰字自己去粘贴路径，是把程序知道的事推给用户重做一遍。
+fn reveal(dir: &std::path::Path) {
+    // 目录可能还不存在（用户从没放过词典）。先建出来再打开，否则资源管理器会弹一个
+    // 「找不到」——而那正是用户此刻最需要的那个目录。
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+}
+
 /// 千位分隔。词条数动辄七位（实测一本 3,402,564），不分节根本读不出量级。
 fn thousands(n: u64) -> String {
     let s = n.to_string();
@@ -3480,59 +3493,124 @@ fn thousands(n: u64) -> String {
     out
 }
 
-/// 自带词典：已加的列在前，末行是添加入口。
+/// 自带词典：一行目录 + 扫到的每本一行开关。
 ///
-/// 列的是**设置里的路径**而不是已打开的那些词典。二者对不上时（文件被移走、被换成
-/// 不支持的格式）那一行会标出「打不开」——把它悄悄从列表里剔掉，用户会以为自己
-/// 从没加过，然后再加一遍，再一次什么也没发生。
+/// 没有「添加」按钮，这是刻意的：添加一本词典 = 把文件放进这个目录。设置页能做的
+/// 只有换目录和开关某一本——凡是用户已经在文件管理器里做过的事，不该再让他来这里
+/// 向程序汇报一遍。
 fn user_dict_rows(st: Rc<State>) -> Element {
-    let paths = st.settings.borrow().user_dicts.clone();
-    let opened = st.user_dicts.borrow();
+    let dir = st.user_dict_dir();
+    let custom = st.settings.borrow().user_dict_dir.is_some();
+    let disabled = st.settings.borrow().disabled_dicts.clone();
 
-    let mut rows: Vec<Element> = Vec::new();
-    for (i, p) in paths.iter().enumerate() {
-        let stem = p
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        // 按路径认领而非按下标：中间有打不开的时，两个列表的下标就对不上了。
-        let (title, sub) = match opened.iter().find(|d| d.path() == p) {
-            Some(d) => (
-                d.name().to_string(),
-                format!("{} 词条 · {stem}", thousands(d.entry_count())),
-            ),
-            None => (stem.clone(), format!("打不开 · {}", p.display())),
-        };
+    let shown = match &dir {
+        Some(d) => d.display().to_string(),
+        None => "无法确定（LOCALAPPDATA 未设置）".to_string(),
+    };
+    let mut right = Element::row().cross(Align::Center).spacing(8);
+    // 只在用过自定义目录时才给「恢复默认」：本来就是默认值时这个按钮点了没意义。
+    if custom {
         let st2 = st.clone();
+        right =
+            right.child(Element::button("恢复默认").on_click(move |_| st2.set_user_dict_dir(None)));
+    }
+    if let Some(d) = dir.clone() {
+        right = right.child(Element::button("打开").on_click(move |_| reveal(&d)));
+    }
+    let st3 = st.clone();
+    right = right.child(Element::button("更改…").on_click(move |ctx| {
+        let st = st3.clone();
+        ctx.request_pick_folder(
+            PickDialog::new().title("选择词典目录"),
+            move |picked| {
+                if let Some(p) = picked {
+                    st.set_user_dict_dir(Some(p));
+                }
+            },
+        );
+    }));
+
+    let mut rows = vec![row("词典目录", Some(&shown), right)];
+
+    let files = dir
+        .as_deref()
+        .map(crate::source::user::scan)
+        .unwrap_or_default();
+    if files.is_empty() {
+        rows.push(row(
+            "还没有词典",
+            Some("把 .mdx 文件放进上面这个目录（可以带子目录），回到这里就能看到"),
+            Element::col(),
+        ));
+        return card(rows);
+    }
+
+    // 逐本打开一次，为的是拿到词典名与词条数——**关掉的也开**：不开就只能显示一个
+    // 文件名，而用户此刻要判断的正是「这本是不是我想开的那本」。一本约 3 ms，
+    // 且只在设置页打开时才走这一遭。
+    for p in &files {
+        let file = crate::source::user::key_of(p);
+        let (title, sub) = match crate::source::user::probe(p) {
+            Ok(d) => (
+                d.name().to_string(),
+                format!("{} 词条 · {file}", thousands(d.entry_count())),
+            ),
+            // 打不开必须**说出原因**：否则用户只看到一个拨不动的开关，无从判断是
+            // 文件坏了，还是我们不支持它用的压缩方式。
+            Err(e) => (file.clone(), format!("打不开：{e:#}")),
+        };
+        let on = signal(!disabled.contains(&file));
         rows.push(row(
             &title,
             Some(&sub),
-            Element::button("移除").on_click(move |_| st2.remove_user_dict(i)),
+            Element::row()
+                .cross(Align::Center)
+                // 监听器须先于开关注册（on_update 按注册顺序广播），且必须盯信号而非
+                // 挂 `on_toggle`——后者被 windui 静默吞掉，见 `SettingToggle`。
+                .child(
+                    Element::leaf()
+                        .reactive()
+                        .widget(DictToggle {
+                            st: st.clone(),
+                            file: file.clone(),
+                            on,
+                            last_version: on.version(),
+                        })
+                        .size(0, 0),
+                )
+                .child(Element::switch(on)),
         ));
     }
-    drop(opened);
-
-    let st3 = st.clone();
-    rows.push(row(
-        "添加词典",
-        // 明说不支持什么：这两类文件用户拿到手时看不出区别，而失败信息出现在
-        // 点完「选择」之后，那时再解释已经晚了一步。
-        Some("MDX 格式。不支持 LZO 压缩与加密正文的词典"),
-        Element::button("选择…").on_click(move |ctx| {
-            let st = st3.clone();
-            ctx.request_pick_file(
-                PickDialog::new()
-                    .title("选择 MDX 词典")
-                    .filter("MDX 词典", &["mdx"]),
-                move |picked| {
-                    if let Some(p) = picked {
-                        st.add_user_dict(p);
-                    }
-                },
-            );
-        }),
-    ));
     card(rows)
+}
+
+/// 监视某一本自带词典的开关。
+///
+/// 与 `SettingToggle` 分开而不是把它泛化：那个持有的是 `fn` 指针（无捕获），而这里
+/// 必须带上「是哪一本」。为一处需要闭包的用法把另一处改成 `Box<dyn FnMut>`，是让
+/// 已经好用的代码替新代码付账。
+struct DictToggle {
+    st: Rc<State>,
+    file: String,
+    on: Signal<bool>,
+    last_version: u64,
+}
+
+impl Widget for DictToggle {
+    fn on_update(&mut self, _ctx: &mut EventCtx) {
+        let v = self.on.version();
+        if v == self.last_version {
+            return;
+        }
+        self.last_version = v;
+        let want = self.on.get();
+        if !self.st.toggle_user_dict(&self.file, want) {
+            self.on.set(!want);
+            // 回拨自己也会推高版本，须同步记下，否则下一帧会把回拨当成新的用户操作，
+            // 来回翻转停不下来。
+            self.last_version = self.on.version();
+        }
+    }
 }
 
 /// 需当场告知的消息条。空串时零高度、不占位。

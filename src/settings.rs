@@ -242,13 +242,25 @@ pub struct Settings {
     /// 词库路径覆盖。`None` = 沿用命令行参数或 exe 同目录的默认查找。
     pub ecdict: Option<PathBuf>,
     pub cedict: Option<PathBuf>,
-    /// 自带词典（MDX）的路径，按用户添加的顺序。
+    /// 自带词典所在的目录。`None` = 用默认目录（见 `source::user::default_dir`）。
     ///
-    /// 存**路径**而非把词典拷进部署目录：这些文件动辄几十上百 MB，且是用户自己的
-    /// 东西。拷一份走意味着卸载时要么留垃圾要么删掉用户的文件，两条都不体面。
-    /// 代价是文件被移走后这一项会失效——那时按 ADR-0011 的同一条原则处理：
-    /// 打不开就跳过，不让它挡住程序启动。
-    pub user_dicts: Vec<PathBuf>,
+    /// 存**一个目录**而非一串文件路径：词典是用户往里丢的，不是逐个登记的。丢进去
+    /// 就能用、拿走就没了，这与「装一本词典」是同一件事；逐个登记则要求用户在文件
+    /// 管理器与设置页之间把同一件事做两遍。
+    ///
+    /// 目录可改而非写死，是因为词库动辄几百 MB 到几 GB，用户多半有自己的存放地方
+    /// （另一块盘、同步目录）。但默认值必须落在**卸载删不到**的地方——见
+    /// `source::user::default_dir` 与 ADR-0011。
+    pub user_dict_dir: Option<PathBuf>,
+    /// 被用户关掉的自带词典，存**文件名**。
+    ///
+    /// 存「关掉的」而不是「开着的」，是这套设计的关键一处：新丢进目录的词典必须
+    /// **默认可用**——否则「放进去就能用」就退化成「放进去再来设置页开一下」，
+    /// 与手动逐个添加没有区别。
+    ///
+    /// 按文件名而非完整路径，是为了用户换目录（把词库从 C 盘挪到 D 盘）之后这些
+    /// 开关还认得出是同一本词典。
+    pub disabled_dicts: Vec<String>,
     /// 左栏宽度（逻辑 px）。
     ///
     /// 存**像素**而非左右比例，是因为左栏装的是一列词头：它需要的宽度由「一个词头加
@@ -268,7 +280,8 @@ impl Default for Settings {
             expand_en: false,
             ecdict: None,
             cedict: None,
-            user_dicts: Vec::new(),
+            user_dict_dir: None,
+            disabled_dicts: Vec::new(),
             left_pane_w: LEFT_PANE_W_DEFAULT,
         }
     }
@@ -285,7 +298,8 @@ pub mod keys {
     pub const EXPAND_EN: &str = "expand_en";
     pub const ECDICT: &str = "ecdict";
     pub const CEDICT: &str = "cedict";
-    pub const USER_DICTS: &str = "user_dicts";
+    pub const USER_DICT_DIR: &str = "user_dict_dir";
+    pub const DISABLED_DICTS: &str = "disabled_dicts";
     pub const LEFT_PANE_W: &str = "left_pane_w";
 }
 
@@ -323,8 +337,11 @@ impl Settings {
             cedict: get(keys::CEDICT)
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
-            user_dicts: get(keys::USER_DICTS)
-                .map(|s| paths_from_str(&s))
+            user_dict_dir: get(keys::USER_DICT_DIR)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            disabled_dicts: get(keys::DISABLED_DICTS)
+                .map(|s| lines_of(&s))
                 .unwrap_or_default(),
             // 读回来就钳一次。库里的值可能是手改的、也可能是旧版本在别的窗口尺寸下
             // 写的，而一个 5px 或 5000px 的左栏会让界面直接不可用——那属于「读不到
@@ -346,7 +363,8 @@ impl Settings {
             (keys::EXPAND_EN, bool_str(self.expand_en).into()),
             (keys::ECDICT, path_str(&self.ecdict)),
             (keys::CEDICT, path_str(&self.cedict)),
-            (keys::USER_DICTS, paths_str(&self.user_dicts)),
+            (keys::USER_DICT_DIR, path_str(&self.user_dict_dir)),
+            (keys::DISABLED_DICTS, self.disabled_dicts.join("\n")),
             (keys::LEFT_PANE_W, self.left_pane_w.to_string()),
         ]
     }
@@ -360,25 +378,15 @@ fn bool_str(b: bool) -> &'static str {
     }
 }
 
-/// 一串路径存成一个值：换行分隔。
+/// 一串文件名存成一个值：换行分隔。
 ///
-/// Windows 的路径不允许含换行（`<>:"/\|?*` 与控制字符都被文件系统挡在外面），
-/// 故这个分隔符不会与内容冲突——用分号或逗号就会，那两个在路径里合法。
-fn paths_str(v: &[PathBuf]) -> String {
-    v.iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join(
-            "
-",
-        )
-}
-
-fn paths_from_str(s: &str) -> Vec<PathBuf> {
+/// Windows 的文件名不允许含换行（`<>:"/\|?*` 与控制字符都被文件系统挡在外面），
+/// 故这个分隔符不会与内容冲突——用分号或逗号就会，那两个在文件名里合法。
+fn lines_of(s: &str) -> Vec<String> {
     s.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .map(PathBuf::from)
+        .map(str::to_string)
         .collect()
 }
 
@@ -551,11 +559,9 @@ mod tests {
             expand_en: true,
             ecdict: Some(PathBuf::from(r"D:\a\ec.db")),
             cedict: None,
+            user_dict_dir: Some(PathBuf::from(r"E:\我的词库")),
             // 两条而非一条：一条存不出分隔符有没有用对。
-            user_dicts: vec![
-                PathBuf::from(r"D:\dict\Oxford.mdx"),
-                PathBuf::from(r"E:\a b\朗文.mdx"),
-            ],
+            disabled_dicts: vec!["Oxford.mdx".into(), "朗文 当代.mdx".into()],
             // 特意取非默认值：等于默认时，`from_pairs` 的兜底分支也能让断言通过，
             // 那就验不出这一项到底有没有真的往返。
             left_pane_w: 340,
