@@ -1003,6 +1003,7 @@ dependencies = [
  "anyhow",
  "csv",
  "embed-resource",
+ "flate2",
  "rusqlite",
  "windows 0.58.0",
  "windui",

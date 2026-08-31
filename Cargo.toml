@@ -14,6 +14,12 @@ windui = { path = "../wind-ui-rust" }
 # 二进制因此 +~1.5MB——相对 windui 的极简理念是笔真实开销，见 docs/adr/0006。
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# MDX 词库的块解压（zlib）。后端是纯 Rust 的 miniz_oxide，不引 C 工具链。
+#
+# 唯一为「运行时直读 MDX」新增的依赖：解压是那条路上真正绕不过去的一环，其余
+# （ripemd128、键序归一化、样式表展开）都在本仓库里自己写了，见 src/store/mdx。
+flate2 = "1"
+
 # 错误传播。词典的失败模式（库损坏、网络、API 报错）对用户都是「查不到」，
 # 不需要调用方按类型分支处理，故用 anyhow 而非自定义错误枚举。
 anyhow = "1"
@@ -31,6 +37,9 @@ windows = { version = "0.58", features = [
     "Win32_System_Registry",
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    # 老 MDX 词典的 GBK / Big5 正文靠 MultiByteToWideChar 解码。系统自带这些代码页的
+    # 映射表，引一份几百 KB 的静态编码表进二进制去做同一件事并不划算。
+    "Win32_Globalization",
 ] }
 
 # 仅构建期工具（examples/build_ecdict.rs）与测试使用。

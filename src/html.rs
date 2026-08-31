@@ -199,7 +199,7 @@ fn attr(attrs: &str, name: &str) -> Option<String> {
 /// 不引入 HTML 实体全表（2,231 项）：词典正文里出现的实体高度集中，而那张表会让
 /// 二进制多出几十 KB——这个项目以体积为卖点（docs/adr/0006）。未识别的实体**原样
 /// 保留**，不吞掉：显示成 `&hellip;` 虽丑，总好过静默消失。
-fn unescape(s: &str) -> String {
+pub(crate) fn unescape(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();
     }
@@ -208,7 +208,10 @@ fn unescape(s: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         let tail = &rest[i..];
-        let Some(semi) = tail[..tail.len().min(12)].find(';') else {
+        // 按**字节**数窗口找分号，但绝不切片：`&` 后面紧跟汉字时，第 12 个字节多半
+        // 落在某个字的中间，`tail[..12]` 会当场恐慌。分号是 ASCII，故字节位置必然
+        // 也是合法的字符边界，直接找字节最省事。
+        let Some(semi) = tail.bytes().take(12).position(|b| b == b';') else {
             out.push('&');
             rest = &tail[1..];
             continue;
@@ -444,6 +447,25 @@ mod tests {
         assert_eq!(plain("&#65;&#x42;"), vec!["AB"]);
         // 认不出的原样保留，不吞——显示成 `&hellip;` 虽丑，总好过静默消失。
         assert_eq!(plain("x&zzz;y"), vec!["x&zzz;y"]);
+    }
+
+    /// 孤立的 `&` 后面紧跟汉字时，找分号的那个窗口不能按字节切片——第 12 个字节多半
+    /// 落在某个字的中间。
+    ///
+    /// 这不是假想：读一本真实 MDX 词典时，头部自述里的
+    /// `&lt;font size=5 color=red&gt;简明英汉字典增强版` 当场把程序打崩。
+    #[test]
+    fn 孤立的与号后面跟汉字不恐慌() {
+        assert_eq!(unescape("&简明英汉字典增强版"), "&简明英汉字典增强版");
+        assert_eq!(
+            unescape("a & 简明英汉字典增强版 b"),
+            "a & 简明英汉字典增强版 b"
+        );
+        // 窗口之外的分号不算实体，前面的 `&` 原样留下。
+        assert_eq!(
+            unescape("&这是一个很长的名字abc;"),
+            "&这是一个很长的名字abc;"
+        );
     }
 
     #[test]

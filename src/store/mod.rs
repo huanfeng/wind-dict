@@ -12,6 +12,7 @@
 
 pub mod cedict;
 pub mod ecdict;
+pub mod mdx;
 pub mod unihan;
 pub mod userdata;
 
