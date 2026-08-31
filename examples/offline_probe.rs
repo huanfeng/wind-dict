@@ -1,7 +1,7 @@
 //! 离线词典端到端验证：一个词典、两份词库、方向自动判定。
 //!
 //! ```bash
-//! cargo run --release --example offline_probe -- ecdict.db cedict.db
+//! cargo run --release --example offline_probe -- .cache/dict
 //! ```
 
 use std::time::Instant;
@@ -10,20 +10,15 @@ use wind_dict::domain::{Dictionary, Entry, Lookup, Query, Wordlist};
 use wind_dict::source::offline::OfflineDictionary;
 
 fn main() -> anyhow::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let (Some(ec), Some(ce)) = (args.next(), args.next()) else {
-        eprintln!("用法：cargo run --release --example offline_probe -- <ecdict.db> <cedict.db>");
+    let Some(dir) = std::env::args().nth(1) else {
+        eprintln!("用法：cargo run --release --example offline_probe -- <词库目录>");
         std::process::exit(2);
     };
 
     let t = Instant::now();
-    // 字形库对本工具无所谓：它探的是查询与补全，字形不参与。给个不存在的路径，
-    // `open` 会当作没有——这正是那个「可缺」设计要保证的行为。
-    let dict = OfflineDictionary::open(
-        std::path::Path::new(&ec),
-        std::path::Path::new(&ce),
-        std::path::Path::new("unihan.db"),
-    )?;
+    // 目录里没有 unihan.db 也照跑：它探的是查询与补全，字形不参与——这正是那个
+    // 「字形库可缺」的设计要保证的行为。
+    let dict = OfflineDictionary::open(std::path::Path::new(&dir))?;
     println!("打开「{}」：{:?}\n", dict.name(), t.elapsed());
 
     // 方向由查询词自动判定——同一个入口，用户从不选方向。

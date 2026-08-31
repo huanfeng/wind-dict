@@ -1672,32 +1672,32 @@ impl State {
 
     /// 换词库路径。只能重启生效：词库连接在 `main` 里打开后交给了界面，运行期换库
     /// 意味着重建整条查询链路，而那点收益抵不上它带来的状态一致性问题。
-    fn set_dict_path(&self, is_ec: bool, path: Option<std::path::PathBuf>) {
-        // **先校验再落库**。选错文件的代价是致命的：词库打不开时 `main` 直接 exit，
+    fn set_dict_dir(&self, dir: Option<std::path::PathBuf>) {
+        // **先校验再落库**。选错目录的代价是致命的：词库打不开时 `main` 直接退出，
         // 而 release 构建没有控制台（`windows_subsystem = "windows"`），用户看到的是
-        // 「双击没反应、托盘不出现、零提示」，且设置存在 %LOCALAPPDATA% 里无从下手。
-        // 文件选择器只按扩展名过滤，把汉英库选进英汉槽它照收——非校验不可。
-        if let Some(p) = &path {
-            if let Err(e) = crate::source::offline::probe_dict(p, is_ec) {
-                self.note_err(format!("这个文件不能用作词库：{e:#}"));
+        // 「双击没反应、托盘不出现、零提示」。
+        //
+        // 光看文件名在不在不够：把汉英库改名成 `ecdict.db` 放进去，只看名字的检查会
+        // 照收，而两个库的表结构完全不同。`check_dir` 会真开一次并试查。
+        if let Some(p) = &dir {
+            let st = crate::source::offline::check_dir(p);
+            if !st.usable() {
+                self.note_err(format!(
+                    "这个目录不能用作词库目录：{}",
+                    st.missing().join("；")
+                ));
                 return;
             }
         }
-        let has = path.is_some();
-        {
-            let mut s = self.settings.borrow_mut();
-            if is_ec {
-                s.ecdict = path;
-            } else {
-                s.cedict = path;
-            }
-        }
+        let has = dir.is_some();
+        self.settings.borrow_mut().dict_dir = dir;
         if self.save_settings() {
             self.note_ok(if has {
-                "词库已更改，重启后生效"
+                "词库目录已更改，重启后生效"
             } else {
-                "已恢复默认词库路径，重启后生效"
+                "已恢复默认词库目录，重启后生效"
             });
+            self.bump_settings();
         }
     }
 
@@ -3425,48 +3425,84 @@ fn toggle_row(
     )])
 }
 
-/// 词库路径。
+/// 词库目录：随程序分发的三份库住在哪。
+///
+/// **一行，不是三行**。三份库永远住在一起、随同一次部署整体替换；给它们各配一个
+/// 文件选择器，等于把一种从不发生的状态（英汉指新版、汉英指旧版）摆到用户面前。
+/// 字形库此前更是**连设置项都没有**，靠「在英汉库旁边找」这条看不见的约定定位——
+/// 同一件事两套规则，其中一套还是隐式的。
 fn dict_rows(st: Rc<State>) -> Element {
-    card(vec![dict_row(st.clone(), true), dict_row(st, false)])
-}
-
-fn dict_row(st: Rc<State>, is_ec: bool) -> Element {
-    let (title, cur) = if is_ec {
-        ("英汉词库", st.settings.borrow().ecdict.clone())
-    } else {
-        ("汉英词库", st.settings.borrow().cedict.clone())
+    use crate::source::offline;
+    let configured = st.settings.borrow().dict_dir.clone();
+    // 显示的是**此刻真正在用的**那个目录，不是设置里写着的那个。二者可能不同：
+    // 设置里的目录失效时 `main` 会回退到程序同目录（否则用户会被锁在启动失败里）。
+    // 只显示设置值的话，用户会对着一个正确的路径纳闷为什么查的还是旧库。
+    let in_use = match &configured {
+        Some(d) if offline::check_dir(d).usable() => d.clone(),
+        _ => offline::exe_dir(),
     };
-    let shown = cur
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "（默认：程序同目录）".into());
+    let fell_back = configured.is_some() && configured.as_ref() != Some(&in_use);
+
+    let status = offline::check_dir(&in_use);
+    let sub = if fell_back {
+        format!("设置的目录当前不可用，正在用：{}", in_use.display())
+    } else {
+        in_use.display().to_string()
+    };
+
     let mut right = Element::row().cross(Align::Center).spacing(8);
-    // 有自定义路径时才给「恢复默认」——本来就是默认值时这个按钮点了没意义。缺了它，
+    // 有自定义目录时才给「恢复默认」——本来就是默认值时这个按钮点了没意义。缺了它，
     // 用户一旦选错就再也回不到默认，只能去手改数据库。
-    if cur.is_some() {
+    if configured.is_some() {
         let st2 = st.clone();
-        right = right.child(
-            Element::button("恢复默认").on_click(move |_ctx| st2.set_dict_path(is_ec, None)),
-        );
+        right = right.child(Element::button("恢复默认").on_click(move |_| st2.set_dict_dir(None)));
     }
-    right = right.child(Element::button("选择…").on_click(move |ctx| {
-        let st = st.clone();
-        ctx.request_pick_file(
-            PickDialog::new()
-                .title(if is_ec {
-                    "选择英汉词库"
-                } else {
-                    "选择汉英词库"
-                })
-                .filter("SQLite 词库", &["db"]),
+    let d = in_use.clone();
+    right = right.child(Element::button("打开").on_click(move |_| reveal(&d)));
+    let st3 = st.clone();
+    right = right.child(Element::button("更改…").on_click(move |ctx| {
+        let st = st3.clone();
+        ctx.request_pick_folder(
+            PickDialog::new().title("选择词库目录"),
             move |picked| {
                 if let Some(p) = picked {
-                    st.set_dict_path(is_ec, Some(p));
+                    st.set_dict_dir(Some(p));
                 }
             },
         );
     }));
-    row(title, Some(&shown), right)
+
+    card(vec![
+        row("词库目录", Some(&sub), right),
+        row("已装词库", Some(&dict_files_line(&status)), Element::col()),
+    ])
+}
+
+/// 三份库的齐备情况，一行文字。
+///
+/// 报**文件大小**而不是词条数：`SELECT count(*)` 在这三个库上实测各要 170–210 ms，
+/// 而设置页每次换肤、每次拨开关都要重建，三份加起来半秒的卡顿换不来什么——用户分辨
+/// 不出 770,611 与 700,000 的差别，却一眼看得出 169 MB 与 0 字节的差别。
+fn dict_files_line(st: &crate::source::offline::DirStatus) -> String {
+    use crate::source::offline::{CEDICT_FILE, ECDICT_FILE, UNIHAN_FILE};
+    fn mb(n: u64) -> String {
+        format!("{:.0} MB", n as f64 / 1_048_576.0)
+    }
+    let mut parts = Vec::new();
+    parts.push(match &st.ecdict {
+        Ok(n) => format!("英汉 {}", mb(*n)),
+        Err(_) => format!("缺 {ECDICT_FILE}"),
+    });
+    parts.push(match &st.cedict {
+        Ok(n) => format!("汉英 {}", mb(*n)),
+        Err(_) => format!("缺 {CEDICT_FILE}"),
+    });
+    // 字形库可缺，故说法不同：它不在只是少一行部首笔画，不是故障。
+    parts.push(match st.unihan {
+        Some(n) => format!("字形 {}", mb(n)),
+        None => format!("无 {UNIHAN_FILE}（不显示部首笔画）"),
+    });
+    parts.join(" · ")
 }
 
 /// 打开一个目录（资源管理器）。

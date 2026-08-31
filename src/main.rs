@@ -23,7 +23,7 @@ use windui::prelude::*;
 
 use wind_dict::icon;
 use wind_dict::settings::Settings;
-use wind_dict::source::offline::OfflineDictionary;
+use wind_dict::source::offline::{self, OfflineDictionary};
 use wind_dict::store::userdata::{UserData, UserDataState};
 use wind_dict::ui;
 use wind_dict::APP_TITLE;
@@ -45,20 +45,29 @@ fn main() {
         UserDataState::Unavailable(_) => Settings::default(),
     };
 
-    let (ecdict, cedict) = dict_paths(&settings);
+    let dict_dir = resolve_dict_dir(&settings);
 
     // 词库缺失是致命的：离线词典是本工具的主体，没有它整个程序没有意义。
     // 与其起一个查什么都「未收录」的空壳（那是在撒谎——术语表里「一无所获」的意思是
     // 词典确实没有这个词，不是「我没词库」），不如直接失败。
-    let dict = match OfflineDictionary::open(&ecdict, &cedict, &unihan_path(&ecdict)) {
+    //
+    // 但**报得出是缺哪一份**：此前只说「无法打开词库」再附一段 anyhow 的因果链，
+    // 用户看到的是一屏读不懂的东西，而他真正需要知道的只有「哪个文件不在」。
+    let status = offline::check_dir(&dict_dir);
+    if !status.usable() {
+        fatal(&format!(
+            "词库不可用。\n\n词库目录：{}\n\n{}\n\n构建词库：\n  cargo run --release --example build_ecdict -- ecdict.csv ecdict.db\n  cargo run --release --example build_cedict -- cedict_ts.u8 cedict.db",
+            dict_dir.display(),
+            status.missing().join("\n"),
+        ));
+    }
+    let dict = match OfflineDictionary::open(&dict_dir) {
         Ok(d) => d,
-        Err(e) => {
-            fatal(&format!(
-                "无法打开词库。\n\n英汉词库：{}\n汉英词库：{}\n\n构建词库：\n  cargo run --release --example build_ecdict -- ecdict.csv ecdict.db\n  cargo run --release --example build_cedict -- cedict_ts.u8 cedict.db\n\n详细原因：\n{e:?}",
-                ecdict.display(),
-                cedict.display(),
-            ));
-        }
+        // `check_dir` 刚刚才开过同样这几份库，走到这里说明文件正在被替换。
+        Err(e) => fatal(&format!(
+            "词库刚才还是好的，现在打不开了——是不是正在被替换？\n\n{}\n\n{e:#}",
+            dict_dir.display()
+        )),
     };
 
     let tray = Tray::new()
@@ -265,53 +274,27 @@ fn userdata_dir() -> Result<PathBuf, String> {
     wind_dict::store::userdata::data_dir()
 }
 
-/// 词库路径。优先级：命令行参数 > 设置 > exe 同目录。
+/// 词库目录。优先级：命令行参数 > 设置 > exe 同目录。
 ///
 /// 命令行压过设置，是因为它是**当次显式指定**的——开发时用 `.cache/dict/` 里的库
-/// 调试，不该被用户设置里的路径顶掉，也不该反过来把设置改坏。
+/// 调试，不该被用户设置里的目录顶掉，也不该反过来把设置改坏。
 ///
-/// exe 同目录而非工作目录：常驻工具从托盘/热键启动时，工作目录是什么完全不可控。
-fn dict_paths(settings: &Settings) -> (PathBuf, PathBuf) {
+/// **设置里的目录不可用时回退 exe 同目录**，而不是直接判死。设置存的是路径，而路径会
+/// 失效（换盘、挪目录、清理下载文件夹）；一旦失效，程序在启动阶段就退出，而修改设置的
+/// 入口**在程序里面**——用户进不去，也就改不回来，只剩手改 SQLite 一条路。一个能把
+/// 自己锁死的设置项不该存在。设置页会把这个回退如实标出来，不是悄悄换掉。
+fn resolve_dict_dir(settings: &Settings) -> PathBuf {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(pair) = positional_dicts(&args) {
-        return pair;
+    if let Some(dir) = positional_dict_dir(&args) {
+        return dir;
     }
-    let dir = exe_dir();
-    let ec = settings
-        .ecdict
-        .clone()
-        .unwrap_or_else(|| dir.join("ecdict.db"));
-    let ce = settings
-        .cedict
-        .clone()
-        .unwrap_or_else(|| dir.join("cedict.db"));
-    (ec, ce)
-}
-
-/// exe 所在目录。工作目录不可信——常驻工具从托盘/热键启动时它是什么完全不可控。
-fn exe_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(PathBuf::from))
-        .unwrap_or_default()
-}
-
-/// 字形库的位置。**没有设置项**，故只按约定找，找不到就没有。
-///
-/// 先看英汉词库旁边，再退到 exe 目录：前者让开发期 `wind-dict .cache/dict/ecdict.db
-/// .cache/dict/cedict.db` 这种跑法自动捡到同目录的字形库，后者是正式部署的样子。
-///
-/// 不给它设置项是刻意的：另外两份词库可以换（用户可能想塞一份更大的 ECDICT），
-/// 字形库没有第二个版本可换——它就是 Unihan。多一个换不了东西的设置项只是噪音。
-fn unihan_path(ecdict: &std::path::Path) -> PathBuf {
-    let beside = ecdict.parent().map(|d| d.join("unihan.db"));
-    match beside {
-        Some(p) if p.exists() => p,
-        _ => exe_dir().join("unihan.db"),
+    match &settings.dict_dir {
+        Some(d) if offline::check_dir(d).usable() => d.clone(),
+        _ => offline::exe_dir(),
     }
 }
 
-/// 命令行里那对词库路径。**命令行含任何开关时一律不认**，返回 `None`。
+/// 命令行里那个词库目录。**命令行含任何开关时一律不认**，返回 `None`。
 ///
 /// 此前是「滤掉 `--` 开头的项、剩下的头两个当词库」，而开关的**取值**长得与位置参数
 /// 一模一样：`--screenshot out.png --click 28 596` 剩下的是 `out.png`、`28`、`596`，
@@ -322,16 +305,13 @@ fn unihan_path(ecdict: &std::path::Path) -> PathBuf {
 /// （windui 的 `--click` 还可重复出现），上游每加一个开关这里就悄悄失效一次，而失效
 /// 的表现又是上面那条谜语。改判「有开关就整体不认」则与上游的开关表无关。
 ///
-/// 两种用法本就不会同时出现：位置参数是开发期临时指定词库（`wind-dict a.db b.db`），
-/// 开关全都走截图与调试路径。
-fn positional_dicts(args: &[String]) -> Option<(PathBuf, PathBuf)> {
+/// 两种用法本就不会同时出现：位置参数是开发期临时指定词库目录
+/// （`wind-dict .cache\dict`），开关全都走截图与调试路径。
+fn positional_dict_dir(args: &[String]) -> Option<PathBuf> {
     if args.iter().any(|a| a.starts_with("--")) {
         return None;
     }
-    match args {
-        [a, b, ..] => Some((PathBuf::from(a), PathBuf::from(b))),
-        _ => None,
-    }
+    args.first().map(PathBuf::from)
 }
 
 /// 本次启动是否该直接收进托盘。见 `autostart::TRAY_ARG`。
@@ -350,7 +330,7 @@ fn wants_tray(args: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_panic_log, positional_dicts, wants_tray};
+    use super::{append_panic_log, positional_dict_dir, wants_tray};
 
     fn 参数(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -390,25 +370,19 @@ mod tests {
     }
 
     #[test]
-    fn 两个位置参数即一对词库() {
-        let got = positional_dicts(&参数(&["ec.db", "ce.db"]));
-        let (ec, ce) = got.expect("两个位置参数该认");
-        assert_eq!(ec.to_str(), Some("ec.db"));
-        assert_eq!(ce.to_str(), Some("ce.db"));
-    }
-
-    /// 只给一个不成对——宁可回退默认，也不拿它当英汉库、汉英库悬空。
-    #[test]
-    fn 单个位置参数不成对() {
-        assert!(positional_dicts(&参数(&["ec.db"])).is_none());
+    fn 位置参数即词库目录() {
+        let got = positional_dict_dir(&参数(&[r".cache\dict"]));
+        assert_eq!(got.expect("该认").to_str(), Some(r".cache\dict"));
+        assert!(positional_dict_dir(&参数(&[])).is_none());
     }
 
     /// 这条是本函数存在的理由：截图开关的取值此前会被当成词库路径。
     #[test]
     fn 带开关时不认位置参数() {
-        assert!(positional_dicts(&参数(&["--screenshot", "out.png"])).is_none());
+        assert!(positional_dict_dir(&参数(&["--screenshot", "out.png"])).is_none());
         assert!(
-            positional_dicts(&参数(&["--screenshot", "out.png", "--click", "28", "596"])).is_none(),
+            positional_dict_dir(&参数(&["--screenshot", "out.png", "--click", "28", "596"]))
+                .is_none(),
             "--click 的坐标不该被当成词库路径"
         );
     }
@@ -419,9 +393,9 @@ mod tests {
     /// 拒绝的做法。这里把它钉住，免得日后有人为了 `--tray` 去动那条规则。
     #[test]
     fn 托盘开关不被当成词库路径() {
-        assert!(positional_dicts(&参数(&[wind_dict::autostart::TRAY_ARG])).is_none());
+        assert!(positional_dict_dir(&参数(&[wind_dict::autostart::TRAY_ARG])).is_none());
         assert!(
-            positional_dicts(&参数(&["ec.db", "ce.db", wind_dict::autostart::TRAY_ARG])).is_none(),
+            positional_dict_dir(&参数(&[r".cache\dict", wind_dict::autostart::TRAY_ARG])).is_none(),
             "混入开关时整体不认，位置参数也不该生效"
         );
     }
@@ -437,7 +411,7 @@ mod tests {
         );
         assert!(!wants_tray(&参数(&["--traylike"])), "不该按前缀匹配");
         assert!(
-            wants_tray(&参数(&["ec.db", "ce.db", "--tray"])),
+            wants_tray(&参数(&[r".cache\dict", "--tray"])),
             "开关出现在任意位置都算"
         );
     }

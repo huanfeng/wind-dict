@@ -170,10 +170,11 @@ function Do-GenData {
 
 # ---------- 自带词典目录 ----------
 #
+# 自带词典 (用户自己放的 MDX) 的目录 —— 不是"词库目录"(那是 exe 同目录的三份 .db)。
 # 与 src/store/userdata.rs 的 data_dir() 必须一致: %LOCALAPPDATA%\wind-dict-data[-dev]\dicts。
 # 这个目录**不在部署目录内**, 故 u/ud 卸载碰不到它 —— 里头是用户自己下载的词典,
 # 动辄几百 MB, 卸载程序顺手删掉是不能接受的 (同 ADR-0011)。
-function Dict-Dir ([string]$profile) {
+function UserDictDir ([string]$profile) {
     $data = if ($profile -eq "dev") { "wind-dict-data-dev" } else { "wind-dict-data" }
     return "$env:LOCALAPPDATA\$data\dicts"
 }
@@ -203,7 +204,7 @@ function Do-GetMdx {
 
 # 把示例词典装进词典目录。已有任何 .mdx 就不动 —— 那是用户的东西。
 function Install-ExampleMdx ([string]$profile) {
-    $dst = Dict-Dir $profile
+    $dst = UserDictDir $profile
     New-Item -ItemType Directory -Path $dst -Force | Out-Null
     if (Get-ChildItem $dst -Recurse -Filter *.mdx -ErrorAction SilentlyContinue) {
         Gray "  - 词典目录已有词典, 不动 ($dst)"; return

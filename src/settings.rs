@@ -239,9 +239,15 @@ pub struct Settings {
     /// 只影响**默认**展开与否，不影响该区是否存在——英英释义始终可展开，这是
     /// 刻意的产品决定（见 `ui::entry_view`）。
     pub expand_en: bool,
-    /// 词库路径覆盖。`None` = 沿用命令行参数或 exe 同目录的默认查找。
-    pub ecdict: Option<PathBuf>,
-    pub cedict: Option<PathBuf>,
+    /// 随程序分发的三份词库所在的目录。`None` = exe 同目录。
+    ///
+    /// **一个目录，不是三条路径**。三份库（英汉、汉英、字形）永远住在一起、随同一次
+    /// 部署整体替换，让它们各配一条路径，等于允许一种从不发生、却处处要防的状态：
+    /// 英汉指向新版、汉英还指着旧版。
+    ///
+    /// 这也把字形库一并收编了：它此前**没有设置项**，靠「在英汉库旁边找」这条隐式
+    /// 约定定位——同一件事有两套规则，其中一套还是不可见的。
+    pub dict_dir: Option<PathBuf>,
     /// 自带词典所在的目录。`None` = 用默认目录（见 `source::user::default_dir`）。
     ///
     /// 存**一个目录**而非一串文件路径：词典是用户往里丢的，不是逐个登记的。丢进去
@@ -278,8 +284,7 @@ impl Default for Settings {
             style: SkinStyle::Plain,
             mode: SkinMode::System,
             expand_en: false,
-            ecdict: None,
-            cedict: None,
+            dict_dir: None,
             user_dict_dir: None,
             disabled_dicts: Vec::new(),
             left_pane_w: LEFT_PANE_W_DEFAULT,
@@ -296,8 +301,9 @@ pub mod keys {
     /// 旧版的皮肤键，**只读不写**。见 `super::legacy`。
     pub const LEGACY_SKIN: &str = "skin";
     pub const EXPAND_EN: &str = "expand_en";
-    pub const ECDICT: &str = "ecdict";
-    pub const CEDICT: &str = "cedict";
+    pub const DICT_DIR: &str = "dict_dir";
+    /// 旧版按文件存的词库路径。**只读不写**，仅用于迁移到 [`DICT_DIR`]。
+    pub const LEGACY_ECDICT: &str = "ecdict";
     pub const USER_DICT_DIR: &str = "user_dict_dir";
     pub const DISABLED_DICTS: &str = "disabled_dicts";
     pub const LEFT_PANE_W: &str = "left_pane_w";
@@ -331,12 +337,18 @@ impl Settings {
             expand_en: get(keys::EXPAND_EN)
                 .map(|s| s == "1")
                 .unwrap_or(d.expand_en),
-            ecdict: get(keys::ECDICT)
+            dict_dir: get(keys::DICT_DIR)
                 .filter(|s| !s.is_empty())
-                .map(PathBuf::from),
-            cedict: get(keys::CEDICT)
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from),
+                .map(PathBuf::from)
+                // 旧版按文件存路径。取英汉库所在的目录迁移过来——三份库本就同处一处，
+                // 故这个推断在旧数据上必然成立。不迁移的话，设置过词库路径的用户会在
+                // 升级后被静默拽回默认目录。
+                .or_else(|| {
+                    get(keys::LEGACY_ECDICT)
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                        .and_then(|p| p.parent().map(PathBuf::from))
+                }),
             user_dict_dir: get(keys::USER_DICT_DIR)
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
@@ -361,8 +373,7 @@ impl Settings {
             (keys::SKIN_STYLE, style_str(self.style).into()),
             (keys::SKIN_MODE, mode_str(self.mode).into()),
             (keys::EXPAND_EN, bool_str(self.expand_en).into()),
-            (keys::ECDICT, path_str(&self.ecdict)),
-            (keys::CEDICT, path_str(&self.cedict)),
+            (keys::DICT_DIR, path_str(&self.dict_dir)),
             (keys::USER_DICT_DIR, path_str(&self.user_dict_dir)),
             (keys::DISABLED_DICTS, self.disabled_dicts.join("\n")),
             (keys::LEFT_PANE_W, self.left_pane_w.to_string()),
@@ -549,6 +560,35 @@ mod tests {
         }
     }
 
+    /// 旧版按**文件**存词库路径（`ecdict` / `cedict` 两个键）。取英汉库所在的目录
+    /// 迁移过来——三份库本就同处一处，故这个推断在旧数据上必然成立。
+    ///
+    /// 不迁移的话，设置过词库路径的用户升级后会被静默拽回程序同目录：查得到词、
+    /// 一切正常，只是用的不是他指定的那份库。这种「没坏但不对」最难被发现。
+    #[test]
+    fn 旧版的词库文件路径迁移成目录() {
+        let 读 = |m: &HashMap<String, String>| {
+            let m = m.clone();
+            Settings::from_pairs(move |k| m.get(k).cloned())
+        };
+
+        let legacy = HashMap::from([(keys::LEGACY_ECDICT.to_string(), r"D:\dict\ecdict.db".to_string())]);
+        assert_eq!(读(&legacy).dict_dir, Some(PathBuf::from(r"D:\dict")));
+
+        // 新键存在时以新键为准，不被旧键顶掉。
+        let both = HashMap::from([
+            (keys::LEGACY_ECDICT.to_string(), r"D:\dict\ecdict.db".to_string()),
+            (keys::DICT_DIR.to_string(), r"E:\新目录".to_string()),
+        ]);
+        assert_eq!(读(&both).dict_dir, Some(PathBuf::from(r"E:\新目录")));
+
+        // 两个都没有就是没设置过，走默认（程序同目录）。
+        assert_eq!(读(&HashMap::new()).dict_dir, None);
+        // 空串等同没设置——旧版把 `None` 也写成空串存了进去。
+        let empty = HashMap::from([(keys::LEGACY_ECDICT.to_string(), String::new())]);
+        assert_eq!(读(&empty).dict_dir, None);
+    }
+
     #[test]
     fn 设置往返一致() {
         let s = Settings {
@@ -557,8 +597,7 @@ mod tests {
             style: SkinStyle::Focus,
             mode: SkinMode::Dark,
             expand_en: true,
-            ecdict: Some(PathBuf::from(r"D:\a\ec.db")),
-            cedict: None,
+            dict_dir: Some(PathBuf::from(r"D:\a\dict")),
             user_dict_dir: Some(PathBuf::from(r"E:\我的词库")),
             // 两条而非一条：一条存不出分隔符有没有用对。
             disabled_dicts: vec!["Oxford.mdx".into(), "朗文 当代.mdx".into()],
