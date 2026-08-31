@@ -44,30 +44,7 @@
 //!
 //! 记在这里是为了别把它当缺陷去「修」：能修的只有引入 CSS，那正是 ADR-0001 拒绝的。
 
-/// 一段文字里的一截，样式一致。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct TextRun {
-    pub text: String,
-    pub bold: bool,
-    pub italic: bool,
-    /// `entry://词` 形式的跳转目标（已去掉协议前缀）。其余链接不留——外部 URL
-    /// 在一个离线词典里点了也没有意义。
-    pub link: Option<String>,
-}
-
-/// 一个段落。`indent` 是列表嵌套层级，0 为不缩进。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct TextBlock {
-    pub indent: u8,
-    pub runs: Vec<TextRun>,
-}
-
-impl TextBlock {
-    /// 本段的纯文字。判空与测试用。
-    pub fn plain(&self) -> String {
-        self.runs.iter().map(|r| r.text.as_str()).collect()
-    }
-}
+use crate::domain::{TextBlock, TextRun};
 
 /// 会切断段落的块级标签。
 ///

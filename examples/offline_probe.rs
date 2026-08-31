@@ -76,6 +76,8 @@ fn main() -> anyhow::Result<()> {
                                 g.join(" / ")
                             );
                         }
+                        // 本例只探随程序分发的两个库，走不到自带词典这一支。
+                        Entry::User(_) => unreachable!("离线词典不产出自带词典的词条"),
                     }
                 }
             }

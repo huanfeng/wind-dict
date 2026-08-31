@@ -382,6 +382,7 @@ mod tests {
             expand_en: true,
             ecdict: Some(std::path::PathBuf::from(r"D:\ec.db")),
             cedict: None,
+            user_dicts: vec![std::path::PathBuf::from(r"D:\Oxford.mdx")],
             left_pane_w: 340,
         };
         {

@@ -30,11 +30,13 @@ use windui::render::{Canvas, Paint};
 use windui::ui::containers::{TabBar, TabItem};
 
 use crate::domain::{
-    Candidate, CharTier, Dictionary, Entry, Glyph, Headword, Lookup, Query, Sense, Wordlist,
+    Candidate, CharTier, Dictionary, Direction, Entry, Glyph, Headword, Lookup, Query, Sense,
+    UserEntry, Wordlist,
 };
 use crate::settings::Settings;
 use crate::skin::{SkinMode, SkinStyle};
 use crate::source::offline::OfflineDictionary;
+use crate::source::user::UserDictionary;
 use crate::store::userdata::{now_secs, UserDataState};
 
 /// 补全候选一次最多列几条。
@@ -856,6 +858,14 @@ fn write_note(text: Signal<String>, tone: Signal<Role>, role: Role, s: impl Into
 /// 界面状态。
 struct State {
     dict: Rc<OfflineDictionary>,
+    /// 自带词典：用户放进来的 MDX，按设置里的顺序依次问过去。
+    ///
+    /// 只装**打开成功**的那些。设置页列的是 `Settings::user_dicts` 里的路径，两者
+    /// 对不上的即为「当前打不开」——文件被移走、被换成不支持的格式，都归这一类。
+    /// 让打不开的词典留在设置里而不是被悄悄剔除，用户才有机会看见并处理它。
+    ///
+    /// `RefCell` 是为了设置页增删词典：那不需要重建界面树，只需下一次查询问到新的那本。
+    user_dicts: RefCell<Vec<UserDictionary>>,
     /// 用户数据（收藏与历史）。不可用时保留**原因**，由 `unavailable_bar` 展示。
     user: UserDataState,
     query: Signal<String>,
@@ -1259,36 +1269,77 @@ impl State {
             self.hint.set("输入一个词开始查询".into());
             return;
         };
+        // 随程序分发的词典与用户自带的词典**都问一遍**，结果并排呈现。
+        //
+        // 这不违反 ADR-0002 的「绝不自动兜底」：那条挡的是**跨类**降级（词典未命中就
+        // 静默发网络请求给译源），因为二者可信度与隐私代价都不同。这里全是词典，
+        // 没有落差需要用户知情，而每条自带词典的词条都带着出处（`UserEntry::source`）。
+        let mut entries = Vec::new();
+        let mut via_base_form = false;
+        let mut err = None;
         match self.dict.lookup(&q) {
-            Err(e) => {
-                self.rebuild_cards(&[]);
-                self.hint.set(format!("词库读取失败：{e}"));
-            }
-            Ok(Lookup::NotFound) => {
-                self.rebuild_cards(&[]);
-                // 提示切换到译源，但**绝不自动发起**——见 ADR-0002。
-                self.hint.set(format!("离线词典未收录「{}」", q.text()));
-            }
+            Err(e) => err = Some(e),
+            Ok(Lookup::NotFound) => {}
             Ok(Lookup::Found {
-                entries,
-                via_base_form,
+                entries: found,
+                via_base_form: v,
             }) => {
-                self.hint.set(if via_base_form {
-                    // 用户查的是变化形态，显示的是原形词条——不提示会让人困惑。
-                    format!("显示的是「{}」的原形词条", q.text())
-                } else {
-                    String::new()
-                });
-                if record {
-                    self.record_all(&headwords_to_record(&entries));
-                    // 只有「确定要这个词」的查询才进导航路径，与记历史同一时机。
-                    // ↑↓ 扫过去的那些不进——否则按住方向键划过二十条，后退键就得
-                    // 按二十下才退得回来，而用户心里那一步只有一步。
-                    self.push_nav(word);
-                }
-                self.rebuild_cards(&entries);
+                entries = found;
+                via_base_form = v;
             }
         }
+        // 顺序即优先级：随程序分发的词典在前。它是我们挑过的，自带词典的来源与质量
+        // 我们一无所知，把后者顶到前面等于替用户做了一个我们没有依据做的判断。
+        let builtin_len = entries.len();
+
+        let mut broken: Vec<String> = Vec::new();
+        for d in self.user_dicts.borrow().iter() {
+            match d.lookup(&q) {
+                Ok(Lookup::Found { entries: found, .. }) => entries.extend(found),
+                Ok(Lookup::NotFound) => {}
+                // 一本词典读坏了不该让整次查询失败：其余词典的结果照样有用。
+                // 但也不能咽下去——用户得知道自己加的那本正在失灵。
+                Err(_) => broken.push(d.name().to_string()),
+            }
+        }
+        if !broken.is_empty() {
+            self.note_err(format!("自带词典读取失败：{}", broken.join("、")));
+        }
+
+        if entries.is_empty() {
+            self.rebuild_cards(&[]);
+            self.hint.set(match err {
+                Some(e) => format!("词库读取失败：{e}"),
+                // 提示切换到译源，但**绝不自动发起**——见 ADR-0002。
+                None => format!("离线词典未收录「{}」", q.text()),
+            });
+            return;
+        }
+
+        self.hint.set(if via_base_form {
+            // 用户查的是变化形态，显示的是原形词条——不提示会让人困惑。
+            format!("显示的是「{}」的原形词条", q.text())
+        } else {
+            String::new()
+        });
+        if record {
+            // 只记随程序分发的词典给出的词头；它一无所获时才退而记自带词典的。
+            //
+            // 不合起来记：MDX 的词头按归一化后的形式重名（查 `fullhouse` 会同时命中
+            // `Full-House` 与 `fullhouse`，见 ADR-0015），全记下来会让一次查询在历史里
+            // 留下两三行只差标点的记录。历史是给人翻的。
+            let source = if builtin_len > 0 {
+                &entries[..builtin_len]
+            } else {
+                &entries[..]
+            };
+            self.record_all(&headwords_to_record(source));
+            // 只有「确定要这个词」的查询才进导航路径，与记历史同一时机。
+            // ↑↓ 扫过去的那些不进——否则按住方向键划过二十条，后退键就得
+            // 按二十下才退得回来，而用户心里那一步只有一步。
+            self.push_nav(word);
+        }
+        self.rebuild_cards(&entries);
     }
 
     /// 按词头把词条分组成卡片，并取各词头当下的收藏状态。
@@ -1650,6 +1701,60 @@ impl State {
         }
     }
 
+    /// 添加一本自带词典。
+    ///
+    /// 与换词库路径（`set_dict_path`）不同，这个**当场生效**，不用重启：那两个库的
+    /// 连接在 `main` 里打开后就交给了界面，而自带词典由 `State` 自己持有。
+    fn add_user_dict(&self, path: std::path::PathBuf) {
+        if self.settings.borrow().user_dicts.contains(&path) {
+            self.note_err("这本词典已经加过了");
+            return;
+        }
+        // **先校验再落库**，与 `set_dict_path` 同一条理由，只是代价形状不同：这里
+        // 选错不会让程序起不来，但会让用户以为加成功了，直到查词时才发现哪本都不响。
+        // MDX 里有一批特性我们不支持（LZO 压缩、正文加密），那些文件**打得开、
+        // 报得出词条数**，只在解压正文时才失败——非真查一次不可。
+        if let Err(e) = crate::source::user::probe(&path) {
+            self.note_err(format!("这个文件不能用作词典：{e:#}"));
+            return;
+        }
+        self.settings.borrow_mut().user_dicts.push(path);
+        if self.save_settings() {
+            self.reload_user_dicts();
+            self.note_ok("词典已添加");
+            self.bump_settings();
+        }
+    }
+
+    /// 移除第 `i` 本自带词典。只从设置里去掉这一项，用户的文件一个字节都不动。
+    fn remove_user_dict(&self, i: usize) {
+        {
+            let mut s = self.settings.borrow_mut();
+            if i >= s.user_dicts.len() {
+                return;
+            }
+            s.user_dicts.remove(i);
+        }
+        if self.save_settings() {
+            self.reload_user_dicts();
+            self.note_ok("词典已移除");
+            self.bump_settings();
+        }
+    }
+
+    /// 按设置里的路径重开全部自带词典。
+    ///
+    /// 整个重开而不是增量增删：设置是唯一的真相，而增量维护要求两处的下标始终对齐，
+    /// 那是迟早会错位一次的东西。重开一本实测 2 ms 量级（索引只有几十 KB），
+    /// 而这条路径只在用户按下增删时才走。
+    fn reload_user_dicts(&self) {
+        let paths = self.settings.borrow().user_dicts.clone();
+        *self.user_dicts.borrow_mut() = paths
+            .iter()
+            .filter_map(|p| UserDictionary::open(p).ok())
+            .collect();
+    }
+
     /// 从当前页签移除一行：历史页删历史条目，收藏页取消收藏。
     ///
     /// **动作随页签而变**是刻意的：召回行的 × 意思是「把这一行从我眼前的这个列表里
@@ -1981,17 +2086,20 @@ fn root_width(ctx: &mut EventCtx) -> i32 {
 
 /// 一张卡片是否属于某个方向页签。
 ///
-/// 「全部」收所有；方向页按卡片里词条的类型判——`Entry` 只有英汉与汉英两个变体
-/// （术语表：两类词条的形状本就不同，不存在能同时容纳二者的字段集合），故这个匹配
-/// 是穷尽的，不存在第三种词条等着被漏掉。
+/// 「全部」收所有；方向页**按词头本身判方向**，与 `Query::direction` 同一套规则。
 ///
-/// 按**第一条**词条判而非全部：一张卡片是一个词头下的全部词条
-/// （`group_by_headword`），而一次查询只走一个方向（`Query::direction` 判定后路由，
-/// 见 `source/offline.rs`），同一张卡片不可能既有英汉又有汉英词条。
+/// 这里曾经按词条类型判（`Entry::English` → 英汉）。自带词典进来之后那样不行了：
+/// `Entry::User` 不属于任何一个方向，一个只被自带词典收录的英文词会从两个方向页里
+/// 一起消失，只在「全部」下露面。
+///
+/// 改按词头判反而更贴 ADR-0003——方向本就是**由文本推出的**，不是存在词条里的属性。
+/// 词头是词典背书的真实文本，用它判定与用查询词判定必然同结论：一次查询只走一个
+/// 方向，命中的词头与查询词是同一种文字。
 fn card_in_tab(c: &Card, tab: usize) -> bool {
+    let dir = Query::new(c.headword.as_str()).map(|q| q.direction());
     match tab {
-        DICT_EN_ZH => matches!(c.entries.first(), Some(Entry::English(_))),
-        DICT_ZH_EN => matches!(c.entries.first(), Some(Entry::Chinese(_))),
+        DICT_EN_ZH => dir == Some(Direction::EnToZh),
+        DICT_ZH_EN => dir == Some(Direction::ZhToEn),
         // `DICT_ALL` 与任何越界值都收全部。越界不该发生（页签由 `TabBar` 写，取值受
         // 标签数约束），但「筛空了」比「panic」更难查，故这里宁可放行。
         _ => true,
@@ -2107,8 +2215,17 @@ pub fn build(
         UserDataState::Ready(u) => u.settings(),
         UserDataState::Unavailable(_) => Settings::default(),
     };
+    // 自带词典在设置读出来之后才开得了：路径就存在设置里。打不开的跳过而不是让程序
+    // 起不来——它们是用户的文件，随时可能被移走，而 ADR-0011 那条「用户数据独立于
+    // 部署存活」在这里的推论就是「别让用户的文件决定程序能不能启动」。
+    let user_dicts: Vec<UserDictionary> = settings
+        .user_dicts
+        .iter()
+        .filter_map(|p| UserDictionary::open(p).ok())
+        .collect();
     let st = Rc::new(State {
         dict: dict.clone(),
+        user_dicts: RefCell::new(user_dicts),
         user,
         query: signal(String::new()),
         candidates: signal(Vec::new()),
@@ -2873,6 +2990,7 @@ fn settings_body(st: Rc<State>) -> Element {
                 .child(group("快捷键", shortcut_rows()))
                 .child(group("启动", autostart_row(st.clone())))
                 .child(group("词库", dict_rows(st.clone())))
+                .child(group("自带词典", user_dict_rows(st.clone())))
                 .child(group("释义显示", expand_en_row(st.clone())))
                 .child(group("数据", data_rows(st))),
         )
@@ -3349,6 +3467,74 @@ fn dict_row(st: Rc<State>, is_ec: bool) -> Element {
     row(title, Some(&shown), right)
 }
 
+/// 千位分隔。词条数动辄七位（实测一本 3,402,564），不分节根本读不出量级。
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// 自带词典：已加的列在前，末行是添加入口。
+///
+/// 列的是**设置里的路径**而不是已打开的那些词典。二者对不上时（文件被移走、被换成
+/// 不支持的格式）那一行会标出「打不开」——把它悄悄从列表里剔掉，用户会以为自己
+/// 从没加过，然后再加一遍，再一次什么也没发生。
+fn user_dict_rows(st: Rc<State>) -> Element {
+    let paths = st.settings.borrow().user_dicts.clone();
+    let opened = st.user_dicts.borrow();
+
+    let mut rows: Vec<Element> = Vec::new();
+    for (i, p) in paths.iter().enumerate() {
+        let stem = p
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // 按路径认领而非按下标：中间有打不开的时，两个列表的下标就对不上了。
+        let (title, sub) = match opened.iter().find(|d| d.path() == p) {
+            Some(d) => (
+                d.name().to_string(),
+                format!("{} 词条 · {stem}", thousands(d.entry_count())),
+            ),
+            None => (stem.clone(), format!("打不开 · {}", p.display())),
+        };
+        let st2 = st.clone();
+        rows.push(row(
+            &title,
+            Some(&sub),
+            Element::button("移除").on_click(move |_| st2.remove_user_dict(i)),
+        ));
+    }
+    drop(opened);
+
+    let st3 = st.clone();
+    rows.push(row(
+        "添加词典",
+        // 明说不支持什么：这两类文件用户拿到手时看不出区别，而失败信息出现在
+        // 点完「选择」之后，那时再解释已经晚了一步。
+        Some("MDX 格式。不支持 LZO 压缩与加密正文的词典"),
+        Element::button("选择…").on_click(move |ctx| {
+            let st = st3.clone();
+            ctx.request_pick_file(
+                PickDialog::new()
+                    .title("选择 MDX 词典")
+                    .filter("MDX 词典", &["mdx"]),
+                move |picked| {
+                    if let Some(p) = picked {
+                        st.add_user_dict(p);
+                    }
+                },
+            );
+        }),
+    ));
+    card(rows)
+}
+
 /// 需当场告知的消息条。空串时零高度、不占位。
 ///
 /// 与 `unavailable_bar` 分开：那条讲的是启动时就已知的**持续状态**，这条讲的是
@@ -3626,7 +3812,7 @@ fn card_view(c: Card, st: Rc<State>) -> Element {
         let expanded = st
             .expanded
             .get(&expand_key(&hw, i), st.settings.borrow().expand_en);
-        col = col.child(entry_view(e, expanded));
+        col = col.child(entry_view(e, expanded, st.clone()));
     }
     // 备注排在最后：它是用户**附加**给这个词的东西，不该插进词典自身的内容里打断
     // 「词头 → 音标 → 释义」这条阅读顺序。只在已收藏时出现——没收藏就没有可附着的
@@ -3794,7 +3980,7 @@ fn star(fav: bool, hw: Headword, st: Rc<State>) -> Element {
 ///
 /// **不含词头**——词头由 `card_view` 统一呈现在卡片头部，此处重复一遍是噪音；
 /// 多音字（一个词头、多条词条）尤其明显，会把同一个词连打好几遍。
-fn entry_view(e: Entry, expanded: Signal<bool>) -> Element {
+fn entry_view(e: Entry, expanded: Signal<bool>, st: Rc<State>) -> Element {
     match e {
         Entry::English(x) => {
             let mut col = Element::col().spacing(8).width_match();
@@ -3848,7 +4034,67 @@ fn entry_view(e: Entry, expanded: Signal<bool>) -> Element {
         // 汉英词条整条就是一段富文本——它没有徽章类内容（CC-CEDICT 只有繁简、拼音、
         // 释义、量词四样，全是文字），故拼音到量词可以一气选到底。
         Entry::Chinese(x) => selectable(chinese_doc(&x)).width_match(),
+        // 自带词典：出处一行 + 一整段富文本。
+        //
+        // 出处**必须画出来**，且在正文之上。随程序分发的两个库是我们挑过的，自带词典
+        // 是用户放进来的、来源与质量我们一无所知；两者以相同样式并排出现时，用户没有
+        // 任何线索区分。这与 ADR-0008 要求标注「由 AI 生成」是同一条理由的另一面。
+        Entry::User(x) => Element::col()
+            .spacing(6)
+            .width_match()
+            .child(
+                Element::label(x.source.clone())
+                    .font_size(12.0)
+                    .fg_role(Role::TextMuted),
+            )
+            .child(
+                selectable(user_doc(&x))
+                    // 词典内部的交叉引用（「参见 X」）点了就跳过去——这是自带词典
+                    // 唯一的导航手段，它的正文里没有别的可操作元素。
+                    .on_span_click(move |_, id| st.select(id)),
+            ),
     }
+}
+
+/// 自带词典正文里每级列表的缩进。
+const USER_INDENT: i32 = 20;
+
+/// 自带词典的正文：段落 + 行内粗体 / 斜体 / 跳转。
+///
+/// 这三个样式位就是 CSS 被剥掉之后**全部**幸存的语义（见 `crate::html`）。斜体尤其
+/// 承重：例句、语体标注（*informal*）、拉丁学名都只剩它了。
+fn user_doc(x: &UserEntry) -> RichDoc {
+    let mut doc = RichDoc::new();
+    for (i, b) in x.body.iter().enumerate() {
+        let mut para = Para::new();
+        for r in &b.runs {
+            let mut style = SpanStyle::new().size(15.0);
+            if r.bold {
+                style = style.weight(700);
+            }
+            if r.italic {
+                style = style.italic();
+            }
+            match &r.link {
+                Some(target) => {
+                    para = para.span_id(
+                        target.clone(),
+                        r.text.clone(),
+                        style.fg(RichColor::Accent).underline(),
+                    )
+                }
+                None => para = para.span(r.text.clone(), style),
+            }
+        }
+        if b.indent > 0 {
+            para = para.indent(i32::from(b.indent) * USER_INDENT);
+        }
+        if i > 0 {
+            para = para.spacing_before(6);
+        }
+        doc = doc.para(para);
+    }
+    doc
 }
 
 /// 把一篇富文本装成可选中、可复制的控件。
@@ -4361,6 +4607,20 @@ mod tests {
         assert_eq!(tone.get(), Role::Danger, "失败消息该是 Danger 角色");
     }
 
+    fn 自带(w: &str) -> Entry {
+        Entry::User(crate::domain::UserEntry {
+            headword: Headword::from_store(w),
+            source: "某本自带词典".into(),
+            body: vec![crate::domain::TextBlock {
+                indent: 0,
+                runs: vec![crate::domain::TextRun {
+                    text: "释义".into(),
+                    ..Default::default()
+                }],
+            }],
+        })
+    }
+
     fn 卡片(entries: Vec<Entry>) -> Card {
         Card {
             headword: entries[0].headword().clone(),
@@ -4388,6 +4648,30 @@ mod tests {
         assert!(!card_in_tab(&zh, DICT_EN_ZH), "汉英卡片不该出现在英汉页");
         assert!(card_in_tab(&zh, DICT_ZH_EN), "汉英卡片该留在汉英页");
         assert!(!card_in_tab(&en, DICT_ZH_EN), "英汉卡片不该出现在汉英页");
+    }
+
+    /// 只被自带词典收录的词，也必须出现在对应的方向页里。
+    ///
+    /// 这是 `card_in_tab` 从「按词条类型判」改成「按词头判方向」的**全部理由**：
+    /// `Entry::User` 不属于任何一个方向，按类型判会让这类卡片从两个方向页里一起
+    /// 消失，只在「全部」下露面——而用户根本不知道自己该去哪个页签找它。
+    #[test]
+    fn 只有自带词典命中的卡片也进方向页() {
+        let en = 卡片(vec![自带("serendipity")]);
+        let zh = 卡片(vec![自带("囍")]);
+        assert!(card_in_tab(&en, DICT_EN_ZH), "英文词头该留在英汉页");
+        assert!(!card_in_tab(&en, DICT_ZH_EN));
+        assert!(card_in_tab(&zh, DICT_ZH_EN), "中文词头该留在汉英页");
+        assert!(!card_in_tab(&zh, DICT_EN_ZH));
+        assert!(card_in_tab(&en, DICT_ALL) && card_in_tab(&zh, DICT_ALL));
+    }
+
+    /// 内置词条与自带词条同处一张卡片时，方向由词头定，与谁排在前面无关。
+    #[test]
+    fn 混装卡片按词头判方向() {
+        let mixed = 卡片(vec![英汉("apple"), 自带("apple")]);
+        assert!(card_in_tab(&mixed, DICT_EN_ZH));
+        assert!(!card_in_tab(&mixed, DICT_ZH_EN));
     }
 
     /// 页签越界不 panic，且**收全部**而非筛空。

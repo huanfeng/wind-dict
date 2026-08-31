@@ -311,27 +311,86 @@ fn split_senses(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// 词条：词典中描述一个词的完整信息单元。分两类且仅两类。
+// ── 富文本 ────────────────────────────────────────────────
+//
+// 自带词典（MDX）的正文没有字段，只有**带样式的段落**。这套模型放在领域层而不是
+// `crate::html`，是因为它描述的是「词典正文长什么样」，与 HTML 无关——HTML 只是它
+// 众多可能来源里的一个，`html::to_blocks` 是转换器，不是定义者。反过来让领域类型
+// 依赖 `html`，会把「解析格式」这件事钉进领域模型。
+
+/// 一段文字里的一截，样式一致。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TextRun {
+    pub text: String,
+    pub bold: bool,
+    pub italic: bool,
+    /// 指向另一个词头的跳转目标。**只留词典内部的跳转**——外部 URL 在一个离线词典里
+    /// 点了也没有意义，留着只会给用户一个按不动的链接。
+    pub link: Option<String>,
+}
+
+/// 一个段落。`indent` 是列表嵌套层级，0 为不缩进。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TextBlock {
+    pub indent: u8,
+    pub runs: Vec<TextRun>,
+}
+
+impl TextBlock {
+    /// 本段的纯文字。判空与测试用。
+    pub fn plain(&self) -> String {
+        self.runs.iter().map(|r| r.text.as_str()).collect()
+    }
+}
+
+// ── 词条 ──────────────────────────────────────────────────
+
+/// 词条：词典中描述一个词的完整信息单元。分三类，且**每一类都有自己真实的形状**。
 ///
-/// 不合并为「字段并集 + 大量 Option」的统一类型（docs/adr/0009）：两类词条的形状
+/// 不合并为「字段并集 + 大量 Option」的统一类型（docs/adr/0009）：几类词条的形状
 /// 本就不同，合并会让 `苹果` 的「过去式」、`apple` 的「繁体」变成能编译的代码。
 /// 拆开之后，这类无意义访问**根本过不了编译**——这正是拆分要买的东西。
+///
+/// ADR-0009 原文写的是「分两类且仅两类」。[`Entry::User`] 是后来加的第三类，这**不是**
+/// 对那份决定的违反而是它的应用：自带词典的正文既没有音标也没有词性，只有带样式的
+/// 段落，硬塞进前两类中的任何一个都要新增一批永远为 `None` 的字段——那正是 ADR-0009
+/// 要挡的事。判据是「形状是否真的不同」，不是「变体数量」。
+///
+/// 与 ADR-0013 拒绝把字形做成第三类词条也不冲突：那次的理由是**字形没有释义**，
+/// 让它与真词条并列会让「查到了」这句话在两种情况下含义不同。自带词典有释义，
+/// 查到它就是查到了。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entry {
     /// 英汉词条，源自 ECDICT。
     English(EnglishEntry),
     /// 汉英词条，源自 CC-CEDICT。
     Chinese(ChineseEntry),
+    /// 自带词典的词条，源自用户放进来的 MDX。
+    User(UserEntry),
 }
 
 impl Entry {
-    /// 两类词条唯一的共性：都有词头。
+    /// 三类词条唯一的共性：都有词头。
     pub fn headword(&self) -> &Headword {
         match self {
             Entry::English(e) => &e.headword,
             Entry::Chinese(e) => &e.headword,
+            Entry::User(e) => &e.headword,
         }
     }
+}
+
+/// 自带词典的词条：词头 + 一段富文本，没有任何字段化信息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserEntry {
+    pub headword: Headword,
+    /// 出处词典的名字。
+    ///
+    /// **必须显示给用户**，且这不是装饰。随程序分发的两个词库是我们挑过的，自带词典
+    /// 是用户自己放进来的、来源与质量我们一无所知。两者以相同样式并排出现时，用户
+    /// 没有任何线索区分。这与 ADR-0008 要求标注「由 AI 生成」是同一条理由的另一面。
+    pub source: String,
+    pub body: Vec<TextBlock>,
 }
 
 /// 英汉词条：英文词头 + 中文释义。

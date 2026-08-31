@@ -30,7 +30,11 @@ fn main() -> anyhow::Result<()> {
     let m = d.meta();
     println!(
         "{}  ——  {:.1} MB · 引擎 v{} · {} 词条",
-        if m.title.is_empty() { "(无标题)" } else { &m.title },
+        if m.title.is_empty() {
+            "(无标题)"
+        } else {
+            &m.title
+        },
         size as f64 / 1_048_576.0,
         m.version,
         m.entry_count

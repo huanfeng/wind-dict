@@ -242,6 +242,13 @@ pub struct Settings {
     /// 词库路径覆盖。`None` = 沿用命令行参数或 exe 同目录的默认查找。
     pub ecdict: Option<PathBuf>,
     pub cedict: Option<PathBuf>,
+    /// 自带词典（MDX）的路径，按用户添加的顺序。
+    ///
+    /// 存**路径**而非把词典拷进部署目录：这些文件动辄几十上百 MB，且是用户自己的
+    /// 东西。拷一份走意味着卸载时要么留垃圾要么删掉用户的文件，两条都不体面。
+    /// 代价是文件被移走后这一项会失效——那时按 ADR-0011 的同一条原则处理：
+    /// 打不开就跳过，不让它挡住程序启动。
+    pub user_dicts: Vec<PathBuf>,
     /// 左栏宽度（逻辑 px）。
     ///
     /// 存**像素**而非左右比例，是因为左栏装的是一列词头：它需要的宽度由「一个词头加
@@ -261,6 +268,7 @@ impl Default for Settings {
             expand_en: false,
             ecdict: None,
             cedict: None,
+            user_dicts: Vec::new(),
             left_pane_w: LEFT_PANE_W_DEFAULT,
         }
     }
@@ -277,6 +285,7 @@ pub mod keys {
     pub const EXPAND_EN: &str = "expand_en";
     pub const ECDICT: &str = "ecdict";
     pub const CEDICT: &str = "cedict";
+    pub const USER_DICTS: &str = "user_dicts";
     pub const LEFT_PANE_W: &str = "left_pane_w";
 }
 
@@ -314,6 +323,9 @@ impl Settings {
             cedict: get(keys::CEDICT)
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
+            user_dicts: get(keys::USER_DICTS)
+                .map(|s| paths_from_str(&s))
+                .unwrap_or_default(),
             // 读回来就钳一次。库里的值可能是手改的、也可能是旧版本在别的窗口尺寸下
             // 写的，而一个 5px 或 5000px 的左栏会让界面直接不可用——那属于「读不到
             // 就退回默认」这条策略要挡住的同一类事故。
@@ -334,6 +346,7 @@ impl Settings {
             (keys::EXPAND_EN, bool_str(self.expand_en).into()),
             (keys::ECDICT, path_str(&self.ecdict)),
             (keys::CEDICT, path_str(&self.cedict)),
+            (keys::USER_DICTS, paths_str(&self.user_dicts)),
             (keys::LEFT_PANE_W, self.left_pane_w.to_string()),
         ]
     }
@@ -345,6 +358,28 @@ fn bool_str(b: bool) -> &'static str {
     } else {
         "0"
     }
+}
+
+/// 一串路径存成一个值：换行分隔。
+///
+/// Windows 的路径不允许含换行（`<>:"/\|?*` 与控制字符都被文件系统挡在外面），
+/// 故这个分隔符不会与内容冲突——用分号或逗号就会，那两个在路径里合法。
+fn paths_str(v: &[PathBuf]) -> String {
+    v.iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        )
+}
+
+fn paths_from_str(s: &str) -> Vec<PathBuf> {
+    s.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect()
 }
 
 fn path_str(p: &Option<PathBuf>) -> String {
@@ -516,6 +551,11 @@ mod tests {
             expand_en: true,
             ecdict: Some(PathBuf::from(r"D:\a\ec.db")),
             cedict: None,
+            // 两条而非一条：一条存不出分隔符有没有用对。
+            user_dicts: vec![
+                PathBuf::from(r"D:\dict\Oxford.mdx"),
+                PathBuf::from(r"E:\a b\朗文.mdx"),
+            ],
             // 特意取非默认值：等于默认时，`from_pairs` 的兜底分支也能让断言通过，
             // 那就验不出这一项到底有没有真的往返。
             left_pane_w: 340,

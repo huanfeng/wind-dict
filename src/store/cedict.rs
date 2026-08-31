@@ -460,7 +460,7 @@ mod tests {
     fn zh(entry: &Entry) -> &ChineseEntry {
         match entry {
             Entry::Chinese(e) => e,
-            Entry::English(_) => panic!("汉英词库不该产出英汉词条"),
+            other => panic!("汉英词库只该产出汉英词条，拿到了 {other:?}"),
         }
     }
 

@@ -344,7 +344,7 @@ mod tests {
     fn en(entry: &Entry) -> &EnglishEntry {
         match entry {
             Entry::English(e) => e,
-            Entry::Chinese(_) => panic!("英汉词库不该产出汉英词条"),
+            other => panic!("英汉词库只该产出英汉词条，拿到了 {other:?}"),
         }
     }
 
