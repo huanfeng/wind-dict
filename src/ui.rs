@@ -828,6 +828,39 @@ impl Widget for HotkeyEditor {
     }
 }
 
+/// 把设置里的回执转成 Toast。
+///
+/// 零尺寸、挂在**顶层**（`body`）而不是设置页里：设置页每次 `bump_settings` 整体重建，
+/// 挂在里头的话，每一条「改完就重建」的回执（换目录、刷新、拨开关）都会连同监听器一起
+/// 被换掉——新监听器带着新的 `last`，那条刚写下的消息于是永远发不出去。
+///
+/// 盯**信号版本**而非内容：连着两次同样的回执（例如连点两下刷新）内容一模一样，比内容
+/// 就只弹一条，而用户点了两下，看不到第二条反馈会以为按钮坏了。
+struct ToastSink {
+    note: Signal<String>,
+    tone: Signal<Role>,
+    last: u64,
+}
+
+impl Widget for ToastSink {
+    fn on_update(&mut self, ctx: &mut EventCtx) {
+        let now = self.note.version();
+        if now == self.last {
+            return;
+        }
+        self.last = now;
+        let text = self.note.get();
+        // 空串是 `note_clear` 用来收起消息的，不是一条消息。
+        if text.is_empty() {
+            return;
+        }
+        match self.tone.get() {
+            Role::Danger => ctx.toast_err(text),
+            _ => ctx.toast_ok(text),
+        }
+    }
+}
+
 /// 让绑在这个信号上的 `host_signal` 整体重建一次。
 ///
 /// windui 的 `host_signal` 收 `Signal<Vec<T>>`、对**每个元素**调一次构建回调，故拿一个
@@ -2523,7 +2556,18 @@ fn body(st: Rc<State>, unavailable: Option<String>) -> Element {
         // 「打完就按」恰恰是熟练用户的常态。
         .child(completer(st.clone()))
         .child(left_loader(st.clone()))
-        .child(card_filter(st.clone()));
+        .child(card_filter(st.clone()))
+        // 回执 → Toast。与上面三个不同，它不产出任何信号，故不参与那条顺序链。
+        .child(
+            Element::leaf()
+                .reactive()
+                .widget(ToastSink {
+                    note: st.settings_note,
+                    tone: st.settings_note_tone,
+                    last: st.settings_note.version(),
+                })
+                .size(0, 0),
+        );
     // 不可用时才占这一行：正常情况下不该为一个不会发生的故障留白。
     if let Some(why) = unavailable {
         root = root.child(
@@ -2985,16 +3029,22 @@ fn settings_body(st: Rc<State>) -> Element {
                 .max_width(620)
                 .padding_xy(40, 26)
                 .spacing(28)
-                .child(notice_bar(st.settings_note, Some(st.settings_note_tone)))
+                // 回执不再占正文里的一行：它现在走顶部的 Toast（见 `ToastSink`）。
+                // 两处都报等于同一句话说两遍，而设置页那条还会把它下面的所有分组
+                // 往下顶一截——一条三秒后就该消失的消息，不该让页面跳一下。
                 .child(group("外观", appearance_group(st.clone())))
                 .child(group("布局", pane_w_row(st.clone())))
                 .child(group("唤起", hotkey_row(st.clone())))
-                .child(group("快捷键", shortcut_rows()))
                 .child(group("启动", autostart_row(st.clone())))
                 .child(group("词库", dict_rows(st.clone())))
                 .child(group("自带词典", user_dict_rows(st.clone())))
                 .child(group("释义显示", expand_en_row(st.clone())))
-                .child(group("数据", data_rows(st))),
+                .child(group("数据", data_rows(st)))
+                // 快捷键一览沉到底部：它是**说明书**，不是设置——读一次就记住了，
+                // 而上面每一项都是要反复来改的。七行键位摆在第四组，等于让每个来改
+                // 词库目录的人先滚过一屏自己早就知道的东西。
+                .child(group("快捷键", shortcut_rows()))
+                .child(group("关于", about_rows())),
         )
 }
 
@@ -3038,6 +3088,46 @@ fn data_rows(st: Rc<State>) -> Element {
                 .fg_role(Role::TextMuted),
         ),
     ])
+}
+
+/// 项目主页。关于页与包内 README 都指这里。
+const REPO_URL: &str = "https://github.com/huanfeng/wind-dict";
+
+/// 关于。
+///
+/// 版本号取 `CARGO_PKG_VERSION`——与 exe 的文件属性（`build.rs`）、发布包的包名
+/// （`scripts/release.ps1`）同一个来源。抄一份常量在这里就等于允许「界面说 0.1.0、
+/// 文件属性说 0.2.0」，而那种不一致没有任何报错，只会让用户报的 bug 对不上版本。
+fn about_rows() -> Element {
+    card(vec![
+        row(
+            crate::APP_TITLE,
+            Some(&format!("版本 {}", env!("CARGO_PKG_VERSION"))),
+            Element::col(),
+        ),
+        row(
+            "项目主页",
+            Some(REPO_URL),
+            Element::button("打开").on_click(|_| open_url(REPO_URL)),
+        ),
+        row(
+            "许可",
+            Some("程序代码 MIT OR Apache-2.0；三份词库各有其上游与协议，见随程序分发的 THIRD-PARTY.md"),
+            Element::col(),
+        ),
+    ])
+}
+
+/// 用默认浏览器打开一个网址。
+///
+/// 走 `explorer` 而不是 `cmd /C start`：后者会闪一下控制台窗口（本程序是 GUI 子系统，
+/// 平时根本没有控制台），而 explorer 是 GUI 程序，把未知协议交回 shell 的效果一样。
+/// 与 `reveal` 同一条路子。
+///
+/// 只喂常量（[`REPO_URL`]）。这个函数**不接受**任何来自词典内容或用户输入的字符串——
+/// 自带词典的正文里就有链接，把它们直接递给 shell 是另一回事，要先有白名单。
+fn open_url(url: &str) {
+    let _ = std::process::Command::new("explorer").arg(url).spawn();
 }
 
 /// 快捷键一览。**只读**：这一栏是说明书，不是改键的地方。
@@ -3550,6 +3640,18 @@ fn user_dict_rows(st: Rc<State>) -> Element {
         right =
             right.child(Element::button("恢复默认").on_click(move |_| st2.set_user_dict_dir(None)));
     }
+    // 刷新：目录才是唯一的真相，而它随时可能在程序外面被改动（往里拖一本、删一本）。
+    // 没有这个按钮时，用户唯一能想到的办法是重启程序——而「换个目录」和「改个开关」
+    // 都会顺带重扫，唯独「我刚往里放了一本」没有对应的动作，这是个说不通的空缺。
+    let st4 = st.clone();
+    right = right.child(Element::button("刷新").on_click(move |_| {
+        st4.reload_user_dicts();
+        let n = st4.user_dicts.borrow().len();
+        st4.note_ok(format!("已重新扫描词典目录，可用 {n} 本"));
+        // 重建设置页：那几行词典名与词条数是构建期扫出来的，不重建就还停在旧的一批上
+        // ——而用户点刷新，要的正是看见新的那一批。
+        st4.bump_settings();
+    }));
     if let Some(d) = dir.clone() {
         right = right.child(Element::button("打开").on_click(move |_| reveal(&d)));
     }
@@ -3855,20 +3957,25 @@ fn candidate_row(c: Candidate, at_cursor: bool, active: bool, st: Rc<State>) -> 
 ///
 /// 吃的是 `visible_cards` 而非 `cards`——前者是后者经右栏页签筛过的派生信号，见
 /// `State::refilter_cards`。
+/// 正文与栏边缘的距离。设计稿此处是 40px，那是在更宽的画布上。
+///
+/// **挂在滚动区内部那一层，不挂在外层容器上**。挂外层时整块滚动区跟着缩进 28px，
+/// 滚动条于是悬在离窗口右边缘 28px 的地方——看着像浮在正文里的一条，而不是这一栏的
+/// 边界，且滚动条与正文之间那道空沟怎么看都像画错了。设置页一直是对的
+/// （`settings_body` 把 padding 放在滚动区**里面**），结果区是唯一的例外。
+const RESULT_PAD_X: i32 = 28;
+
 fn result_area(st: Rc<State>) -> Element {
     let (cards, fnote) = (st.visible_cards, st.filter_note);
     Element::col()
         .fill()
-        // 左右 28px。这个值管的是**正文与栏边缘**的距离，两侧对称——正文铺满不等于
-        // 顶到边框上，那样读起来局促。设计稿此处是 40px，那是在更宽的画布上。
-        // 它此前挂在主列上，两栏之后主列没了，落到这里。
-        .padding_xy(28, 14)
         .spacing(6)
         .child(
             Element::label_signal(st.hint)
                 .fg_role(Role::TextMuted)
                 .height(20)
-                .width_match(),
+                .width_match()
+                .padding_edges(Insets::new(RESULT_PAD_X, 14, RESULT_PAD_X, 0)),
         )
         // 页签筛空时的说明，与 `hint` 各占一行、各说各的：`hint` 讲的是查询本身
         // （未收录、经原形命中），这一行讲的是「你现在停在哪个页签」。塞进同一个信号
@@ -3878,10 +3985,13 @@ fn result_area(st: Rc<State>) -> Element {
                 .font_size(13.0)
                 .fg_role(Role::TextMuted)
                 .width_match()
+                .padding_edges(Insets::new(RESULT_PAD_X, 0, RESULT_PAD_X, 0))
                 .visible_when(move || !fnote.get().is_empty()),
         )
         .child(scroll_area(
-            Element::host_signal(cards, move |c: Card| card_view(c, st.clone())).width_match(),
+            Element::host_signal(cards, move |c: Card| card_view(c, st.clone()))
+                .width_match()
+                .padding_edges(Insets::new(RESULT_PAD_X, 0, RESULT_PAD_X, 14)),
         ))
 }
 
