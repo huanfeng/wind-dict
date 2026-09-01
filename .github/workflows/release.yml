@@ -1,0 +1,104 @@
+# 推 v* 标签即发布。
+#
+# 干活的是 `scripts/release.ps1`，本文件只负责把它需要的东西摆好、再把产物送上去。
+# **发布逻辑一份，不是两份**——本地 `.\scripts\dev.ps1 rel` 与这里跑的是同一个脚本，
+# 否则"本地打的包"和"CI 打的包"迟早不是一回事，而那种差异只有用户会发现。
+#
+# 用法：
+#   把 Cargo.toml 的版本改成 0.2.0 并提交 → git tag v0.2.0 → git push origin v0.2.0
+# 脚本会核对 tag 与 Cargo.toml；对不上就当场失败，不会发出一个版本号说不清的包。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      smoke:
+        description: "跑启动冒烟（runner 起不来窗口时选 false）"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write # 建 Release、传附件
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      # 并排检出，理由同 ci.yml：windui 是 path 依赖。
+      # 这一步还有个发布专有的意义：release.ps1 会记下 windui 的提交号写进包内
+      # README——path 依赖占了这个 exe 的一大半，不记它，"这个包从哪来的"只答对一半。
+      - uses: actions/checkout@v4
+        with:
+          path: wind-dict
+      - uses: actions/checkout@v4
+        with:
+          repository: huanfeng/wind-ui-rust
+          ref: ${{ vars.WINDUI_REF }}
+          path: wind-ui-rust
+          token: ${{ secrets.WINDUI_TOKEN || github.token }}
+
+      - name: 工具链
+        shell: pwsh
+        run: rustc --version; cargo --version
+
+      # **不缓存词库，也不缓存它的下载源。**
+      #
+      # 缓存能省下每次约十分钟（下 63MB 的 ECDICT CSV + 建 190MB 的库），但代价是
+      # 发布出去的词库内容会被冻在缓存里，而这件事**没有任何外在表现**——版本号照涨，
+      # 词库还是上个月那份。发布一年也就几次，十分钟买一个"词库确实是这次现下的"，
+      # 划算。cargo 那边照缓存：它是按 Cargo.lock 定址的，不存在同样的问题。
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: release-${{ runner.os }}-${{ hashFiles('wind-dict/Cargo.lock') }}
+
+      - name: 打包
+        shell: pwsh
+        working-directory: wind-dict
+        run: |
+          # 冒烟这一步在 GitHub 的 windows runner 上能不能跑通尚未验证（要建窗口、
+          # 要渲染）。跑不通就用 workflow_dispatch 把 smoke 关掉，**不要**为了让流水线
+          # 变绿把它默认改成关——那是唯一一道端到端的检查。
+          # 变量名避开 $args：那是 PowerShell 的自动变量，往里写值能跑，但读起来
+          # 像在改函数的入参。
+          $smoke = "${{ github.event.inputs.smoke }}"
+          $relArgs = @("-ExpectVersion", "${{ github.ref_name }}", "-Repo", "${{ github.repository }}")
+          if ($smoke -eq "false") { $relArgs += "-NoSmoke" }
+          .\scripts\release.ps1 @relArgs
+
+      # 冒烟的截图留作构建物：出问题时"那个包长什么样"是第一手证据，而它不进发布包。
+      - name: 留存冒烟截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke
+          path: wind-dict/artifacts/release/*.png
+          if-no-files-found: ignore
+
+      - name: 建 Release 并上传
+        shell: pwsh
+        working-directory: wind-dict
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $dir = "artifacts\release"
+          # 逐个列出而不是靠通配：gh 不展开通配符，交给它一个没展开的 * 会得到一个
+          # "文件不存在"，而不是一次少传附件——后者更难发现。
+          $files = @(
+            Get-ChildItem $dir -Filter "*.zip"
+            Get-ChildItem $dir -Filter "*.zip.sha256"
+            Get-ChildItem $dir -Filter "wind-dict.json"
+          ) | ForEach-Object { $_.FullName }
+          if (-not $files) { throw "artifacts\release 下没有可上传的产物" }
+          $files | ForEach-Object { Write-Host "上传 $_" }
+          gh release create "${{ github.ref_name }}" `
+            --title "${{ github.ref_name }}" `
+            --generate-notes `
+            @files

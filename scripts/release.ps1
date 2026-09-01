@@ -85,6 +85,34 @@ function Get-GitInfo {
     return $info
 }
 
+# path 依赖各自的 git 状态。
+#
+# 拒绝脏工作树, 图的是"这个包由哪次提交产生"有个准数。而 windui 是 **path 依赖**
+# (../wind-ui-rust) —— 它占了这个 exe 的一大半, 却完全不在本仓库的 git status 里。
+# 只管本仓库等于把那半边的可重现性凭空丢了: 同一个 wind-dict 提交, 隔壁改一行,
+# 打出来就是另一个程序, 而包上任何地方都看不出区别。
+#
+# 从 Cargo.toml 现扫而不是把 ../wind-ui-rust 写死: 日后再添一个 path 依赖时,
+# 写死的那种会**静默**漏掉它 —— 正是这里要防的那类事。
+function Get-PathDeps {
+    $deps = @()
+    foreach ($line in Get-Content "$Root\Cargo.toml" -Encoding UTF8) {
+        if ($line -notmatch 'path\s*=\s*"([^"]+)"') { continue }
+        $raw = Join-Path $Root $Matches[1]
+        if (-not (Test-Path $raw)) { continue }
+        $full = (Resolve-Path $raw).Path
+        $d = @{ Name = (Split-Path $full -Leaf); Path = $full; Commit = ""; Dirty = $false; Known = $false }
+        git -C $full rev-parse --git-dir *> $null
+        if ($LASTEXITCODE -eq 0) {
+            $d.Commit = (git -C $full rev-parse --short HEAD).Trim()
+            $d.Dirty  = [bool]((git -C $full status --porcelain) -join "")
+            $d.Known  = $true
+        }
+        $deps += $d
+    }
+    return $deps
+}
+
 # ---------- 准备:词库与示例词典 ----------
 # 两者都由 dev.ps1 负责取得 (那里有下载、重试、增量构建的全套逻辑)。这里只判断
 # "在不在", 缺了就把活交回去 —— 免得同一件事在两个脚本里各写一遍然后慢慢漂移。
@@ -111,8 +139,19 @@ function Ensure-Payload {
 }
 
 # ---------- 组装 ----------
-function Copy-Staging ([string]$stage, [string]$version, [hashtable]$git) {
-    if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+function Copy-Staging ([string]$stage, [string]$version, [hashtable]$git, [array]$deps) {
+    # 暂存目录是刻意留到下次发布的（排障时第一件事就是翻"到底打进去了什么"），
+    # 于是很容易有人正拿它里头的 exe 在跑 —— 直接 Remove-Item 会甩出一句原始的
+    # "another process" 报错，指着 cedict.db，而真正要说的是"先把那个程序关掉"。
+    if (Test-Path $stage) {
+        $live = Get-Process -Name "wind-dict" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -like "$stage\*" }
+        if ($live) {
+            ErrMsg "暂存目录里的 wind-dict.exe 正开着 (PID $($live.Id -join ', '))，先关掉它再打包"
+            exit 1
+        }
+        Remove-Item -Recurse -Force $stage
+    }
     New-Item -ItemType Directory -Path $stage, "$stage\dicts-example" -Force | Out-Null
 
     Copy-Item "$Root\target\release\wind-dict.exe" "$stage\wind-dict.exe" -Force
@@ -127,14 +166,18 @@ function Copy-Staging ([string]$stage, [string]$version, [hashtable]$git) {
     $mdx = Get-ChildItem $MdxDir -Filter *.mdx | Select-Object -First 1
     Copy-Item $mdx.FullName "$stage\dicts-example\ecdict-headless.mdx" -Force
 
-    Write-Readme "$stage\README.txt" $version $git
+    Write-Readme "$stage\README.txt" $version $git $deps
 }
 
 # 包里的 README。**生成而不是入库一份**: 版本号、构建日期、提交号都在这里, 入库
 # 就等于把它们抄成第二份, 而抄错时没有任何报错, 只是包里写着一个陈旧的号码。
-function Write-Readme ([string]$path, [string]$version, [hashtable]$git) {
+function Write-Readme ([string]$path, [string]$version, [hashtable]$git, [array]$deps) {
     $stamp = (Get-Date).ToString("yyyy-MM-dd")
     $from  = if ($git.Known) { "提交 $($git.Commit)" } else { "(非 git 工作树)" }
+    # path 依赖的提交也写进去: 少了它, "这个包从哪来的"只答对了一半。
+    foreach ($d in $deps) {
+        if ($d.Known) { $from += " · $($d.Name) $($d.Commit)" }
+    }
     $text = @"
 清风词典 wind-dict $version ($Arch)
 构建于 $stamp · $from
@@ -368,6 +411,17 @@ if ($git.Known) {
     Warn "不在 git 工作树里, 包内 README 不会记录出处"
 }
 
+$deps = @(Get-PathDeps)
+foreach ($d in $deps) {
+    if (-not $d.Known) { Warn "路径依赖 $($d.Name) 不在 git 工作树里, 无从记录它的版本"; continue }
+    if ($d.Dirty -and -not $AllowDirty) {
+        ErrMsg "路径依赖 $($d.Name) 有未提交的改动, 拒绝打包 (确要如此加 -AllowDirty)"
+        git -C $d.Path status --short
+        exit 1
+    }
+    if ($d.Dirty) { Warn "路径依赖 $($d.Name) 不干净, 这个包无法由 $($d.Commit) 重现" }
+}
+
 $name     = "wind-dict-$version-$Arch"
 $stage    = "$OutDir\staging\$name"
 $zip      = "$OutDir\$name.zip"
@@ -375,6 +429,7 @@ $shot     = "$OutDir\wind-dict-$version-smoke.png"
 
 Say "`n========== 发布 $name =========="
 Gray "  版本 $version   提交 $(if ($git.Known) { $git.Commit } else { '-' })   输出 $OutDir"
+foreach ($d in $deps) { Gray "  路径依赖 $($d.Name) $(if ($d.Known) { $d.Commit } else { '(非 git)' })" }
 
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 if (-not (Ensure-Payload)) { exit 1 }
@@ -394,7 +449,7 @@ if ($SkipBuild) {
 }
 
 Say "`n[stage] 组装 → $stage"
-Copy-Staging $stage $version $git
+Copy-Staging $stage $version $git $deps
 Get-ChildItem $stage -Recurse -File | ForEach-Object {
     Gray ("  - {0,-42} {1}" -f $_.FullName.Substring($stage.Length + 1), (Size-Of $_.FullName))
 }

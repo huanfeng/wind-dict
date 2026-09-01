@@ -1,0 +1,68 @@
+# 每次推送与 PR 跑的检查：格式、clippy、测试。
+#
+# 与 `dev.ps1 ci` 是同一组命令，刻意保持一致——本地能过、CI 过不了（或反过来）
+# 只会让人不再相信其中一个。
+#
+# 不需要词库：探真实词库的那几个测试自己会跳过（"跳过：本机没有词库文件"），
+# MDX 那几个用的是 tests/fixtures 里入库的小样本。故这里不下载 190MB 的东西。
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      # 两个仓库必须**并排**检出：Cargo.toml 里 windui 是 path 依赖
+      # (`path = "../wind-ui-rust"`)，少了它 cargo 连解析都过不去。
+      # GitHub 的检出路径必须在 $GITHUB_WORKSPACE 之下，故两边都放进工作区根，
+      # 兄弟关系与本机的目录结构一致。
+      - uses: actions/checkout@v4
+        with:
+          path: wind-dict
+      - uses: actions/checkout@v4
+        with:
+          repository: huanfeng/wind-ui-rust
+          # 仓库变量 WINDUI_REF 可钉住某个 tag/commit；留空即默认分支。
+          ref: ${{ vars.WINDUI_REF }}
+          path: wind-ui-rust
+          # windui 若是私有库，需要一个有其读权限的 PAT 存成 WINDUI_TOKEN；
+          # 公开库不必设，会退到本次运行的 github.token。
+          token: ${{ secrets.WINDUI_TOKEN || github.token }}
+
+      - name: 工具链
+        shell: pwsh
+        run: |
+          rustup component add rustfmt clippy
+          rustc --version; cargo --version
+
+      # 缓存注册表与构建产物。rusqlite 走 bundled，每次冷构建都要编译一遍 SQLite 的
+      # C 源码——那是这条流水线里最贵的一段，值得缓存。
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            wind-dict/target
+          key: ci-${{ runner.os }}-${{ hashFiles('wind-dict/Cargo.lock') }}
+          restore-keys: ci-${{ runner.os }}-
+
+      - name: fmt
+        working-directory: wind-dict
+        run: cargo fmt --all -- --check
+
+      # -D warnings：本仓库当前是零告警，让它保持零。告警一旦允许堆积，
+      # 就再也没人看 clippy 的输出了。
+      - name: clippy
+        working-directory: wind-dict
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        working-directory: wind-dict
+        run: cargo test
