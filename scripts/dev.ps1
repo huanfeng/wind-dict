@@ -15,7 +15,9 @@
 #   run          Dev 构建并运行
 #   gd           gen-data: 下载词库源 + 构建 ecdict.db / cedict.db / unihan.db → .cache/dict/
 #   gm           下载一本示例 MDX (~70MB), 供手动测试"自带词典"; 部署时自动装进词典目录
-#   p / pd       部署 release / dev → 目标目录 (复制 + 可选开机自启)
+#   p / pd       部署 release / dev → 目标目录 (覆盖式复制 + 开机自启)
+#   i / id       全新部署 release / dev 并启动: 构建 → 杀实例 → 清空目录 → 装 → 起
+#                (要看最新改动就用它; p 是覆盖式的, 留得下上一版多出来的文件)
 #   u / ud       卸载 release / dev (删目录 + 移除自启)
 #   rel          发布: 构建 + 组装 + 验证 + 压成带版本的 zip → artifacts\release\
 #                (要传参数就直接调 scripts\release.ps1, 见那个文件的头部)
@@ -163,10 +165,12 @@ function Do-GenData {
 # 与 src/store/userdata.rs 的 data_dir() 必须一致: %LOCALAPPDATA%\wind-dict-data[-dev]\dicts。
 # 这个目录**不在部署目录内**, 故 u/ud 卸载碰不到它 —— 里头是用户自己下载的词典,
 # 动辄几百 MB, 卸载程序顺手删掉是不能接受的 (同 ADR-0011)。
-function UserDictDir ([string]$profile) {
+function UserDataDir ([string]$profile) {
     $data = if ($profile -eq "dev") { "wind-dict-data-dev" } else { "wind-dict-data" }
-    return "$env:LOCALAPPDATA\$data\dicts"
+    return "$env:LOCALAPPDATA\$data"
 }
+
+function UserDictDir ([string]$profile) { return (Join-Path (UserDataDir $profile) "dicts") }
 
 # 下载示例 MDX → .cache\mdx\。仅供手动测试, 不参与构建, 不随产品分发。
 function Do-GetMdx {
@@ -275,6 +279,109 @@ function Remove-AutoStart ([string]$name) {
     Gray "  - 已移除开机自启 ($name)"
 }
 
+# ---------- 停实例 / 清目录 / 起实例 ----------
+#
+# 停掉某个目录下运行的实例, 并**等它真的退出**。
+#
+# 按 exe 路径过滤而不是照进程名一律杀: 用户很可能同时开着 release 那个常驻实例, 或者
+# 一个从 build_dev\ 直接 run 出来的 —— 部署 dev 没有理由把它们一起带走。
+#
+# 等待用 WaitForExit 而不是睡一个固定的毫秒数: Stop-Process 返回时进程未必已经消失
+# (它只是发出终止请求), 紧接着删目录就会撞上「文件正由另一进程使用」。固定睡眠要么
+# 白等要么不够, 而不够的那次会以一次莫名其妙的删除失败呈现 —— 那时人会去调那个数字,
+# 不会去想句柄还没放开。
+function Stop-App ([string]$dir) {
+    $procs = @(Get-Process -Name "wind-dict" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path -like "$dir\*" })
+    if ($procs.Count -eq 0) { return $true }
+    $ok = $true
+    foreach ($proc in $procs) {
+        Gray "  - 停止运行中的实例 (PID $($proc.Id))"
+        # 强杀而非 CloseMainWindow: 本程序收到 WM_CLOSE 只是把窗口藏起来继续常驻
+        # (托盘工具都这样), 温和退出在这里根本不会退。
+        try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop }
+        catch { Warn "    杀不掉: $($_.Exception.Message)"; $ok = $false; continue }
+        try {
+            if (-not $proc.WaitForExit(5000)) { ErrMsg "    PID $($proc.Id) 5 秒内没有退出"; $ok = $false }
+        } catch { }  # 进程已消失时拿不到句柄, 那正是我们要的结果
+    }
+    return $ok
+}
+
+# 这个目录能不能整个删掉。
+#
+# $DeployDirRelease / $DeployDirDev 可被 scripts\deploy.local.ps1 覆盖成任意路径, 而
+# 下一步要跑的是 Remove-Item -Recurse -Force。一个写错的本地配置就足以删掉用户在别处
+# 的东西, 而且是无声的。故先证明这确实是我们装出来的目录, 再动手。
+function Test-Wipeable ([string]$dir, [string]$profile) {
+    $d = $dir.TrimEnd('\', '/')
+    if (-not $d) { ErrMsg "部署目录为空, 拒绝清理"; return $false }
+
+    # 用户数据必须活得比部署久 (ADR-0011)。部署目录若等于数据目录、或把数据目录套在
+    # 自己里头, 清理下去就是把收藏和历史一起删了 —— 这种事只会发生一次, 而那一次没有
+    # 撤销。u/ud 走 Uninstall 时同样该拦, 故这道闸放在两条路都经过的地方。
+    $data = (UserDataDir $profile).TrimEnd('\', '/')
+    if ($d -ieq $data -or $data.StartsWith("$d\", [StringComparison]::OrdinalIgnoreCase)) {
+        ErrMsg "部署目录套着用户数据目录, 拒绝清理:"
+        ErrMsg "  部署 $d"
+        ErrMsg "  数据 $data"
+        return $false
+    }
+
+    if (-not (Test-Path $d)) { return $true }
+    if (@(Get-ChildItem -LiteralPath $d -Force).Count -eq 0) { return $true }
+    # 目录里有东西, 那就必须认得出是我们的。空目录放行是刻意的: 上次部署中途失败
+    # 留下一个空壳很常见, 为它停下来只是添堵。
+    if (-not (Test-Path (Join-Path $d "wind-dict.exe"))) {
+        ErrMsg "目录里没有 wind-dict.exe, 不像是部署目录, 拒绝清理: $d"
+        Gray  "  (部署目录在 scripts\deploy.local.ps1 里配; 确实要用它就先手动清空)"
+        return $false
+    }
+    return $true
+}
+
+# 整个删掉部署目录。调用前必须先过 Test-Wipeable。
+#
+# 「整个删」而不是逐个覆盖那几个文件名: 覆盖式部署清不掉上一版多出来的文件 —— 哪天
+# 不再分发 unihan.db, 旧的那份会永远留在目录里, 程序照样把它读进来。于是手上跑的是一个
+# 混着两个版本残骸的目录, 而从外面完全看不出来。
+function Clear-DeployDir ([string]$dir) {
+    if (-not (Test-Path $dir)) { return $true }
+    # 反病毒、资源管理器的预览窗格、索引服务都可能在进程退出后再攥着句柄一小会儿。
+    # 第一次失败就报错, 会把「其实等两百毫秒就好」变成一次假故障。
+    for ($i = 1; $i -le 5; $i++) {
+        try {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction Stop
+            Gray "  - 已清空 $dir"
+            return $true
+        } catch {
+            if ($i -eq 5) {
+                ErrMsg "清理失败: $($_.Exception.Message)"
+                ErrMsg "  多半还有句柄攥着这个目录里的文件 (另开着一个实例? 资源管理器停在里面?)"
+                return $false
+            }
+            Start-Sleep -Milliseconds (200 * $i)
+        }
+    }
+    return $false
+}
+
+# 起一个新实例。
+#
+# **不带 --tray**: 那个开关是给开机自启用的, 带上就直接收进托盘、什么也不显示
+# (见 src/autostart.rs 的 TRAY_ARG)。这条命令的用途是「装完立刻看看新东西」, 起来
+# 不给窗口等于没起。
+#
+# 工作目录设成部署目录只是为了贴近双击图标的样子; 词库按 exe 所在目录找
+# (main.rs 的 resolve_dict_dir → offline::exe_dir), 与 cwd 无关。
+function Start-App ([string]$dir) {
+    $exe = Join-Path $dir "wind-dict.exe"
+    if (-not (Test-Path $exe)) { ErrMsg "没有可启动的 exe: $exe"; return $false }
+    Start-Process -FilePath $exe -WorkingDirectory $dir
+    Gray "  - 已启动 $exe"
+    return $true
+}
+
 function Deploy ([string]$profile = "release") {
     $outdir    = Out-For $profile
     $targetDir = if ($profile -eq "dev") { $DeployDirDev } else { $DeployDirRelease }
@@ -283,10 +390,8 @@ function Deploy ([string]$profile = "release") {
         ErrMsg "无 $outdir 产物; 请先 '$(if($profile -eq 'dev'){'d'}else{'1'})' 构建。"; return $false
     }
     Say "`n========== 部署 ($profile) → $targetDir =========="
-    # 先杀掉运行中的实例, 让出文件锁 (常驻工具多半开着)。
-    Get-Process -Name "wind-dict" -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -like "$targetDir\*" } | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Milliseconds 400
+    # 先停掉运行中的实例, 让出文件锁 (常驻工具多半开着)。
+    if (-not (Stop-App $targetDir)) { ErrMsg "实例没停下来, 复制多半会撞上文件锁"; return $false }
 
     New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
     foreach ($f in @("wind-dict.exe", "ecdict.db", "cedict.db", "unihan.db")) {
@@ -306,13 +411,35 @@ function Uninstall ([string]$profile = "release") {
     $targetDir = if ($profile -eq "dev") { $DeployDirDev } else { $DeployDirRelease }
     $autoName  = if ($profile -eq "dev") { "wind-dict-dev" } else { "wind-dict" }
     Say "`n========== 卸载 ($profile) =========="
-    Get-Process -Name "wind-dict" -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -like "$targetDir\*" } | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Milliseconds 400
+    # 拦一道再删: 卸载与全新部署删的是同一个目录, 那条红线 (别把用户数据卷进来)
+    # 对两者一样成立。
+    if (-not (Test-Wipeable $targetDir $profile)) { return $false }
+    if (-not (Stop-App $targetDir)) { return $false }
     Remove-AutoStart $autoName
-    if (Test-Path $targetDir) { Remove-Item -Recurse -Force $targetDir; Gray "  - 已删除 $targetDir" }
-    Say "`n卸载完成."
+    if (-not (Clear-DeployDir $targetDir)) { return $false }
+    Say "`n卸载完成. 用户数据 (收藏/历史/自带词典) 仍在 $(UserDataDir $profile)"
     return $true
+}
+
+# ---------- 全新部署并启动 ----------
+#
+# 一条命令跑完「构建 → 停实例 → 清空目录 → 装 → 起」, 供改完代码立刻上手试。
+#
+# 与 p/pd 的区别只在**清空**与**启动**这两步。分成两个命令而不是给 Deploy 加开关,
+# 是因为 p 还有一个正当用法: 目标机上只想换掉 exe 和词库, 不动目录里别的东西。
+function Install-Fresh ([string]$profile = "release") {
+    $targetDir = if ($profile -eq "dev") { $DeployDirDev } else { $DeployDirRelease }
+    Say "`n========== 全新部署 ($profile) → $targetDir =========="
+    # 先验目标合法再构建: 构建 release 要几分钟, 让人等完了才说「这个目录我不敢删」
+    # 是浪费的。
+    if (-not (Test-Wipeable $targetDir $profile)) { return $false }
+    if (-not (Build-App $profile)) { return $false }
+    if (-not (Stop-App $targetDir)) { return $false }
+    if (-not (Clear-DeployDir $targetDir)) { return $false }
+    # 复制、自启、示例词典全部复用 Deploy —— 部署内容是同一件事, 抄成两份就等着
+    # 哪天只有一边记得加新文件。
+    if (-not (Deploy $profile)) { return $false }
+    return (Start-App $targetDir)
 }
 
 # ---------- 发布 ----------
@@ -355,6 +482,8 @@ function Invoke-Command ([string]$cmd) {
         "gm"                 { return (Do-GetMdx) }
         "p"                  { return (Deploy "release") }
         "pd"                 { return (Deploy "dev") }
+        "i"                  { return (Install-Fresh "release") }
+        "id"                 { return (Install-Fresh "dev") }
         "u"                  { return (Uninstall "release") }
         "ud"                 { return (Uninstall "dev") }
         { $_ -in "rel", "release" } { return (Do-Release) }
@@ -377,7 +506,8 @@ function Show-Menu {
     Write-Host "    run Dev 构建并运行              gd  生成词库 (下载 + 构建 .db)"
     Write-Host "    gm  下载示例 MDX (自带词典手动测试用)"
     Write-Host "  部署:"
-    Write-Host "    p   部署 release                pd  部署 dev"
+    Write-Host "    p   部署 release (覆盖)        pd  部署 dev (覆盖)"
+    Write-Host "    i   全新部署+启动 release       id  全新部署+启动 dev"
     Write-Host "    u   卸载 release                ud  卸载 dev"
     Write-Host "  发布:"
     Write-Host "    rel 打成带版本的 zip → artifacts\release\ (构建+验证+压包)"
