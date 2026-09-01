@@ -1025,6 +1025,16 @@ struct State {
     tabs: RefCell<Vec<TabSpec>>,
     /// 页签集合变了，标签条整体重建一次。
     tabs_rev: Signal<Vec<u64>>,
+    /// 结果区的选择域。
+    ///
+    /// 右栏的正文被拆成许多个富文本控件——词头一个（它要与星标按钮并排，而富文本里
+    /// 放不进按钮）、音标一个、每段释义一个、每张卡片各一套。它们共用这一个域，于是
+    /// 选区能从词头一路拖到最后一条释义、跨过卡片边界，Ctrl+C 一次拿全。
+    ///
+    /// 不需要在查询后重建：控件换新之后旧成员的 `Weak` 自然失效，而新控件第一次排版
+    /// 就会把域里的旧选区清掉（那份选区记的是「第几个成员的第几个碎片」，换了内容
+    /// 就指向别的字了）。
+    sel_scope: SelectionScope,
     /// 左栏当前页签：候选 / 历史 / 收藏。
     left_tab: Signal<usize>,
     /// 左栏当前列出的行。三个页签共用，由 `LeftPaneLoader` 按页签填充。
@@ -2433,6 +2443,7 @@ pub fn build(
         dict_tab: signal(DICT_ALL),
         tabs: RefCell::new(Vec::new()),
         tabs_rev: signal(vec![0]),
+        sel_scope: SelectionScope::new(),
         // 开屏停在历史页：DESIGN.md 的「Search is home / Recall is a drawer」讲的是
         // 别拿历史当主导航，不是别让人看见它。左栏那 280px 在开屏时**没有别的内容**
         // 可放——候选页此刻是空的——而「最近查过什么」正好是下一次查询的起点。
@@ -4266,6 +4277,8 @@ fn card_view(c: Card, st: Rc<State>) -> Element {
                 // 不与下方释义合成一篇：星标要与词头**同一行**并排，而富文本里放不进
                 // 一个按钮。代价是选区不能从词头一路拖到释义，可以接受。
                 Element::rich(headword_doc(&hw))
+                    // 与释义同域：查完一个词，从词头一路拖到释义末尾是最常见的那一下。
+                    .selection_scope(st.sel_scope.clone())
                     .copy_menu(true)
                     // 同 `selectable`：不进焦点环，Ctrl+C 就复制不了词头。
                     .focusable(true)
@@ -4464,7 +4477,7 @@ fn entry_view(e: Entry, expanded: Signal<bool>, st: Rc<State>, show_source: bool
             let mut col = Element::col().spacing(8).width_match();
             // 音标与词性同一行：它们都是「这个词是什么」的元信息，与释义分属两层。
             if x.phonetic.is_some() || x.pos.is_some() {
-                col = col.child(selectable(en_meta_doc(&x)));
+                col = col.child(selectable(en_meta_doc(&x), &st));
             }
             // 分级徽章紧跟音标：两者都在回答「这是个什么词」，而释义回答的是
             // 「它什么意思」。放到词形变化之后会把这两段元信息劈开。
@@ -4488,7 +4501,7 @@ fn entry_view(e: Entry, expanded: Signal<bool>, st: Rc<State>, show_source: bool
             if let Some(zh) = &x.zh_definition {
                 let glosses = crate::domain::parse_glosses(zh);
                 if !glosses.is_empty() {
-                    col = col.child(selectable(zh_def_doc(&glosses)));
+                    col = col.child(selectable(zh_def_doc(&glosses), &st));
                 }
             }
             // 英英释义默认折叠，用户主动展开才可见——这是刻意的产品决定，非偷懒。
@@ -4504,14 +4517,14 @@ fn entry_view(e: Entry, expanded: Signal<bool>, st: Rc<State>, show_source: bool
                     expanded,
                     // 这一段单独限宽，理由见 `EN_DEF_MAX_W`：整屏正文里只有它是成句的
                     // 英文散文，行长失控的风险是真的。
-                    selectable(en_def_doc(en)).max_width(EN_DEF_MAX_W),
+                    selectable(en_def_doc(en), &st).max_width(EN_DEF_MAX_W),
                 ));
             }
             col
         }
         // 汉英词条整条就是一段富文本——它没有徽章类内容（CC-CEDICT 只有繁简、拼音、
         // 释义、量词四样，全是文字），故拼音到量词可以一气选到底。
-        Entry::Chinese(x) => selectable(chinese_doc(&x)).width_match(),
+        Entry::Chinese(x) => selectable(chinese_doc(&x), &st).width_match(),
         // 自带词典：出处一行（仅「全部」页）+ 一整段富文本。
         Entry::User(x) => Element::col()
             .spacing(6)
@@ -4528,7 +4541,7 @@ fn entry_view(e: Entry, expanded: Signal<bool>, st: Rc<State>, show_source: bool
                 Element::col()
             })
             .child(
-                selectable(user_doc(&x))
+                selectable(user_doc(&x), &st)
                     // 词典内部的交叉引用（「参见 X」）点了就跳过去——这是自带词典
                     // 唯一的导航手段，它的正文里没有别的可操作元素。
                     .on_span_click(move |_, id| st.select(id)),
@@ -4584,8 +4597,10 @@ fn user_doc(x: &UserEntry) -> RichDoc {
 ///
 /// `copy_menu(true)` 开右键菜单（复制选区 / 全选）。仅靠 Ctrl+C 不够：这一屏没有别的
 /// 右键菜单，用户在释义上点右键期待的就是复制。
-fn selectable(doc: RichDoc) -> Element {
+fn selectable(doc: RichDoc, st: &Rc<State>) -> Element {
     Element::rich(doc)
+        // 进结果区那一个选择域：右栏所有正文共用一份选区，可以一路拖到底。
+        .selection_scope(st.sel_scope.clone())
         .copy_menu(true)
         // **强制进焦点环**，否则 Ctrl+C 到不了它。
         //
