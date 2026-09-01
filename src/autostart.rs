@@ -16,9 +16,27 @@
 //! 本项目当前仅 Windows（ADR-0005）。其余平台给出「不支持」而非假装成功——
 //! 静默返回 `Ok` 会让设置界面显示一个永远打不开的开关。
 
-/// 注册表值名。改名会导致旧的自启项变成孤儿（用户卸载后仍留在注册表里），故此值
-/// **一经发布不得更改**。
-const VALUE_NAME: &str = "wind-dict";
+/// 注册表值名。
+///
+/// **release 那支一经发布不得更改**：改名会让旧的自启项变成孤儿（用户卸载后仍留在
+/// 注册表里）。这条约束只约束 release 的取值，dev 支本就不该与它共用一个名字。
+///
+/// dev 与 release 分名，判据与 `userdata::data_dir()` 分两个数据目录、`dev.ps1` 分两个
+/// 部署目录完全一致——它们是两个程序。此前这里恒为 `wind-dict`，代价有两处，且**两处
+/// 都是静默的**：
+///
+/// 1. 两支同时装着时，dev 实例一启动，`repair_if_stale` 读到 release 写的那条值、发现
+///    与自己的路径不等，就把 **release 的开机自启改写成 dev 的 exe**。而这条路径上的
+///    失败是明确设计为静默的（见 `main` 里那句 `let _ =`），用户要到下次开机才发现
+///    起来的是调试构建。
+/// 2. `dev.ps1` 给 dev 部署写的自启项叫 `wind-dict-dev`，程序读的却是 `wind-dict`，
+///    于是设置页那个开关对 dev 部署恒显示「关」——用户一开，两条自启项就都指向同一个
+///    exe，开机起两个实例。
+const VALUE_NAME: &str = if cfg!(debug_assertions) {
+    "wind-dict-dev"
+} else {
+    "wind-dict"
+};
 
 /// 开机自启时附加的命令行开关：**带它才收进托盘，不带就正常显示窗口**。
 ///
@@ -217,4 +235,19 @@ pub fn set(on: bool) -> anyhow::Result<()> {
 /// 返回是否改写过。启动时调一次即可，见 `main`。
 pub fn repair_if_stale() -> anyhow::Result<bool> {
     imp::repair_if_stale()
+}
+
+#[cfg(test)]
+mod tests {
+    /// 两支的自启项名字必须分开，否则 dev 实例会静默改掉 release 的自启项。
+    ///
+    /// 单测永远在 debug 下跑，故这里钉得住的只有 dev 那一支——但把 `VALUE_NAME` 改回
+    /// 一个恒定值，这条就会红，而那正是它要拦的那次改动。
+    ///
+    /// 字面量与 `dev.ps1` 里 dev 部署用的 `$autoName` 是同一个事实：脚本写哪个名字、
+    /// 程序读哪个名字，对不上就等于设置页显示一个假状态。改一边必须改另一边。
+    #[test]
+    fn 开发构建的自启项名与发布构建分开() {
+        assert_eq!(super::VALUE_NAME, "wind-dict-dev");
+    }
 }
