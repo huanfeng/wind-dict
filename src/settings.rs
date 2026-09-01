@@ -572,12 +572,18 @@ mod tests {
             Settings::from_pairs(move |k| m.get(k).cloned())
         };
 
-        let legacy = HashMap::from([(keys::LEGACY_ECDICT.to_string(), r"D:\dict\ecdict.db".to_string())]);
+        let legacy = HashMap::from([(
+            keys::LEGACY_ECDICT.to_string(),
+            r"D:\dict\ecdict.db".to_string(),
+        )]);
         assert_eq!(读(&legacy).dict_dir, Some(PathBuf::from(r"D:\dict")));
 
         // 新键存在时以新键为准，不被旧键顶掉。
         let both = HashMap::from([
-            (keys::LEGACY_ECDICT.to_string(), r"D:\dict\ecdict.db".to_string()),
+            (
+                keys::LEGACY_ECDICT.to_string(),
+                r"D:\dict\ecdict.db".to_string(),
+            ),
             (keys::DICT_DIR.to_string(), r"E:\新目录".to_string()),
         ]);
         assert_eq!(读(&both).dict_dir, Some(PathBuf::from(r"E:\新目录")));
