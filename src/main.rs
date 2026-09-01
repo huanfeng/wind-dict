@@ -28,7 +28,32 @@ use wind_dict::store::userdata::{UserData, UserDataState};
 use wind_dict::ui;
 use wind_dict::APP_TITLE;
 
+/// 单实例标识。
+///
+/// dev 与 release 分开，与 `autostart::VALUE_NAME`、`userdata::data_dir()` 同一套判据：
+/// 两个变体是两个程序，让 dev 构建顶掉正在用的 release 窗口没有道理。
+const SINGLE_ID: &str = if cfg!(debug_assertions) {
+    "wind-dict-dev"
+} else {
+    "wind-dict"
+};
+
 fn main() {
+    // 单实例闸门放在**最前面**，先于 panic 日志与自启修复。
+    //
+    // 二次实例的全部使命是把 argv 递给首实例然后死掉。让它走完启动流程的话，
+    // `repair_if_stale` 会顺手改写自启项、160 MB 的词库会被再打开一次——白做，而且
+    // 带副作用。`App::run` 内部本来也仲裁一次，但那已经在这些事之后了。
+    //
+    // **离屏截图除外**：那条路不建窗口、不常驻，是验证手段而不是第二个实例。拦掉它
+    // 就等于「只要有实例开着就永远截不了图」，而截图是本项目验证界面的主要手段。
+    // windui 自己在 `run` 里也是先处理截图、再仲裁，这里与它一致。
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !wants_screenshot(&args)
+        && windui::claim_instance(SINGLE_ID) == windui::InstanceRole::Handoff
+    {
+        return;
+    }
     install_panic_log();
     // 自启项若还是旧格式（没有 `--tray`）或指着旧路径，就地改写。静默忽略失败：
     // 这是一次**修复**，不是用户此刻要求的动作，为它弹错不成比例；真要改自启，
@@ -110,7 +135,14 @@ fn main() {
         .tray(tray)
         // 常驻：关闭只收起，进程始终活着等热键。见 ADR-0006。
         .hide_on_close()
-        .screenshot_from_args();
+        .screenshot_from_args()
+        // 单实例。`app_id` 必须与上面 `claim_instance` 传的**完全一致**：不一致的话
+        // 本进程会撞上自己已经持有的那把锁、把自己误判成二次实例，然后把 argv 转发
+        // 给自己，窗口就永不出现了（windui `claim_instance` 的文档写了这一条）。
+        //
+        // 回调空着即可：平台层在它返回后就会显示并前置主窗口，而那正是「用户又双击了
+        // 一次图标」该有的结果——本程序常驻托盘，窗口多半正藏着，只置前是不够的。
+        .single_instance(SINGLE_ID, |_argv| {});
 
     // **只有开机自启才收进托盘**，手动运行照常显示窗口。
     //
@@ -316,6 +348,15 @@ fn positional_dict_dir(args: &[String]) -> Option<PathBuf> {
     args.first().map(PathBuf::from)
 }
 
+/// 本次启动是不是离屏截图。见 `main` 里那道单实例闸门。
+///
+/// 判据比 windui 的宽——它还要求 `--screenshot` 后面跟得上一个路径。宁可宽：判宽了
+/// 只是多起一个实例（`App::run` 里那道仲裁还会再拦一次），判窄了却是截图永远拿不到，
+/// 而那种失败看上去像「程序起不来」，要查很久才会想到单实例头上。
+fn wants_screenshot(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--screenshot")
+}
+
 /// 本次启动是否该直接收进托盘。见 `autostart::TRAY_ARG`。
 fn launched_for_tray() -> bool {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -332,7 +373,7 @@ fn wants_tray(args: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_panic_log, positional_dict_dir, wants_tray};
+    use super::{append_panic_log, positional_dict_dir, wants_screenshot, wants_tray};
 
     fn 参数(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -399,6 +440,29 @@ mod tests {
         assert!(
             positional_dict_dir(&参数(&[r".cache\dict", wind_dict::autostart::TRAY_ARG])).is_none(),
             "混入开关时整体不认，位置参数也不该生效"
+        );
+    }
+
+    /// 离屏截图必须绕开单实例闸门。
+    ///
+    /// 判错的后果不对称：判宽了只是多起一个实例（`App::run` 里那道仲裁会再拦一次），
+    /// 判窄了则是「只要有实例开着就永远截不了图」——而截图是本项目验证界面的主要手段，
+    /// 那种失败还看不出跟单实例有关。
+    #[test]
+    fn 截图模式绕开单实例闸门() {
+        assert!(wants_screenshot(&参数(&["--screenshot", "out.png"])));
+        assert!(
+            wants_screenshot(&参数(&["--screenshot", "out.png", "--size", "920", "620"])),
+            "截图参数后面还挂着别的开关时同样成立"
+        );
+        assert!(!wants_screenshot(&参数(&[])), "手动双击不是截图");
+        assert!(
+            !wants_screenshot(&参数(&[wind_dict::autostart::TRAY_ARG])),
+            "开机自启不是截图"
+        );
+        assert!(
+            !wants_screenshot(&参数(&["--screenshots"])),
+            "不该按前缀匹配，与 wants_tray 同理"
         );
     }
 
