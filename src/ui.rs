@@ -2193,6 +2193,18 @@ impl State {
         self.visible_cards.set(kept);
     }
 
+    /// 当前停在哪个页签上。
+    ///
+    /// 越界退回「全部」：下标由 `TabBar` 写、受标签数约束，本不该越界，但「多显示了
+    /// 一些东西」比 panic 好收拾——与 `refilter_cards` 是同一条兜底。
+    fn current_tab_key(&self) -> TabKey {
+        self.tabs
+            .borrow()
+            .get(self.dict_tab.get())
+            .map(|t| t.key.clone())
+            .unwrap_or(TabKey::All)
+    }
+
     /// 重建页签集合：全部 + 内置两份 + 每本自带词典。
     ///
     /// 只在**页签集合本身**变化时调（装卸词典、改名、开关某本），不在每次查询时调——
@@ -4269,13 +4281,16 @@ fn card_view(c: Card, st: Rc<State>) -> Element {
     if let Some(g) = &c.glyph {
         col = col.child(glyph_row(g));
     }
+    // 只在「全部」页标来源。进了某本词典的专属页签，每条词条再标一遍它的名字没有
+    // 信息量——整页都是它，那行小字重复几遍只是噪音（查 standby 时它会连着出现三次）。
+    let show_source = matches!(st.current_tab_key(), TabKey::All);
     for (i, e) in c.entries.into_iter().enumerate() {
         // 只查表，不新建：本函数跑在重建作用域内，在这里 `signal()` 出来的句柄活不过
         // 下一次重建。信号由 `rebuild_cards` 预先备好，详见 `ExpandedStates`。
         let expanded = st
             .expanded
             .get(&expand_key(&hw, i), st.settings.borrow().expand_en);
-        col = col.child(entry_view(e, expanded, st.clone()));
+        col = col.child(entry_view(e, expanded, st.clone(), show_source));
     }
     // 备注排在最后：它是用户**附加**给这个词的东西，不该插进词典自身的内容里打断
     // 「词头 → 音标 → 释义」这条阅读顺序。只在已收藏时出现——没收藏就没有可附着的
@@ -4443,7 +4458,7 @@ fn star(fav: bool, hw: Headword, st: Rc<State>) -> Element {
 ///
 /// **不含词头**——词头由 `card_view` 统一呈现在卡片头部，此处重复一遍是噪音；
 /// 多音字（一个词头、多条词条）尤其明显，会把同一个词连打好几遍。
-fn entry_view(e: Entry, expanded: Signal<bool>, st: Rc<State>) -> Element {
+fn entry_view(e: Entry, expanded: Signal<bool>, st: Rc<State>, show_source: bool) -> Element {
     match e {
         Entry::English(x) => {
             let mut col = Element::col().spacing(8).width_match();
@@ -4497,19 +4512,21 @@ fn entry_view(e: Entry, expanded: Signal<bool>, st: Rc<State>) -> Element {
         // 汉英词条整条就是一段富文本——它没有徽章类内容（CC-CEDICT 只有繁简、拼音、
         // 释义、量词四样，全是文字），故拼音到量词可以一气选到底。
         Entry::Chinese(x) => selectable(chinese_doc(&x)).width_match(),
-        // 自带词典：出处一行 + 一整段富文本。
-        //
-        // 出处**必须画出来**，且在正文之上。随程序分发的两个库是我们挑过的，自带词典
-        // 是用户放进来的、来源与质量我们一无所知；两者以相同样式并排出现时，用户没有
-        // 任何线索区分。这与 ADR-0008 要求标注「由 AI 生成」是同一条理由的另一面。
+        // 自带词典：出处一行（仅「全部」页）+ 一整段富文本。
         Entry::User(x) => Element::col()
             .spacing(6)
             .width_match()
-            .child(
+            // 出处那行在专属页签里省掉：页签名已经回答了「这是谁说的」。在「全部」页
+            // 它仍**必须画出来**——随程序分发的两个库是我们挑过的，自带词典是用户放
+            // 进来的、来源与质量我们一无所知，两者以相同样式并排出现时，用户没有任何
+            // 线索区分。这与 ADR-0008 要求标注「由 AI 生成」是同一条理由的另一面。
+            .child(if show_source {
                 Element::label(x.source.clone())
                     .font_size(12.0)
-                    .fg_role(Role::TextMuted),
-            )
+                    .fg_role(Role::TextMuted)
+            } else {
+                Element::col()
+            })
             .child(
                 selectable(user_doc(&x))
                     // 词典内部的交叉引用（「参见 X」）点了就跳过去——这是自带词典
