@@ -71,7 +71,7 @@ fn main() {
     };
 
     let tray = Tray::new()
-        .tooltip(format!("{APP_TITLE} — {} 查询", settings.hotkey))
+        .tooltip(wind_dict::ui::tray_tip(&settings.hotkey))
         // 托盘图标与标题栏、任务栏是同一份产物（`scripts/gen-icon.ps1`）。此前这里是
         // 一块 16×16 的纯蓝方块占位——托盘里一排图标中它是唯一认不出是什么的那个。
         .icon_rgba(icon::TRAY_SIZE, icon::TRAY_SIZE, icon::TRAY_RGBA)
@@ -144,7 +144,9 @@ fn main() {
         }
     });
 
-    let ui = ui::build(dict, user, theme_handle, hotkey, system_dark);
+    // 托盘句柄要在 `content` 之前取到，与主题、热键两个句柄同理。
+    let tray_handle = app.tray_handle();
+    let ui = ui::build(dict, user, theme_handle, hotkey, tray_handle, system_dark);
     app.on_shortcut(ui.shortcut)
         // 运行期跟随系统亮暗。常驻工具尤其需要：一次会话可能横跨日出日落，而进程
         // 一直不重启——只在启动时读一次的话，用户在系统里切了暗色得把词典重开。

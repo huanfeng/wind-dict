@@ -57,6 +57,23 @@ impl OfflineDictionary {
 // ── 词库目录 ──────────────────────────────────────────────
 
 /// 三份库的文件名。**部署脚本与程序共用这套名字**，改名要两边一起改。
+/// 两份内置词库各自的**稳定键**与**默认显示名**。
+///
+/// 键与名分开，是因为两者的寿命完全不同：键进设置、进筛选逻辑，改一次就作废一批
+/// 用户数据（比如「哪些词典被关掉了」）；名只是给人看的，用户随时可以改（见
+/// `Settings::dict_name`）。把显示名当键用，等于用户一改名字，所有按键存的东西
+/// 就全对不上了。
+pub const ECDICT_KEY: &str = "ecdict";
+pub const CEDICT_KEY: &str = "cedict";
+
+/// 默认显示名。
+///
+/// 「简明英汉字典」是 ECDICT 的中文正名（上游 skywind3000/ECDICT 自己就这么叫）。
+/// CC-CEDICT **没有**中文正名——它就叫 CC-CEDICT，那是个专名不是缩写词，对中文用户
+/// 不友好；这里给一个描述性的名字，并让用户可以改。两个名字都进设置页可编辑。
+pub const ECDICT_NAME: &str = "简明英汉字典";
+pub const CEDICT_NAME: &str = "汉英词典";
+
 pub const ECDICT_FILE: &str = "ecdict.db";
 pub const CEDICT_FILE: &str = "cedict.db";
 pub const UNIHAN_FILE: &str = "unihan.db";

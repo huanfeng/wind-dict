@@ -267,6 +267,14 @@ pub struct Settings {
     /// 按文件名而非完整路径，是为了用户换目录（把词库从 C 盘挪到 D 盘）之后这些
     /// 开关还认得出是同一本词典。
     pub disabled_dicts: Vec<String>,
+    /// 各来源的自定义显示名：`(稳定键, 名字)`。
+    ///
+    /// 存**键**而非下标或路径：内置那两份的键是 `ecdict` / `cedict`，自带词典的键是
+    /// 文件名——换目录、装卸别的词典都不会让这份映射错位。
+    ///
+    /// 只存改过的那些。没有条目就用默认名，故「恢复默认」等同于删掉这一条，不需要
+    /// 另存一个「是否用了默认名」的标志——那种标志迟早会与实际的名字对不上。
+    pub dict_names: Vec<(String, String)>,
     /// 左栏宽度（逻辑 px）。
     ///
     /// 存**像素**而非左右比例，是因为左栏装的是一列词头：它需要的宽度由「一个词头加
@@ -287,12 +295,36 @@ impl Default for Settings {
             dict_dir: None,
             user_dict_dir: None,
             disabled_dicts: Vec::new(),
+            dict_names: Vec::new(),
             left_pane_w: LEFT_PANE_W_DEFAULT,
         }
     }
 }
 
 /// 设置在数据库里的键名。集中在此，避免字符串散落各处拼错。
+impl Settings {
+    /// 某个来源此刻的显示名。没改过就是 `default`。
+    pub fn dict_name(&self, key: &str, default: &str) -> String {
+        self.dict_names
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| default.to_string())
+    }
+
+    /// 改名。空名字视同**恢复默认**——直接删掉这一条，而不是存一个空串。
+    ///
+    /// 存空串的话，`dict_name` 就得再判一次「空的算不算数」，而那条判断迟早会有
+    /// 一处漏掉；不存则「有没有这一条」本身就是答案。
+    pub fn set_dict_name(&mut self, key: &str, name: &str) {
+        let name = name.trim();
+        self.dict_names.retain(|(k, _)| k != key);
+        if !name.is_empty() {
+            self.dict_names.push((key.to_string(), name.to_string()));
+        }
+    }
+}
+
 pub mod keys {
     pub const HOTKEY: &str = "hotkey";
     pub const AUTOSTART: &str = "autostart";
@@ -306,6 +338,7 @@ pub mod keys {
     pub const LEGACY_ECDICT: &str = "ecdict";
     pub const USER_DICT_DIR: &str = "user_dict_dir";
     pub const DISABLED_DICTS: &str = "disabled_dicts";
+    pub const DICT_NAMES: &str = "dict_names";
     pub const LEFT_PANE_W: &str = "left_pane_w";
 }
 
@@ -352,6 +385,9 @@ impl Settings {
             user_dict_dir: get(keys::USER_DICT_DIR)
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
+            dict_names: get(keys::DICT_NAMES)
+                .map(|s| pairs_of(&s))
+                .unwrap_or_else(|| d.dict_names.clone()),
             disabled_dicts: get(keys::DISABLED_DICTS)
                 .map(|s| lines_of(&s))
                 .unwrap_or_default(),
@@ -376,6 +412,14 @@ impl Settings {
             (keys::DICT_DIR, path_str(&self.dict_dir)),
             (keys::USER_DICT_DIR, path_str(&self.user_dict_dir)),
             (keys::DISABLED_DICTS, self.disabled_dicts.join("\n")),
+            (
+                keys::DICT_NAMES,
+                self.dict_names
+                    .iter()
+                    .map(|(k, v)| format!("{k}\t{v}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
             (keys::LEFT_PANE_W, self.left_pane_w.to_string()),
         ]
     }
@@ -398,6 +442,21 @@ fn lines_of(s: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(str::to_string)
+        .collect()
+}
+
+/// 解析「键 TAB 名字」逐行的映射。
+///
+/// 分隔符取制表符而非等号或冒号：键里有文件名（`朗文=当代.mdx` 完全合法），而
+/// Windows 的文件名不允许含制表符与换行，故这个分隔符不会与内容冲突。
+///
+/// 一行拆不出两段就整行丢掉，不猜。设置库可能被手改或被旧版本写坏，而一个半截的
+/// 映射会表现为「某本词典的名字莫名其妙变成一串键」——比它干脆不生效更难查。
+fn pairs_of(s: &str) -> Vec<(String, String)> {
+    s.lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .filter(|(k, v)| !k.is_empty() && !v.is_empty())
         .collect()
 }
 
@@ -563,6 +622,55 @@ mod tests {
     /// 旧版按**文件**存词库路径（`ecdict` / `cedict` 两个键）。取英汉库所在的目录
     /// 迁移过来——三份库本就同处一处，故这个推断在旧数据上必然成立。
     ///
+    /// 改名与恢复默认。
+    ///
+    /// 「清空即恢复默认」是这套设计的关键一处：没有它，用户改错了名字就只能再编一个
+    /// 名字，回不到我们给的那个。而它成立的前提是**空名字不落库**——落一个空串的话，
+    /// `dict_name` 就得再判一次「空的算不算数」，那条判断迟早有一处会漏。
+    #[test]
+    fn 词典改名与恢复默认() {
+        let mut s = Settings::default();
+        assert_eq!(
+            s.dict_name("ecdict", "简明英汉字典"),
+            "简明英汉字典",
+            "没改过就是默认名"
+        );
+
+        s.set_dict_name("ecdict", "我的英汉");
+        assert_eq!(s.dict_name("ecdict", "简明英汉字典"), "我的英汉");
+        assert_eq!(s.dict_names.len(), 1);
+
+        s.set_dict_name("ecdict", "又改一次");
+        assert_eq!(s.dict_names.len(), 1, "改第二次不该多出一条");
+        assert_eq!(s.dict_name("ecdict", "简明英汉字典"), "又改一次");
+
+        s.set_dict_name("ecdict", "   ");
+        assert!(s.dict_names.is_empty(), "全空白等同清空，不落库");
+        assert_eq!(s.dict_name("ecdict", "简明英汉字典"), "简明英汉字典");
+    }
+
+    /// 半截的映射整行丢掉，不猜。
+    ///
+    /// 设置库可能被手改或被旧版本写坏，而一个猜出来的映射会表现为「某本词典的名字
+    /// 莫名其妙变成一串键」——比它干脆不生效更难查。
+    #[test]
+    fn 词典名映射只认完整的行() {
+        let got = pairs_of(
+            "ecdict	英汉
+没有分隔符
+	cedict少了键
+cedict	
+ a 	 b ",
+        );
+        assert_eq!(
+            got,
+            vec![
+                ("ecdict".to_string(), "英汉".to_string()),
+                ("a".to_string(), "b".to_string()),
+            ],
+        );
+    }
+
     /// 不迁移的话，设置过词库路径的用户升级后会被静默拽回程序同目录：查得到词、
     /// 一切正常，只是用的不是他指定的那份库。这种「没坏但不对」最难被发现。
     #[test]
@@ -607,6 +715,11 @@ mod tests {
             user_dict_dir: Some(PathBuf::from(r"E:\我的词库")),
             // 两条而非一条：一条存不出分隔符有没有用对。
             disabled_dicts: vec!["Oxford.mdx".into(), "朗文 当代.mdx".into()],
+            // 两条，且其中一条的键带空格：分隔符用的是制表符，验它不会被空格搅乱。
+            dict_names: vec![
+                ("ecdict".into(), "我的英汉".into()),
+                ("朗文 当代.mdx".into(), "朗文".into()),
+            ],
             // 特意取非默认值：等于默认时，`from_pairs` 的兜底分支也能让断言通过，
             // 那就验不出这一项到底有没有真的往返。
             left_pane_w: 340,

@@ -30,8 +30,8 @@ use windui::render::{Canvas, Paint};
 use windui::ui::containers::{TabBar, TabItem};
 
 use crate::domain::{
-    Candidate, CharTier, Dictionary, Direction, Entry, Glyph, Headword, Lookup, Query, Sense,
-    UserEntry, Wordlist,
+    Candidate, CharTier, Dictionary, Entry, Glyph, Headword, Lookup, Query, Sense, UserEntry,
+    Wordlist,
 };
 use crate::settings::Settings;
 use crate::skin::{SkinMode, SkinStyle};
@@ -135,9 +135,80 @@ const LEFT_FAVORITES: usize = 2;
 ///
 /// 由此推出一件必须如实呈现的事：一次查询只走一个方向，故**总有一个方向页是空的**
 /// （查 `apple` 时「汉英」必空）。空着不吭声会被读成「坏了」，故有 `filter_note`。
+/// 一个页签筛的是哪个来源。
+///
+/// **页签的轴是来源，不是方向。** 方向（英汉 / 汉英）在单次查询里没有区分力：方向
+/// 由查询词推出（ADR-0003），查 `hello` 走英汉、查 `你好` 走汉英，于是那两页永远
+/// 是「一页有货、一页空着」。有区分力的是「这条出自哪本词典」。
+///
+/// 内置那两份词库各占一个页签而不是合成一个「离线词典」，是产品决定：用户要能一眼
+/// 看出某条释义来自哪一份，而这两份的编纂来源、授权、质量都不同（见 THIRD-PARTY.md）。
+#[derive(Clone, PartialEq, Eq)]
+enum TabKey {
+    /// 全部来源。
+    All,
+    /// 随程序分发的词库，值是 `offline::ECDICT_KEY` / `CEDICT_KEY`。
+    Builtin(&'static str),
+    /// 自带词典，值是文件名（`source::user::key_of`）。
+    User(String),
+}
+
+/// 一个页签：筛什么、叫什么、这次有没有货。
+struct TabSpec {
+    key: TabKey,
+    label: String,
+    /// 本次结果里有没有这个来源的词条。绑给 `TabItem::enabled`。
+    ///
+    /// **用信号而不是每次重建标签条**：结果每查一次就变，而页签集合只在装卸词典或
+    /// 改名时才变。重建会丢掉悬停态、并让选中滑块从头落定而不是滑过去。
+    on: Signal<bool>,
+}
+
+impl TabSpec {
+    fn new(key: TabKey, label: String) -> Self {
+        Self {
+            key,
+            label,
+            on: signal(true),
+        }
+    }
+}
+
+/// 按页签筛出要显示的卡片。
+///
+/// **逐条筛，不是整张卡片筛**：一个词头下面常常同时挂着内置词库与自带词典的词条
+/// （查 hello 就是），整张留下等于点进「简明英汉字典」还看得见另一本的内容——那样
+/// 页签名就是在撒谎；整张丢掉则那个词头会从它确实收录的那一页里消失。
+///
+/// 筛空的卡片整张丢掉：只剩一个词头、底下什么都没有的卡片没有信息量，而它会让
+/// 「这一页里有几条」这个一眼可数的事实变得不可数。
+fn filter_cards(all: Vec<Card>, key: &TabKey) -> Vec<Card> {
+    all.into_iter()
+        .filter_map(|mut c| {
+            c.entries.retain(|e| entry_in_tab(e, key));
+            (!c.entries.is_empty()).then_some(c)
+        })
+        .collect()
+}
+
+/// 一条词条属不属于某个页签。
+///
+/// 内置那两份靠**词条的类型**认：`Entry::English` 只可能来自 ECDICT，
+/// `Entry::Chinese` 只可能来自 CC-CEDICT——这不是猜，是 `OfflineDictionary::lookup`
+/// 按方向选路的直接结果。自带词典靠**稳定键**认，不能靠显示名：名字可以被用户改、
+/// 也可能撞车（两个文件的 MDX 标题一模一样是常有的事）。
+fn entry_in_tab(e: &Entry, key: &TabKey) -> bool {
+    use crate::source::offline::{CEDICT_KEY, ECDICT_KEY};
+    match (key, e) {
+        (TabKey::All, _) => true,
+        (TabKey::Builtin(k), Entry::English(_)) => *k == ECDICT_KEY,
+        (TabKey::Builtin(k), Entry::Chinese(_)) => *k == CEDICT_KEY,
+        (TabKey::User(k), Entry::User(u)) => *k == u.source_key,
+        _ => false,
+    }
+}
+
 const DICT_ALL: usize = 0;
-const DICT_EN_ZH: usize = 1;
-const DICT_ZH_EN: usize = 2;
 
 /// 左栏一行的高度。
 ///
@@ -726,6 +797,29 @@ impl Widget for CardFilter {
     }
 }
 
+/// 监视「给词典改名」输入框、落库的响应式控件。与 [`NoteSaver`] 同构，理由相同：
+/// windui 的 `text_input` 没有提交/失焦回调，只能盯变化。
+///
+/// **不重建设置页**：重建会把正在输入的这个框连同它的焦点一起换掉，用户打第二个字
+/// 时就发现光标没了。改名影响的是页签，而页签在另一棵子树上（`tabs_rev`）。
+struct DictNameSaver {
+    st: Rc<State>,
+    key: String,
+    text: Signal<String>,
+    last_version: u64,
+}
+
+impl Widget for DictNameSaver {
+    fn on_update(&mut self, _ctx: &mut EventCtx) {
+        let v = self.text.version();
+        if v == self.last_version {
+            return;
+        }
+        self.last_version = v;
+        self.st.set_dict_name(&self.key, &self.text.get());
+    }
+}
+
 /// 监视备注输入、落库的响应式控件。
 ///
 /// 与 `Completer` 同构，靠 `on_update` 相位工作。之所以需要它，是因为 windui 的
@@ -924,7 +1018,13 @@ struct State {
     /// 右栏页签筛完之后的空态文案。空串 = 无需提示，见 `refilter_cards`。
     filter_note: Signal<String>,
     /// 右栏当前页签：全部 / 英汉 / 汉英。
+    /// 托盘图标的运行期句柄。改热键之后要把提示改掉——那句话里写着热键。
+    tray: windui::platform::TrayHandle,
     dict_tab: Signal<usize>,
+    /// 页签集合。随装卸词典与改名而变，随查询**不变**（变的只是各自的可用态）。
+    tabs: RefCell<Vec<TabSpec>>,
+    /// 页签集合变了，标签条整体重建一次。
+    tabs_rev: Signal<Vec<u64>>,
     /// 左栏当前页签：候选 / 历史 / 收藏。
     left_tab: Signal<usize>,
     /// 左栏当前列出的行。三个页签共用，由 `LeftPaneLoader` 按页签填充。
@@ -1662,6 +1762,9 @@ impl State {
         self.settings.borrow_mut().hotkey = spec;
         self.hotkey.set(spec.to_hotkey());
         if self.save_settings() {
+            // 托盘提示里写着热键。不跟着改的话，用户改完热键去托盘上一悬停，看到的
+            // 是**旧的那个组合**——一句由程序自己给出、且明确是错的信息。
+            self.tray.set_tooltip(tray_tip(&spec));
             self.note_ok(format!("唤起热键已改为 {spec}"));
         }
     }
@@ -1791,6 +1894,7 @@ impl State {
         };
         let disabled = self.settings.borrow().disabled_dicts.clone();
         *self.user_dicts.borrow_mut() = crate::source::user::load(&dir, &disabled);
+        self.apply_dict_aliases();
     }
 
     /// 从当前页签移除一行：历史页删历史条目，收藏页取消收藏。
@@ -2050,16 +2154,97 @@ impl State {
     /// 「汉英」页必然一条也没有。那**不是**故障，但空白一片看起来像故障，所以必须
     /// 有一句话——而 `hint` 讲的是查询本身（未收录、经原形命中），不能拿来讲页签。
     fn refilter_cards(&self) {
-        let tab = self.dict_tab.get();
         let all = self.cards.get();
+
+        // 先更新每个页签的可用态。判据是**全部结果**，与此刻停在哪一页无关——
+        // 拿筛过的结果去判，会让除当前页之外的所有页签一起变灰。
+        //
+        // 一条结果都没有时**全部保持可用**：那是「还没查」或「这个词没收录」，不是
+        // 「这本词典没有它」。全灰会让开屏那一眼看着像所有词典都坏了。
+        let idle = all.is_empty();
+        for t in self.tabs.borrow().iter() {
+            let any = idle
+                || matches!(t.key, TabKey::All)
+                || all
+                    .iter()
+                    .any(|c| c.entries.iter().any(|e| entry_in_tab(e, &t.key)));
+            if t.on.get() != any {
+                t.on.set(any);
+            }
+        }
+
+        let (key, label) = {
+            let tabs = self.tabs.borrow();
+            match tabs.get(self.dict_tab.get()) {
+                Some(t) => (t.key.clone(), t.label.clone()),
+                // 越界不该发生（下标由 `TabBar` 写，取值受标签数约束），但「筛空了」
+                // 比 panic 更难查，故这里宁可退回全收。
+                None => (TabKey::All, String::new()),
+            }
+        };
+
         let had_any = !all.is_empty();
-        let kept: Vec<Card> = all.into_iter().filter(|c| card_in_tab(c, tab)).collect();
+        let kept = filter_cards(all, &key);
         self.filter_note.set(if had_any && kept.is_empty() {
-            format!("本次查询没有{}方向的词条。", dict_tab_label(tab))
+            format!("本次查询在「{label}」里没有词条。")
         } else {
             String::new()
         });
         self.visible_cards.set(kept);
+    }
+
+    /// 重建页签集合：全部 + 内置两份 + 每本自带词典。
+    ///
+    /// 只在**页签集合本身**变化时调（装卸词典、改名、开关某本），不在每次查询时调——
+    /// 查询只改各页签的可用态，那走信号（见 [`TabSpec::on`]）。
+    fn rebuild_tabs(&self) {
+        use crate::source::offline::{CEDICT_KEY, CEDICT_NAME, ECDICT_KEY, ECDICT_NAME};
+        let mut v = {
+            let s = self.settings.borrow();
+            vec![
+                TabSpec::new(TabKey::All, "全部".into()),
+                TabSpec::new(
+                    TabKey::Builtin(ECDICT_KEY),
+                    s.dict_name(ECDICT_KEY, ECDICT_NAME),
+                ),
+                TabSpec::new(
+                    TabKey::Builtin(CEDICT_KEY),
+                    s.dict_name(CEDICT_KEY, CEDICT_NAME),
+                ),
+            ]
+        };
+        for d in self.user_dicts.borrow().iter() {
+            v.push(TabSpec::new(
+                TabKey::User(d.key().to_string()),
+                d.name().to_string(),
+            ));
+        }
+        // 词典少了的话当前下标可能落到外面。回「全部」而不是钳到末项：钳过去等于把
+        // 用户默默扔进另一本词典的结果里，而他并没有选它。
+        if self.dict_tab.get() >= v.len() {
+            self.dict_tab.set(DICT_ALL);
+        }
+        *self.tabs.borrow_mut() = v;
+        bump(self.tabs_rev);
+        self.refilter_cards();
+    }
+
+    /// 把设置里的自定义名字贴到已打开的词典上。
+    fn apply_dict_aliases(&self) {
+        let names = self.settings.borrow().dict_names.clone();
+        for d in self.user_dicts.borrow_mut().iter_mut() {
+            let alias = names.iter().find(|(k, _)| k == d.key()).map(|(_, v)| v);
+            d.set_alias(alias.map(String::as_str));
+        }
+    }
+
+    /// 给某个来源改名。空名字 = 恢复默认。
+    fn set_dict_name(&self, key: &str, name: &str) {
+        self.settings.borrow_mut().set_dict_name(key, name);
+        if self.save_settings() {
+            self.apply_dict_aliases();
+            self.rebuild_tabs();
+        }
     }
 
     /// 把一次查询命中的全部词头记入历史记录。
@@ -2120,41 +2305,6 @@ fn root_width(ctx: &mut EventCtx) -> i32 {
     root.and_then(|r| tree.get(r))
         .map(|n| n.bounds.w)
         .unwrap_or(0)
-}
-
-/// 一张卡片是否属于某个方向页签。
-///
-/// 「全部」收所有；方向页**按词头本身判方向**，与 `Query::direction` 同一套规则。
-///
-/// 这里曾经按词条类型判（`Entry::English` → 英汉）。自带词典进来之后那样不行了：
-/// `Entry::User` 不属于任何一个方向，一个只被自带词典收录的英文词会从两个方向页里
-/// 一起消失，只在「全部」下露面。
-///
-/// 改按词头判反而更贴 ADR-0003——方向本就是**由文本推出的**，不是存在词条里的属性。
-/// 词头是词典背书的真实文本，用它判定与用查询词判定必然同结论：一次查询只走一个
-/// 方向，命中的词头与查询词是同一种文字。
-fn card_in_tab(c: &Card, tab: usize) -> bool {
-    let dir = Query::new(c.headword.as_str()).map(|q| q.direction());
-    match tab {
-        DICT_EN_ZH => dir == Some(Direction::EnToZh),
-        DICT_ZH_EN => dir == Some(Direction::ZhToEn),
-        // `DICT_ALL` 与任何越界值都收全部。越界不该发生（页签由 `TabBar` 写，取值受
-        // 标签数约束），但「筛空了」比「panic」更难查，故这里宁可放行。
-        _ => true,
-    }
-}
-
-/// 方向页签的名字，供空态文案引用。
-///
-/// 「英汉 / 汉英」是**查询方向**名，术语表允许；禁止的是「英汉词典 / 汉英词典」那个
-/// 组合——本项目只有一个词典。文案因此说的是「没有 X 方向的词条」，不是「X 词典里
-/// 没有」。
-fn dict_tab_label(tab: usize) -> &'static str {
-    match tab {
-        DICT_EN_ZH => "英汉",
-        DICT_ZH_EN => "汉英",
-        _ => "任何",
-    }
 }
 
 /// 把词条按词头分组，组的顺序与组内顺序都保持原样。
@@ -2239,6 +2389,7 @@ pub fn build(
     user: UserDataState,
     theme: ThemeHandle,
     hotkey: HotkeyHandle,
+    tray: windui::platform::TrayHandle,
     // 系统此刻是否偏好暗色。由 `main` 查好传进来而非在此现查：它是 OS 状态，
     // 而本模块的其余部分只碰自己的状态。
     system_dark: bool,
@@ -2266,7 +2417,10 @@ pub fn build(
         visible_cards: signal(Vec::new()),
         hint: signal(String::from("输入一个词开始查询")),
         filter_note: signal(String::new()),
+        tray,
         dict_tab: signal(DICT_ALL),
+        tabs: RefCell::new(Vec::new()),
+        tabs_rev: signal(vec![0]),
         // 开屏停在历史页：DESIGN.md 的「Search is home / Recall is a drawer」讲的是
         // 别拿历史当主导航，不是别让人看见它。左栏那 280px 在开屏时**没有别的内容**
         // 可放——候选页此刻是空的——而「最近查过什么」正好是下一次查询的起点。
@@ -2294,6 +2448,8 @@ pub fn build(
     // 扫词典目录。放在 `State` 造好之后，是因为扫描要读设置里的目录与开关，
     // 那两样都得先有 `State` 才拿得到。
     st.reload_user_dicts();
+    // 页签集合依赖上面扫到的那批词典，故必须排在它后面。
+    st.rebuild_tabs();
     // 开屏即把左栏填上：驱动器要到第一次 layout 才跑，在那之前列表是空的，
     // 而开屏那一眼正好落在这里。
     st.reload_left();
@@ -2899,7 +3055,7 @@ fn right_pane(st: Rc<State>) -> Element {
         // 位置、结果区被挤没。它**只有独占竖向容器的一行**时才是对的——那时 Match
         // 落在主轴上被降级为 Wrap（`core.rs` 的「主轴上的 Match 降级为 Wrap」），
         // 高度才是那条标签条本身。
-        .child(dict_tab_bar(st.dict_tab))
+        .child(dict_tab_bar(st.clone()))
         .child(result_area(st).weight(1.0))
 }
 
@@ -2966,17 +3122,21 @@ fn nav_button(
 /// 一族常量）——一份内容区才是它的实情，`TabBar` 只负责那条标签条。
 ///
 /// 条高与贯穿基线由 `TabBar` 自己按主题决定，故此处不设固定高、也不另加分隔线。
-fn dict_tab_bar(selected: Signal<usize>) -> Element {
-    Element::leaf()
-        .widget(TabBar::new(
-            vec![
-                TabItem::new("全部".into()),
-                TabItem::new("英汉".into()),
-                TabItem::new("汉英".into()),
-            ],
-            selected,
-        ))
-        .width_match()
+fn dict_tab_bar(st: Rc<State>) -> Element {
+    Element::host_signal(st.tabs_rev, move |_rev: u64| {
+        let items: Vec<TabItem> = st
+            .tabs
+            .borrow()
+            .iter()
+            // 本次没命中的置灰而不是摘掉：留在原位，位置就是稳定的，用户「总是点
+            // 第三个」这条肌肉记忆才成立；摘掉则每查一个词后面所有页签整体左移，
+            // 看着像换了一条标签条。
+            .map(|t| TabItem::new(t.label.clone()).enabled(t.on))
+            .collect();
+        Element::leaf()
+            .widget(TabBar::new(items, st.dict_tab))
+            .width_match()
+    })
 }
 
 /// 设置页。
@@ -3088,6 +3248,14 @@ fn data_rows(st: Rc<State>) -> Element {
                 .fg_role(Role::TextMuted),
         ),
     ])
+}
+
+/// 托盘图标的悬停提示。
+///
+/// **建托盘时与改热键时共用这一处**：两边各写一句 `format!` 的话，用户改一次热键，
+/// 提示的措辞就会跟着变一次——而那两句本该是同一句话的不同时刻。
+pub fn tray_tip(hotkey: &crate::settings::HotkeySpec) -> String {
+    format!("{} — {hotkey} 查询", crate::APP_TITLE)
 }
 
 /// 项目主页。关于页与包内 README 都指这里。
@@ -3562,37 +3730,110 @@ fn dict_rows(st: Rc<State>) -> Element {
         );
     }));
 
+    // 两份词库各占一行而不是合成「已装词库」一行：它们现在各有一个页签、各有一个
+    // 可改的名字，那一行里塞不下，也说不清哪个大小对应哪个名字。
     card(vec![
         row("词库目录", Some(&sub), right),
-        row("已装词库", Some(&dict_files_line(&status)), Element::col()),
+        builtin_dict_row(
+            st.clone(),
+            offline::ECDICT_KEY,
+            offline::ECDICT_NAME,
+            "英汉",
+            offline::ECDICT_FILE,
+            &status.ecdict,
+        ),
+        builtin_dict_row(
+            st,
+            offline::CEDICT_KEY,
+            offline::CEDICT_NAME,
+            "汉英",
+            offline::CEDICT_FILE,
+            &status.cedict,
+        ),
+        // 字形库**没有改名框**：它不出词条，也就没有页签，名字无处可显示。多一个
+        // 改了看不见效果的输入框只会让人以为坏了。
+        row("字形库", Some(&glyph_line(&status)), Element::col()),
     ])
 }
 
-/// 三份库的齐备情况，一行文字。
-///
-/// 报**文件大小**而不是词条数：`SELECT count(*)` 在这三个库上实测各要 170–210 ms，
-/// 而设置页每次换肤、每次拨开关都要重建，三份加起来半秒的卡顿换不来什么——用户分辨
-/// 不出 770,611 与 700,000 的差别，却一眼看得出 169 MB 与 0 字节的差别。
-fn dict_files_line(st: &crate::source::offline::DirStatus) -> String {
-    use crate::source::offline::{CEDICT_FILE, ECDICT_FILE, UNIHAN_FILE};
-    fn mb(n: u64) -> String {
-        format!("{:.0} MB", n as f64 / 1_048_576.0)
-    }
-    let mut parts = Vec::new();
-    parts.push(match &st.ecdict {
-        Ok(n) => format!("英汉 {}", mb(*n)),
-        Err(_) => format!("缺 {ECDICT_FILE}"),
-    });
-    parts.push(match &st.cedict {
-        Ok(n) => format!("汉英 {}", mb(*n)),
-        Err(_) => format!("缺 {CEDICT_FILE}"),
-    });
-    // 字形库可缺，故说法不同：它不在只是少一行部首笔画，不是故障。
-    parts.push(match st.unihan {
-        Some(n) => format!("字形 {}", mb(n)),
+/// 一份内置词库的设置行：当前名字 + 方向/文件/大小 + 改名框。
+fn builtin_dict_row(
+    st: Rc<State>,
+    key: &'static str,
+    default_name: &str,
+    dir_label: &str,
+    file: &str,
+    stat: &Result<u64, String>,
+) -> Element {
+    let sub = match stat {
+        Ok(n) => format!("{dir_label} · {file} · {}", mb(*n)),
+        // 打不开必须说出原因：否则用户只看到一行名字，无从判断是文件没了还是坏了。
+        Err(e) => format!("{dir_label} · {file} · 打不开：{e}"),
+    };
+    dict_name_row(st, key, default_name, &sub, Element::col())
+}
+
+/// 字形库那一行的说明。它可缺，故说法与另外两份不同：不在只是少一行部首笔画，
+/// 不是故障。
+fn glyph_line(st: &crate::source::offline::DirStatus) -> String {
+    use crate::source::offline::UNIHAN_FILE;
+    match st.unihan {
+        Some(n) => format!("部首、笔画、繁简 · {UNIHAN_FILE} · {}", mb(n)),
         None => format!("无 {UNIHAN_FILE}（不显示部首笔画）"),
-    });
-    parts.join(" · ")
+    }
+}
+
+/// 词库大小。
+///
+/// 报**文件大小**而不是词条数：`SELECT count(*)` 在这几个库上实测各要 170–210 ms，
+/// 而设置页每次换肤、每次拨开关都要重建，加起来半秒的卡顿换不来什么——用户分辨不出
+/// 770,611 与 700,000 的差别，却一眼看得出 169 MB 与 0 字节的差别。
+fn mb(n: u64) -> String {
+    format!("{:.0} MB", n as f64 / 1_048_576.0)
+}
+
+/// 一行「某本词典」：当前显示名 + 说明 + 改名框（+ 右侧附加控件）。
+///
+/// 输入框里**留空表示用默认名**，占位符就是那个默认名——而不是把默认名填进去。
+/// 填进去的话，「我没改过」与「我把它改成了跟默认一样」在存储里就分不开，用户也
+/// 没有一个明确的「恢复默认」动作可做（清空即恢复，见 `Settings::set_dict_name`）。
+fn dict_name_row(
+    st: Rc<State>,
+    key: &str,
+    default_name: &str,
+    sub: &str,
+    extra: Element,
+) -> Element {
+    let (custom, title) = {
+        let s = st.settings.borrow();
+        (s.dict_name(key, ""), s.dict_name(key, default_name))
+    };
+    let text = signal(custom);
+    Element::row().width_match().cross(Align::Center).child(row(
+        &title,
+        Some(sub),
+        Element::row()
+            .cross(Align::Center)
+            .spacing(8)
+            // 监听器须先于输入框注册：`on_update` 按注册顺序广播。
+            .child(
+                Element::leaf()
+                    .reactive()
+                    .widget(DictNameSaver {
+                        st,
+                        key: key.to_string(),
+                        text,
+                        last_version: text.version(),
+                    })
+                    .size(0, 0),
+            )
+            .child(
+                Element::text_input(text, default_name)
+                    .font_size(13.0)
+                    .width(150),
+            )
+            .child(extra),
+    ))
 }
 
 /// 打开一个目录（资源管理器）。
@@ -3698,26 +3939,24 @@ fn user_dict_rows(st: Rc<State>) -> Element {
             Err(e) => (file.clone(), format!("打不开：{e:#}")),
         };
         let on = signal(!disabled.contains(&file));
-        rows.push(row(
-            &title,
-            Some(&sub),
-            Element::row()
-                .cross(Align::Center)
-                // 监听器须先于开关注册（on_update 按注册顺序广播），且必须盯信号而非
-                // 挂 `on_toggle`——后者被 windui 静默吞掉，见 `SettingToggle`。
-                .child(
-                    Element::leaf()
-                        .reactive()
-                        .widget(DictToggle {
-                            st: st.clone(),
-                            file: file.clone(),
-                            on,
-                            last_version: on.version(),
-                        })
-                        .size(0, 0),
-                )
-                .child(Element::switch(on)),
-        ));
+        let toggle = Element::row()
+            .cross(Align::Center)
+            // 监听器须先于开关注册（on_update 按注册顺序广播），且必须盯信号而非
+            // 挂 `on_toggle`——后者被 windui 静默吞掉，见 `SettingToggle`。
+            .child(
+                Element::leaf()
+                    .reactive()
+                    .widget(DictToggle {
+                        st: st.clone(),
+                        file: file.clone(),
+                        on,
+                        last_version: on.version(),
+                    })
+                    .size(0, 0),
+            )
+            .child(Element::switch(on));
+        // 键是文件名，与页签、开关用的是同一个（见 `source::user::key_of`）。
+        rows.push(dict_name_row(st.clone(), &file, &title, &sub, toggle));
     }
     card(rows)
 }
@@ -4577,9 +4816,9 @@ fn join(s: &Sense) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        card_in_tab, clamp_left_w, dict_tab_label, expand_key, grading_row, group_by_headword,
+        clamp_left_w, entry_in_tab, expand_key, filter_cards, grading_row, group_by_headword,
         headwords_to_record, scroll_area, signal, write_note, Card, ExpandedStates, NavPath, Role,
-        DICT_ALL, DICT_EN_ZH, DICT_ZH_EN, RIGHT_MIN_W,
+        TabKey, RIGHT_MIN_W,
     };
     use crate::domain::{
         ChineseEntry, EnglishEntry, Entry, ExamTag, Grading, Headword, Inflections, Sense,
@@ -4832,9 +5071,14 @@ mod tests {
     }
 
     fn 自带(w: &str) -> Entry {
+        自带来自(w, "牛津.mdx")
+    }
+
+    fn 自带来自(w: &str, key: &str) -> Entry {
         Entry::User(crate::domain::UserEntry {
             headword: Headword::from_store(w),
             source: "某本自带词典".into(),
+            source_key: key.into(),
             body: vec![crate::domain::TextBlock {
                 indent: 0,
                 runs: vec![crate::domain::TextRun {
@@ -4856,57 +5100,82 @@ mod tests {
         }
     }
 
-    #[test]
-    fn 全部页收下两个方向的卡片() {
-        let en = 卡片(vec![英汉("apple")]);
-        let zh = 卡片(vec![汉英("苹果", "ping2 guo3")]);
-        assert!(card_in_tab(&en, DICT_ALL));
-        assert!(card_in_tab(&zh, DICT_ALL));
+    fn 内置(key: &'static str) -> TabKey {
+        TabKey::Builtin(key)
     }
 
     #[test]
-    fn 方向页只收该方向的卡片() {
-        let en = 卡片(vec![英汉("apple")]);
-        let zh = 卡片(vec![汉英("苹果", "ping2 guo3")]);
-        assert!(card_in_tab(&en, DICT_EN_ZH), "英汉卡片该留在英汉页");
-        assert!(!card_in_tab(&zh, DICT_EN_ZH), "汉英卡片不该出现在英汉页");
-        assert!(card_in_tab(&zh, DICT_ZH_EN), "汉英卡片该留在汉英页");
-        assert!(!card_in_tab(&en, DICT_ZH_EN), "英汉卡片不该出现在汉英页");
+    fn 全部页收下所有来源() {
+        for e in [
+            英汉("apple"),
+            汉英("苹果", "ping2 guo3"),
+            自带("serendipity"),
+        ] {
+            assert!(entry_in_tab(&e, &TabKey::All));
+        }
     }
 
-    /// 只被自带词典收录的词，也必须出现在对应的方向页里。
+    /// 内置两份各归各的页，且**自带词典的词条不进内置页**。
     ///
-    /// 这是 `card_in_tab` 从「按词条类型判」改成「按词头判方向」的**全部理由**：
-    /// `Entry::User` 不属于任何一个方向，按类型判会让这类卡片从两个方向页里一起
-    /// 消失，只在「全部」下露面——而用户根本不知道自己该去哪个页签找它。
+    /// 这是页签从「方向」改成「来源」之后最要紧的一条：此前自带词典的英文词条会
+    /// 落进「英汉」页，因为那时判的是词头的方向。现在「简明英汉字典」这一页只该有
+    /// 简明英汉字典的东西——否则页签名就是在撒谎。
     #[test]
-    fn 只有自带词典命中的卡片也进方向页() {
-        let en = 卡片(vec![自带("serendipity")]);
-        let zh = 卡片(vec![自带("囍")]);
-        assert!(card_in_tab(&en, DICT_EN_ZH), "英文词头该留在英汉页");
-        assert!(!card_in_tab(&en, DICT_ZH_EN));
-        assert!(card_in_tab(&zh, DICT_ZH_EN), "中文词头该留在汉英页");
-        assert!(!card_in_tab(&zh, DICT_EN_ZH));
-        assert!(card_in_tab(&en, DICT_ALL) && card_in_tab(&zh, DICT_ALL));
+    fn 内置两份各归各页() {
+        use crate::source::offline::{CEDICT_KEY, ECDICT_KEY};
+        let en = 英汉("apple");
+        let zh = 汉英("苹果", "ping2 guo3");
+        let user = 自带("apple");
+        assert!(entry_in_tab(&en, &内置(ECDICT_KEY)));
+        assert!(!entry_in_tab(&zh, &内置(ECDICT_KEY)));
+        assert!(!entry_in_tab(&user, &内置(ECDICT_KEY)), "自带的不算内置的");
+        assert!(entry_in_tab(&zh, &内置(CEDICT_KEY)));
+        assert!(!entry_in_tab(&en, &内置(CEDICT_KEY)));
+        assert!(!entry_in_tab(&user, &内置(CEDICT_KEY)));
     }
 
-    /// 内置词条与自带词条同处一张卡片时，方向由词头定，与谁排在前面无关。
-    #[test]
-    fn 混装卡片按词头判方向() {
-        let mixed = 卡片(vec![英汉("apple"), 自带("apple")]);
-        assert!(card_in_tab(&mixed, DICT_EN_ZH));
-        assert!(!card_in_tab(&mixed, DICT_ZH_EN));
-    }
-
-    /// 页签越界不 panic，且**收全部**而非筛空。
+    /// 混装卡片按页签**拆开**：内置页只留内置的词条，自带页只留那一本的。
     ///
-    /// 越界本不该发生（页签由 `TabBar` 写，取值受标签数约束），但这条兜底的取向是
-    /// 刻意的：一屏该有的词条全在，比一屏莫名其妙的空白好查得多。
+    /// 这是「逐条筛而不是整张筛」的全部理由。查 hello 时一个词头下面既有内置英汉库
+    /// 的词条、又有自带词典的——整张留下，点进「简明英汉字典」还看得见另一本的内容；
+    /// 整张丢掉，这个词头就会从它确实收录的那一页里消失。
     #[test]
-    fn 越界页签收全部而非筛空() {
-        let en = 卡片(vec![英汉("apple")]);
-        assert!(card_in_tab(&en, 99));
-        assert_eq!(dict_tab_label(99), "任何");
+    fn 混装卡片按来源拆开() {
+        use crate::source::offline::ECDICT_KEY;
+        let c = 卡片(vec![英汉("apple"), 自带来自("apple", "牛津.mdx")]);
+        let all = filter_cards(vec![c.clone()], &TabKey::All);
+        assert_eq!(all[0].entries.len(), 2, "全部页两条都在");
+
+        let ec = filter_cards(vec![c.clone()], &内置(ECDICT_KEY));
+        assert_eq!(ec.len(), 1, "词头还在");
+        assert_eq!(ec[0].entries.len(), 1);
+        assert!(matches!(ec[0].entries[0], Entry::English(_)));
+
+        let ox = filter_cards(vec![c], &TabKey::User("牛津.mdx".into()));
+        assert_eq!(ox[0].entries.len(), 1);
+        assert!(matches!(ox[0].entries[0], Entry::User(_)));
+    }
+
+    /// 筛空的卡片整张丢掉，不留一个光秃秃的词头。
+    #[test]
+    fn 筛空的卡片不留词头() {
+        use crate::source::offline::CEDICT_KEY;
+        let c = 卡片(vec![英汉("apple")]);
+        assert!(filter_cards(vec![c], &内置(CEDICT_KEY)).is_empty());
+    }
+
+    /// 自带词典按**稳定键**认，不按显示名。
+    ///
+    /// 两本词典的 MDX 标题一模一样是常有的事，且用户随时能改名；拿名字当依据会把
+    /// 两本的词条混进同一页，而用户看到的是「这一页里混着别本的东西」。
+    #[test]
+    fn 自带词典按文件名分页() {
+        let a = 自带来自("apple", "牛津.mdx");
+        let b = 自带来自("apple", "柯林斯.mdx");
+        let 牛津 = TabKey::User("牛津.mdx".into());
+        assert!(entry_in_tab(&a, &牛津));
+        assert!(!entry_in_tab(&b, &牛津), "同名不同文件必须分开");
+        assert!(!entry_in_tab(&英汉("apple"), &牛津), "内置的不进自带页");
     }
 
     fn 走过(词们: &[&str]) -> NavPath {

@@ -31,7 +31,16 @@ use crate::domain::{Dictionary, Entry, Headword, Lookup, Query, UserEntry};
 use crate::store::mdx::Mdx;
 
 pub struct UserDictionary {
-    name: String,
+    /// 词典自报的名字（MDX 头部的 Title，为空则退到文件名）。
+    base_name: String,
+    /// 用户改的名字。`None` = 用 `base_name`。
+    ///
+    /// **别名与本名分开存**，不是就地改掉 `base_name`：用户清空输入框的意思是
+    /// 「恢复默认」，而就地改掉之后本名就找不回来了，只能重开一次文件去读——那让
+    /// 一个纯界面动作变成一次磁盘操作，且中途出错就永久丢了这本词典的名字。
+    alias: Option<String>,
+    /// 稳定键 = 文件名（见 [`key_of`]）。词条、页签、开关全按它对应。
+    key: String,
     /// 这本词典的文件路径。留着是为了设置页能把「扫到的一个文件」与「已经开着的
     /// 这本词典」对上——按下标对会在中间某本被关掉或打不开时整体错位。
     path: PathBuf,
@@ -42,7 +51,9 @@ impl UserDictionary {
     pub fn open(path: &Path) -> Result<Self> {
         let mdx = Mdx::open(path)?;
         Ok(Self {
-            name: display_name(path, &mdx),
+            base_name: display_name(path, &mdx),
+            alias: None,
+            key: key_of(path),
             path: path.to_path_buf(),
             mdx,
         })
@@ -50,6 +61,21 @@ impl UserDictionary {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 稳定键（文件名）。
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// 设定或清除别名。`None`（或全空白）= 恢复本名。
+    ///
+    /// **只改名，不改键**：改完之后这本词典的开关、页签筛选照旧认得出它是同一本。
+    pub fn set_alias(&mut self, alias: Option<&str>) {
+        self.alias = alias
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
     }
 
     pub fn entry_count(&self) -> u64 {
@@ -180,7 +206,7 @@ pub fn probe(path: &Path) -> Result<UserDictionary> {
 
 impl Dictionary for UserDictionary {
     fn name(&self) -> &str {
-        &self.name
+        self.alias.as_deref().unwrap_or(&self.base_name)
     }
 
     /// 查词。不分方向——MDX 不声明自己收的是哪种语言，只能原样问过去。
@@ -197,7 +223,8 @@ impl Dictionary for UserDictionary {
             .map(|(head, html)| {
                 Entry::User(UserEntry {
                     headword: Headword::from_store(head),
-                    source: self.name.clone(),
+                    source: self.name().to_string(),
+                    source_key: self.key.clone(),
                     body: crate::html::to_blocks(&html),
                 })
             })
