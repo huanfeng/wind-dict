@@ -1,4 +1,4 @@
-# wind-dict 开发脚本
+﻿# wind-dict 开发脚本
 #
 # 用法:
 #   .\scripts\dev.ps1            # 交互式菜单
@@ -17,6 +17,8 @@
 #   gm           下载一本示例 MDX (~70MB), 供手动测试"自带词典"; 部署时自动装进词典目录
 #   p / pd       部署 release / dev → 目标目录 (复制 + 可选开机自启)
 #   u / ud       卸载 release / dev (删目录 + 移除自启)
+#   rel          发布: 构建 + 组装 + 验证 + 压成带版本的 zip → artifacts\release\
+#                (要传参数就直接调 scripts\release.ps1, 见那个文件的头部)
 #   k=check  l=clippy  t=test  f=fmt  fc=fmt-check  ci(=fc+l+t)  clean
 #
 # 部署目标 (默认 %LOCALAPPDATA%\wind-dict, 免管理员; 在 scripts\deploy.local.ps1 覆盖):
@@ -29,18 +31,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# ---------- 路径 ----------
-# 层级: <repo>\scripts\dev.ps1
-$ScriptDir   = $PSScriptRoot
-$Root        = Split-Path $ScriptDir -Parent
-$CacheDir    = "$Root\.cache"          # 下载源 + 构建的 .db (不入库)
-$SrcDir      = "$CacheDir\src"         # 下载的 ecdict.csv / cedict.txt
-$DictDir     = "$CacheDir\dict"        # 构建的 ecdict.db / cedict.db / unihan.db
-$MdxDir      = "$CacheDir\mdx"         # 下载的示例 .mdx (不入库)
-$BuildDir    = "$Root\build"           # release 产物 (= 部署内容)
-$BuildDevDir = "$Root\build_dev"       # dev 产物
+# 路径 ($Root/$DictDir/$MdxDir/...) 与输出辅助 (Say/Warn/ErrMsg/Gray) 在 common.ps1,
+# 与 release.ps1 共用 —— 那些路径是**同一个事实**, 抄成两份就等着哪天悄悄漂移。
+. "$PSScriptRoot\common.ps1"
 
-# 词库源。
+# ---------- 词库源 ----------
 $EcdictUrl = "https://raw.githubusercontent.com/skywind3000/ECDICT/master/ecdict.csv"
 $CedictUrl = "https://www.mdbg.net/chinese/export/cedict/cedict_1_0_ts_utf-8_mdbg.txt.gz"
 # 字形源。Unihan 是 Unicode 官方数据, latest 随标准每年更新。
@@ -68,12 +63,6 @@ $DeployDirRelease = "$env:LOCALAPPDATA\wind-dict"
 $DeployDirDev     = "$env:LOCALAPPDATA\wind-dict-dev"
 $deployCfg = "$ScriptDir\deploy.local.ps1"
 if (Test-Path $deployCfg) { . $deployCfg }
-
-# ---------- 输出辅助 ----------
-function Say    ([string]$m) { Write-Host $m -ForegroundColor Green }
-function Warn   ([string]$m) { Write-Host $m -ForegroundColor Yellow }
-function ErrMsg ([string]$m) { Write-Host $m -ForegroundColor Red }
-function Gray   ([string]$m) { Write-Host $m -ForegroundColor DarkGray }
 
 function Out-For ([string]$profile) { if ($profile -eq "dev") { $BuildDevDir } else { $BuildDir } }
 
@@ -326,6 +315,18 @@ function Uninstall ([string]$profile = "release") {
     return $true
 }
 
+# ---------- 发布 ----------
+# 只是把 release.ps1 挂进菜单; 逻辑全在那边 (版本校验、组装、三道验证、压包、校验和)。
+# 要传参数 (-ExpectVersion / -Repo / -SkipBuild) 就直接调那个脚本。
+function Do-Release {
+    # 先归零: release.ps1 顺利跑完时不会调 exit, $LASTEXITCODE 会留着它内部最后一条
+    # 原生命令 (cargo) 的值。不归零就等于拿一个陈旧的数当成败判据。
+    $global:LASTEXITCODE = 0
+    & "$ScriptDir\release.ps1"
+    if ($LASTEXITCODE -ne 0) { ErrMsg "发布失败"; return $false }
+    return $true
+}
+
 # ---------- 代码质量 ----------
 function Do-Check    { Say "`ncargo check...";       Push-Location $Root; try { cargo check }                    finally { Pop-Location } }
 function Do-Clippy   { Say "`ncargo clippy...";      Push-Location $Root; try { cargo clippy --all-targets }     finally { Pop-Location } }
@@ -356,6 +357,7 @@ function Invoke-Command ([string]$cmd) {
         "pd"                 { return (Deploy "dev") }
         "u"                  { return (Uninstall "release") }
         "ud"                 { return (Uninstall "dev") }
+        { $_ -in "rel", "release" } { return (Do-Release) }
         { $_ -in "k", "check" }     { Do-Check;    return $true }
         { $_ -in "l", "clippy" }    { Do-Clippy;   return $true }
         { $_ -in "t", "test" }      { Do-Test;     return $true }
@@ -377,6 +379,8 @@ function Show-Menu {
     Write-Host "  部署:"
     Write-Host "    p   部署 release                pd  部署 dev"
     Write-Host "    u   卸载 release                ud  卸载 dev"
+    Write-Host "  发布:"
+    Write-Host "    rel 打成带版本的 zip → artifacts\release\ (构建+验证+压包)"
     Write-Host "  质量:"
     Write-Host "    k check   l clippy   t test   f fmt   fc fmt-check   ci   clean"
     Write-Host "    q 退出"
