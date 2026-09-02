@@ -2,25 +2,31 @@
 #
 # 用法:
 #   .\scripts\dev.ps1            # 交互式菜单
-#   .\scripts\dev.ps1 <命令>...  # 直调, 可连续: .\scripts\dev.ps1 gd 1 p
+#   .\scripts\dev.ps1 <命令>...  # 直调, 可连续: .\scripts\dev.ps1 gd b p
 #
 # wind-dict 是绿色单目录应用: 产物 = wind-dict.exe + 两个词库 (ecdict.db / cedict.db)
 #                                     + 一个字形库 (unihan.db, 可缺)。
 # 词库由 examples/build_ecdict|build_cedict 从下载的 ECDICT(CSV) / CC-CEDICT(txt) 构建,
-# 太大不入库 (见 .gitignore), 由 gen-data 生成到 .cache/dict/。
+# 太大不入库 (见 .gitignore), 由 gd 生成到 .cache/dict/。
 #
-# 命令:
-#   b / d        Dev 构建 → build_dev/ (exe + 词库软复制)
-#   1 / r        Release 构建 → build/
-#   run          Dev 构建并运行
-#   gd           gen-data: 下载词库源 + 构建 ecdict.db / cedict.db / unihan.db → .cache/dict/
-#   gm           下载一本示例 MDX (~70MB), 供手动测试"自带词典"; 部署时自动装进词典目录
-#   p / pd       部署 release / dev → 目标目录 (覆盖式复制 + 开机自启)
-#   i / id       全新部署 release / dev 并启动: 构建 → 杀实例 → 清空目录 → 装 → 起
-#                (要看最新改动就用它; p 是覆盖式的, 留得下上一版多出来的文件)
-#   u / ud       卸载 release / dev (删目录 + 移除自启)
-#   rel          发布: 构建 + 组装 + 验证 + 压成带版本的 zip → artifacts\release\
-#                (要传参数就直接调 scripts\release.ps1, 见那个文件的头部)
+# ── 命名规则: release 是基准, dev 在同一个命令**前面加一个 d** ──────────────────
+#
+# 日常做的事绝大多数是 release; dev 构建只在要带断言跑一跑时才用。此前两者的命令各起
+# 各的名 (1/b, p/pd, i/id), 记的是两套东西, 且 "1" 这种名字与它做的事毫无关系。
+#
+#   b    / db     构建 → build\ / build_dev\  (exe + 三份词库, 内容即部署内容)
+#   run  / drun   构建并直接运行 (不部署、不碰注册表; 跑的是 build[_dev]\ 里那个)
+#   p    / dp     覆盖式部署 → 目标目录 + 开机自启
+#   i    / di     全新部署并启动: 构建 → 停实例 → 清空目录 → 装 → 起
+#                 (要看最新改动就用它; p 是覆盖式的, 留得下上一版多出来的文件)
+#   u    / du     卸载 (删目录 + 移除自启; 用户数据不动, 见 ADR-0011)
+#
+# ── 与 release/dev 无关的 ────────────────────────────────────────────────────
+#
+#   gd            生成词库: 下载源 + 构建 ecdict.db / cedict.db / unihan.db → .cache\dict\
+#   gm            下载一本示例 MDX (~70MB), 供手动测试「自带词典」; 部署时自动装进词典目录
+#   rel           发布: 构建 + 组装 + 验证 + 压成带版本的 zip → artifacts\release\
+#                 (要传参数就直接调 scripts\release.ps1, 见那个文件的头部)
 #   k=check  l=clippy  t=test  f=fmt  fc=fmt-check  ci(=fc+l+t)  clean
 #
 # 部署目标 (默认 %LOCALAPPDATA%\wind-dict, 免管理员; 在 scripts\deploy.local.ps1 覆盖):
@@ -66,7 +72,19 @@ $DeployDirDev     = "$env:LOCALAPPDATA\wind-dict-dev"
 $deployCfg = "$ScriptDir\deploy.local.ps1"
 if (Test-Path $deployCfg) { . $deployCfg }
 
-function Out-For ([string]$profile) { if ($profile -eq "dev") { $BuildDevDir } else { $BuildDir } }
+# ---------- profile 的派生值 ----------
+#
+# release 是基准, dev 只是同一件事的另一个变体: 产物目录、部署目录、自启项名字全由它
+# 派生。这三个判断此前散在 Deploy / Uninstall / Install-Fresh 里各写一遍 —— 加一个变体
+# 要改三处, 而漏掉一处的表现是「部署 dev 却动了 release 的自启项」这类查不清的故障。
+function Out-For      ([string]$profile) { if ($profile -eq "dev") { $BuildDevDir } else { $BuildDir } }
+function DeployDirFor ([string]$profile) { if ($profile -eq "dev") { $DeployDirDev } else { $DeployDirRelease } }
+# 自启项的名字。**必须与 src/autostart.rs 的 VALUE_NAME 一致**: 程序启动时会拿自己算出的
+# 那条命令行去比对同名值, 对不上就就地改写 (repair_if_stale)。两边取的都是「dev 加 d 后缀」
+# 这个约定 —— 那边按 cfg!(debug_assertions) 分, 这边按 profile 分, 结论相同。
+function AutoNameFor  ([string]$profile) { if ($profile -eq "dev") { "wind-dict-dev" } else { "wind-dict" } }
+# 构建这个 profile 该敲哪个命令, 供「产物不存在」时的提示引用。
+function BuildCmdFor  ([string]$profile) { if ($profile -eq "dev") { "db" } else { "b" } }
 
 # ---------- 词库: 下载 ----------
 # 已存在则跳过 (下载是幂等的一次性动作; 删 .cache\src 可强制重下)。
@@ -163,7 +181,7 @@ function Do-GenData {
 #
 # 自带词典 (用户自己放的 MDX) 的目录 —— 不是"词库目录"(那是 exe 同目录的三份 .db)。
 # 与 src/store/userdata.rs 的 data_dir() 必须一致: %LOCALAPPDATA%\wind-dict-data[-dev]\dicts。
-# 这个目录**不在部署目录内**, 故 u/ud 卸载碰不到它 —— 里头是用户自己下载的词典,
+# 这个目录**不在部署目录内**, 故 u/du 卸载碰不到它 —— 里头是用户自己下载的词典,
 # 动辄几百 MB, 卸载程序顺手删掉是不能接受的 (同 ADR-0011)。
 function UserDataDir ([string]$profile) {
     $data = if ($profile -eq "dev") { "wind-dict-data-dev" } else { "wind-dict-data" }
@@ -222,7 +240,7 @@ function Ensure-Dict {
 # ---------- 构建 ----------
 # exe + 词库组装到 build[_dev]\; 内容即部署内容。
 # dev 变体走默认 debug (未优化 + 断言), release 走优化。两者都是 GUI 子系统 (无控制台):
-# dev 构建也会被 pd 部署成常驻程序, 弹黑窗口是产品缺陷不是开发便利。panic 看
+# dev 构建也会被 dp 部署成常驻程序, 弹黑窗口是产品缺陷不是开发便利。panic 看
 # %LOCALAPPDATA%\wind-dict-data-dev\panic.log。
 function Build-App ([string]$profile = "release") {
     $outdir = Out-For $profile
@@ -254,10 +272,15 @@ function Build-App ([string]$profile = "release") {
     return $true
 }
 
-function Do-Run {
-    if (-not (Build-App "dev")) { return $false }
-    Say "`n[run] $BuildDevDir\wind-dict.exe"
-    & "$BuildDevDir\wind-dict.exe"
+# 构建并直接跑 build[_dev]\ 里那个, **不部署**: 不复制到目标目录、不写自启项。
+#
+# 与 i/di 的分工: 这条是「编完看一眼」, 那条是「装上用」。跑的是产物目录里的 exe, 故
+# 用户数据仍按 profile 分 (dev 走 wind-dict-data-dev), 不会污染日常使用的历史与收藏。
+function Do-Run ([string]$profile = "release") {
+    if (-not (Build-App $profile)) { return $false }
+    $exe = "$(Out-For $profile)\wind-dict.exe"
+    Say "`n[run] $exe"
+    & $exe
     return $true
 }
 
@@ -319,7 +342,7 @@ function Test-Wipeable ([string]$dir, [string]$profile) {
 
     # 用户数据必须活得比部署久 (ADR-0011)。部署目录若等于数据目录、或把数据目录套在
     # 自己里头, 清理下去就是把收藏和历史一起删了 —— 这种事只会发生一次, 而那一次没有
-    # 撤销。u/ud 走 Uninstall 时同样该拦, 故这道闸放在两条路都经过的地方。
+    # 撤销。u/du 走 Uninstall 时同样该拦, 故这道闸放在两条路都经过的地方。
     $data = (UserDataDir $profile).TrimEnd('\', '/')
     if ($d -ieq $data -or $data.StartsWith("$d\", [StringComparison]::OrdinalIgnoreCase)) {
         ErrMsg "部署目录套着用户数据目录, 拒绝清理:"
@@ -384,10 +407,10 @@ function Start-App ([string]$dir) {
 
 function Deploy ([string]$profile = "release") {
     $outdir    = Out-For $profile
-    $targetDir = if ($profile -eq "dev") { $DeployDirDev } else { $DeployDirRelease }
-    $autoName  = if ($profile -eq "dev") { "wind-dict-dev" } else { "wind-dict" }
+    $targetDir = DeployDirFor $profile
+    $autoName  = AutoNameFor $profile
     if (-not (Test-Path "$outdir\wind-dict.exe")) {
-        ErrMsg "无 $outdir 产物; 请先 '$(if($profile -eq 'dev'){'d'}else{'1'})' 构建。"; return $false
+        ErrMsg "无 $outdir 产物; 请先 '$(BuildCmdFor $profile)' 构建。"; return $false
     }
     Say "`n========== 部署 ($profile) → $targetDir =========="
     # 先停掉运行中的实例, 让出文件锁 (常驻工具多半开着)。
@@ -408,8 +431,8 @@ function Deploy ([string]$profile = "release") {
 }
 
 function Uninstall ([string]$profile = "release") {
-    $targetDir = if ($profile -eq "dev") { $DeployDirDev } else { $DeployDirRelease }
-    $autoName  = if ($profile -eq "dev") { "wind-dict-dev" } else { "wind-dict" }
+    $targetDir = DeployDirFor $profile
+    $autoName  = AutoNameFor $profile
     Say "`n========== 卸载 ($profile) =========="
     # 拦一道再删: 卸载与全新部署删的是同一个目录, 那条红线 (别把用户数据卷进来)
     # 对两者一样成立。
@@ -425,10 +448,10 @@ function Uninstall ([string]$profile = "release") {
 #
 # 一条命令跑完「构建 → 停实例 → 清空目录 → 装 → 起」, 供改完代码立刻上手试。
 #
-# 与 p/pd 的区别只在**清空**与**启动**这两步。分成两个命令而不是给 Deploy 加开关,
+# 与 p/dp 的区别只在**清空**与**启动**这两步。分成两个命令而不是给 Deploy 加开关,
 # 是因为 p 还有一个正当用法: 目标机上只想换掉 exe 和词库, 不动目录里别的东西。
 function Install-Fresh ([string]$profile = "release") {
-    $targetDir = if ($profile -eq "dev") { $DeployDirDev } else { $DeployDirRelease }
+    $targetDir = DeployDirFor $profile
     Say "`n========== 全新部署 ($profile) → $targetDir =========="
     # 先验目标合法再构建: 构建 release 要几分钟, 让人等完了才说「这个目录我不敢删」
     # 是浪费的。
@@ -475,17 +498,19 @@ function Do-Ci {
 # ---------- 命令分发 ----------
 function Invoke-Command ([string]$cmd) {
     switch ($cmd) {
-        { $_ -in "b", "d" }  { return (Build-App "dev") }
-        { $_ -in "1", "r" }  { return (Build-App "release") }
-        "run"                { return (Do-Run) }
+        # release 在前、dev 在后, 成对排列 —— 命名规则见文件头部。
+        "b"                  { return (Build-App "release") }
+        "db"                 { return (Build-App "dev") }
+        "run"                { return (Do-Run "release") }
+        "drun"               { return (Do-Run "dev") }
+        "p"                  { return (Deploy "release") }
+        "dp"                 { return (Deploy "dev") }
+        "i"                  { return (Install-Fresh "release") }
+        "di"                 { return (Install-Fresh "dev") }
+        "u"                  { return (Uninstall "release") }
+        "du"                 { return (Uninstall "dev") }
         "gd"                 { return (Do-GenData) }
         "gm"                 { return (Do-GetMdx) }
-        "p"                  { return (Deploy "release") }
-        "pd"                 { return (Deploy "dev") }
-        "i"                  { return (Install-Fresh "release") }
-        "id"                 { return (Install-Fresh "dev") }
-        "u"                  { return (Uninstall "release") }
-        "ud"                 { return (Uninstall "dev") }
         { $_ -in "rel", "release" } { return (Do-Release) }
         { $_ -in "k", "check" }     { Do-Check;    return $true }
         { $_ -in "l", "clippy" }    { Do-Clippy;   return $true }
@@ -501,19 +526,20 @@ function Invoke-Command ([string]$cmd) {
 function Show-Menu {
     Write-Host ""
     Say "===== wind-dict 开发菜单 ====="
-    Write-Host "  构建/运行:"
-    Write-Host "    b   Dev 构建 → build_dev/       1   Release 构建 → build/"
-    Write-Host "    run Dev 构建并运行              gd  生成词库 (下载 + 构建 .db)"
-    Write-Host "    gm  下载示例 MDX (自带词典手动测试用)"
-    Write-Host "  部署:"
-    Write-Host "    p   部署 release (覆盖)        pd  部署 dev (覆盖)"
-    Write-Host "    i   全新部署+启动 release       id  全新部署+启动 dev"
-    Write-Host "    u   卸载 release                ud  卸载 dev"
-    Write-Host "  发布:"
-    Write-Host "    rel 打成带版本的 zip → artifacts\release\ (构建+验证+压包)"
-    Write-Host "  质量:"
-    Write-Host "    k check   l clippy   t test   f fmt   fc fmt-check   ci   clean"
-    Write-Host "    q 退出"
+    Gray "  release 是基准; dev 在同一个命令前面加一个 d"
+    Write-Host ""
+    Write-Host "              release          dev"
+    Write-Host "  构建        b                db        → build\ / build_dev\"
+    Write-Host "  运行        run              drun      构建并直接跑, 不部署"
+    Write-Host "  部署        p                dp        覆盖式"
+    Write-Host "              i                di        全新部署并启动"
+    Write-Host "  卸载        u                du        用户数据不动"
+    Write-Host ""
+    Write-Host "  数据      gd  生成词库 (下载源 + 构建 .db)"
+    Write-Host "            gm  下载示例 MDX (自带词典手动测试用)"
+    Write-Host "  发布      rel 打成带版本的 zip → artifacts\release\ (构建+验证+压包)"
+    Write-Host "  质量      k check   l clippy   t test   f fmt   fc fmt-check   ci   clean"
+    Write-Host "            q 退出"
     Write-Host ""
     $sel = Read-Host "请选择"
     return $sel
