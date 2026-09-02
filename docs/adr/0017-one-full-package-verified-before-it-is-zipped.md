@@ -54,7 +54,7 @@
 
 ## 示例词典进包，但装不进去
 
-包里带一本 `dicts-example\ecdict-headless.mdx`，让「自带词典」这条路开箱可试。
+包里带一本 `dicts-example\ecdict-headless.mdx`，让「用户词典」这条路开箱可试。
 
 但它**不能由安装这一步放到位**：词典目录在 `%LOCALAPPDATA%\wind-dict-data\dicts\`，
 在部署目录之外（ADR-0011、ADR-0015），而一个 zip 只能往自己解压的地方写。这个不对称

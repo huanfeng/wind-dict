@@ -24,7 +24,7 @@
 # ── 与 release/dev 无关的 ────────────────────────────────────────────────────
 #
 #   gd            生成词库: 下载源 + 构建 ecdict.db / cedict.db / unihan.db → .cache\dict\
-#   gm            下载一本示例 MDX (~70MB), 供手动测试「自带词典」; 部署时自动装进词典目录
+#   gm            下载一本示例 MDX (~70MB), 供手动测试「用户词典」; 部署时自动装进词典目录
 #   rel           发布: 构建 + 组装 + 验证 + 压成带版本的 zip → artifacts\release\
 #                 (要传参数就直接调 scripts\release.ps1, 见那个文件的头部)
 #   k=check  l=clippy  t=test  f=fmt  fc=fmt-check  ci(=fc+l+t)  clean
@@ -52,11 +52,11 @@ $UnihanUrl = "https://www.unicode.org/Public/UCD/latest/ucd/Unihan.zip"
 # 该字表属《著作权法》第五条所指行政性质文件, 不适用著作权法, 故可自由使用。
 $TghzBase = "https://raw.githubusercontent.com/shengdoushi/common-standard-chinese-characters-table/master"
 
-# 示例自带词典 (MDX)。用于手动测试"把词典丢进目录就能查"这条路, 不随产品分发。
+# 示例用户词典 (MDX)。用于手动测试"把词典丢进目录就能查"这条路, 不随产品分发。
 #
 # 取 ECDICT 自己发布的 MDX 而非别的: 它是本仓库唯一能自动下载的、授权明确 (MIT/CC)
 # 的 MDX。选 headless (无音标) 版是刻意的 —— 它与随程序分发的 ecdict.db 内容同源,
-# 若取带音标的版本, 两者显示出来几乎一模一样, 反而看不出自带词典那一段是不是真的
+# 若取带音标的版本, 两者显示出来几乎一模一样, 反而看不出用户词典那一段是不是真的
 # 走通了; 无音标版一眼能分辨。
 $ExampleMdxUrl = "https://github.com/skywind3000/ECDICT/releases/download/1.0.28/ecdict-mdx-headless-28.zip"
 
@@ -177,9 +177,9 @@ function Do-GenData {
     return $true
 }
 
-# ---------- 自带词典目录 ----------
+# ---------- 用户词典目录 ----------
 #
-# 自带词典 (用户自己放的 MDX) 的目录 —— 不是"词库目录"(那是 exe 同目录的三份 .db)。
+# 用户词典 (用户自己放的 MDX) 的目录 —— 不是"词库目录"(那是 exe 同目录的三份 .db)。
 # 与 src/store/userdata.rs 的 data_dir() 必须一致: %LOCALAPPDATA%\wind-dict-data[-dev]\dicts。
 # 这个目录**不在部署目录内**, 故 u/du 卸载碰不到它 —— 里头是用户自己下载的词典,
 # 动辄几百 MB, 卸载程序顺手删掉是不能接受的 (同 ADR-0011)。
@@ -424,7 +424,7 @@ function Deploy ([string]$profile = "release") {
         Gray "  - $f"
     }
     Set-AutoStart $targetDir $autoName
-    # 自带词典不进部署目录: 它属于用户数据那一侧, 卸载不该删 (见 Dict-Dir)。
+    # 用户词典不进部署目录: 它属于用户数据那一侧, 卸载不该删 (见 Dict-Dir)。
     Install-ExampleMdx $profile
     Say "`n部署完成. 启动: $targetDir\wind-dict.exe"
     return $true
@@ -440,7 +440,7 @@ function Uninstall ([string]$profile = "release") {
     if (-not (Stop-App $targetDir)) { return $false }
     Remove-AutoStart $autoName
     if (-not (Clear-DeployDir $targetDir)) { return $false }
-    Say "`n卸载完成. 用户数据 (收藏/历史/自带词典) 仍在 $(UserDataDir $profile)"
+    Say "`n卸载完成. 用户数据 (收藏/历史/用户词典) 仍在 $(UserDataDir $profile)"
     return $true
 }
 
@@ -536,7 +536,7 @@ function Show-Menu {
     Write-Host "  卸载        u                du        用户数据不动"
     Write-Host ""
     Write-Host "  数据      gd  生成词库 (下载源 + 构建 .db)"
-    Write-Host "            gm  下载示例 MDX (自带词典手动测试用)"
+    Write-Host "            gm  下载示例 MDX (用户词典手动测试用)"
     Write-Host "  发布      rel 打成带版本的 zip → artifacts\release\ (构建+验证+压包)"
     Write-Host "  质量      k check   l clippy   t test   f fmt   fc fmt-check   ci   clean"
     Write-Host "            q 退出"

@@ -60,7 +60,7 @@ struct CodeInfo {
 pub struct CodeTable {
     key: String,
     base_name: String,
-    /// 用户改的名字（`Settings::dict_names`）。与自带词典同一套机制。
+    /// 用户改的名字（`Settings::dict_names`）。与用户词典同一套机制。
     alias: Option<String>,
     font_family: Option<String>,
     /// 查词组时要不要逐字列出（`Settings::code_multi_char`）。
@@ -136,7 +136,7 @@ impl CodeTable {
         self.multi_char = on;
     }
 
-    /// 改名。空名字 = 恢复默认，与自带词典同一套语义。
+    /// 改名。空名字 = 恢复默认，与用户词典同一套语义。
     pub fn set_alias(&mut self, alias: Option<&str>) {
         self.alias = alias.filter(|s| !s.trim().is_empty()).map(str::to_string);
     }

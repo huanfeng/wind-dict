@@ -1,4 +1,4 @@
-//! 自带词典：用户自己放进来的 MDX。
+//! 用户词典：用户自己放进来的 MDX。
 //!
 //! 与离线词典的关系是**并列**，不是补充也不是兜底：两者都实现
 //! [`Dictionary`]，同一个查询会问遍所有词典，各自的结果并排呈现。这与 ADR-0002
@@ -7,7 +7,7 @@
 //!
 //! ## 为什么不参与补全
 //!
-//! [`crate::domain::Wordlist`] 只由离线词典实现，自带词典**刻意不接**。
+//! [`crate::domain::Wordlist`] 只由离线词典实现，用户词典**刻意不接**。
 //!
 //! 补全是按词频排序的（ECDICT 的 `frq`），而 MDX 不带任何词频信号。把它的词混进
 //! 候选列表，只能追加在末尾或按字典序插入——前者用户看不见，后者会把「打 `app`
@@ -99,7 +99,7 @@ fn display_name(path: &Path, mdx: &Mdx) -> String {
     }
     path.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "自带词典".to_string())
+        .unwrap_or_else(|| "用户词典".to_string())
 }
 
 /// 打开一次并试查，确认这个文件真能用作词典。
@@ -240,7 +240,7 @@ impl Dictionary for UserDictionary {
         }
         Ok(Lookup::Found {
             entries,
-            // 自带词典没有词形变化数据，落不到原形上，故恒为 false。
+            // 用户词典没有词形变化数据，落不到原形上，故恒为 false。
             via_base_form: false,
         })
     }
@@ -265,13 +265,13 @@ mod tests {
         };
         assert_eq!(entries.len(), 1);
         let Entry::User(u) = &entries[0] else {
-            panic!("自带词典只产出 Entry::User");
+            panic!("用户词典只产出 Entry::User");
         };
         assert_eq!(u.headword.as_str(), "zebra");
         assert_eq!(u.source, "wind-dict 测试样本", "出处必须带上");
         assert_eq!(u.body.len(), 2, "两个列表项各成一段");
         assert_eq!(u.body[0].plain(), "striped animal");
-        // 词典内部跳转要留住，它是自带词典唯一的导航手段。
+        // 词典内部跳转要留住，它是用户词典唯一的导航手段。
         assert!(
             u.body[1]
                 .runs

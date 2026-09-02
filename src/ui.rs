@@ -149,7 +149,7 @@ enum TabKey {
     /// 全部来源。
     All,
     /// 某一个来源，值是它的**稳定键**：内置词库是 `offline::ECDICT_KEY` /
-    /// `CEDICT_KEY`，自带词典是文件名，码表是方案 id。
+    /// `CEDICT_KEY`，用户词典是文件名，码表是方案 id。
     ///
     /// 三类来源共用一个变体而不是各占一个：用户眼里它们都是「一本词典」，页签要筛的
     /// 也只是「这条出自哪一本」。分三个变体的话，每加一类来源就要在筛选、排序、页签
@@ -180,7 +180,7 @@ impl TabSpec {
 
 /// 按页签筛出要显示的卡片。
 ///
-/// **逐条筛，不是整张卡片筛**：一个词头下面常常同时挂着内置词库与自带词典的词条
+/// **逐条筛，不是整张卡片筛**：一个词头下面常常同时挂着内置词库与用户词典的词条
 /// （查 hello 就是），整张留下等于点进「简明英汉字典」还看得见另一本的内容——那样
 /// 页签名就是在撒谎；整张丢掉则那个词头会从它确实收录的那一页里消失。
 ///
@@ -199,7 +199,7 @@ fn filter_cards(all: Vec<Card>, key: &TabKey) -> Vec<Card> {
 ///
 /// 内置那两份靠**词条的类型**认：`Entry::English` 只可能来自 ECDICT，
 /// `Entry::Chinese` 只可能来自 CC-CEDICT——这不是猜，是 `OfflineDictionary::lookup`
-/// 按方向选路的直接结果。自带词典靠**稳定键**认，不能靠显示名：名字可以被用户改、
+/// 按方向选路的直接结果。用户词典靠**稳定键**认，不能靠显示名：名字可以被用户改、
 /// 也可能撞车（两个文件的 MDX 标题一模一样是常有的事）。
 fn entry_in_tab(e: &Entry, key: &TabKey) -> bool {
     match key {
@@ -241,7 +241,7 @@ fn move_key(keys: &mut Vec<String>, from: usize, to: usize) -> bool {
 ///
 /// 内置那两份靠**词条类型**认：`Entry::English` 只可能来自 ECDICT，`Entry::Chinese`
 /// 只可能来自 CC-CEDICT——这不是猜，是 `OfflineDictionary::lookup` 按方向选路的直接
-/// 结果。自带词典与码表各自带着自己的键。
+/// 结果。用户词典与码表各自带着自己的键。
 fn entry_source_key(e: &Entry) -> &str {
     use crate::source::offline::{CEDICT_KEY, ECDICT_KEY};
     match e {
@@ -1029,7 +1029,7 @@ fn write_note(text: Signal<String>, tone: Signal<Role>, role: Role, s: impl Into
 /// 界面状态。
 struct State {
     dict: Rc<OfflineDictionary>,
-    /// 自带词典：用户放进来的 MDX，按设置里的顺序依次问过去。
+    /// 用户词典：用户放进来的 MDX，按设置里的顺序依次问过去。
     ///
     /// 只装**打开成功**的那些。设置页列的是 `Settings::user_dicts` 里的路径，两者
     /// 对不上的即为「当前打不开」——文件被移走、被换成不支持的格式，都归这一类。
@@ -1069,10 +1069,17 @@ struct State {
     tabs: RefCell<Vec<TabSpec>>,
     /// 已装的码表方案（由字查编码与拆分）。
     ///
-    /// 与自带词典分开存而不是塞进同一个 `Vec<Box<dyn Dictionary>>`：两者的**来源**
-    /// 不同——自带词典是用户丢进词典目录的文件，码表是从清风输入法那边探测来的方案，
+    /// 与用户词典分开存而不是塞进同一个 `Vec<Box<dyn Dictionary>>`：两者的**来源**
+    /// 不同——用户词典是用户丢进词典目录的文件，码表是从清风输入法那边探测来的方案，
     /// 各有各的目录、开关与失败方式，设置页也分两处列。
     code_tables: RefCell<Vec<CodeTable>>,
+    /// 正在「设置」哪一本词典（稳定键）。`None` = 对话框没开。
+    ///
+    /// 与 `dict_dialog` 分开存：显隐是给 windui 的遮罩看的信号，而「哪一本」是内容，
+    /// 关掉对话框之后它要跟着清空，否则下次开会闪一下上一本的名字。
+    dict_editing: RefCell<Option<String>>,
+    /// 词典设置对话框的显隐。
+    dict_dialog: Signal<bool>,
     /// 设置页停在哪一类（[`SETTINGS_TABS`] 的下标）。
     ///
     /// 不落库：它是「我此刻在看哪一页」，不是配置。下次打开设置从第一类开始，与用户
@@ -1471,7 +1478,7 @@ impl State {
         //
         // 这不违反 ADR-0002 的「绝不自动兜底」：那条挡的是**跨类**降级（词典未命中就
         // 静默发网络请求给译源），因为二者可信度与隐私代价都不同。这里全是词典，
-        // 没有落差需要用户知情，而每条自带词典的词条都带着出处（`UserEntry::source`）。
+        // 没有落差需要用户知情，而每条用户词典的词条都带着出处（`UserEntry::source`）。
         let mut entries = Vec::new();
         let mut via_base_form = false;
         let mut err = None;
@@ -1486,9 +1493,9 @@ impl State {
                 via_base_form = v;
             }
         }
-        // 顺序即优先级：随程序分发的词典在前。它是我们挑过的，自带词典的来源与质量
+        // 顺序即优先级：随程序分发的词典在前。它是我们挑过的，用户词典的来源与质量
         // 我们一无所知，把后者顶到前面等于替用户做了一个我们没有依据做的判断。
-        let builtin_len = entries.len();
+        // （用户可以在设置里改这个顺序，见 `ordered_sources`。）
 
         let mut broken: Vec<String> = Vec::new();
         for d in self.user_dicts.borrow().iter() {
@@ -1501,7 +1508,7 @@ impl State {
             }
         }
         if !broken.is_empty() {
-            self.note_err(format!("自带词典读取失败：{}", broken.join("、")));
+            self.note_err(format!("用户词典读取失败：{}", broken.join("、")));
         }
 
         // 码表排在最后：它回答的是「这个词怎么打」，而不是「这个词什么意思」。查词的人
@@ -1512,15 +1519,33 @@ impl State {
             }
         }
 
-        // 记历史用的词头**在排序前取**：`builtin_len` 是个下标，排序会打乱它。这批词头
-        // 只该来自内置词库——自带词典的词头常有大小写与标点变体（`Full-House` 与
-        // `fullhouse`，见 ADR-0015），全记下来会在历史里留下几行只差标点的记录。
-        // 内置一条也没命中时退回全部：那时这个词只有自带词典收录，不记的话它永远进不了
-        // 历史——原来的分支语义如此，排序不该顺手改掉它。
-        let record_words = if builtin_len > 0 {
-            headwords_to_record(&entries[..builtin_len])
-        } else {
-            headwords_to_record(&entries)
+        // 关掉的来源不进结果。
+        //
+        // 内置那两份是**查完再滤**：`OfflineDictionary::lookup` 内部按方向选路，拆不出
+        // 「只查汉英」这一半；而一次查询几十毫秒，不值得为一个开关去改存储层的接口。
+        // 用户词典与码表则是压根不装载（见 `reload_*`），这里滤到的只有内置那两份。
+        {
+            let disabled = self.settings.borrow().disabled_dicts.clone();
+            entries.retain(|e| !disabled.iter().any(|k| k == entry_source_key(e)));
+        }
+
+        // 记历史用的词头**在排序前取**，且只取内置词库那些：用户词典的词头常有大小写与
+        // 标点变体（`Full-House` 与 `fullhouse`，见 ADR-0015），全记下来会在历史里留下
+        // 几行只差标点的记录。按**来源**挑而不是按下标切——过滤与排序都会动那个下标。
+        //
+        // 内置一条也没命中时退回全部：那时这个词只有用户词典或码表收录，不记的话它永远
+        // 进不了历史。
+        let record_words = {
+            let builtin: Vec<Entry> = entries
+                .iter()
+                .filter(|e| matches!(e, Entry::English(_) | Entry::Chinese(_)))
+                .cloned()
+                .collect();
+            if builtin.is_empty() {
+                headwords_to_record(&entries)
+            } else {
+                headwords_to_record(&builtin)
+            }
         };
         // 词条按用户配置的词典顺序排。放在最后：上面那几段是「谁查到了什么」，这一步
         // 才是「按什么次序给用户看」。
@@ -1543,7 +1568,7 @@ impl State {
             String::new()
         });
         if record {
-            // 只记随程序分发的词典给出的词头；它一无所获时才退而记自带词典的。
+            // 只记随程序分发的词典给出的词头；它一无所获时才退而记用户词典的。
             //
             // 不合起来记：MDX 的词头按归一化后的形式重名（查 `fullhouse` 会同时命中
             // `Full-House` 与 `fullhouse`，见 ADR-0015），全记下来会让一次查询在历史里
@@ -1942,7 +1967,7 @@ impl State {
     /// 换词典目录。`None` = 恢复默认。
     ///
     /// 与换词库路径（`set_dict_path`）不同，这个**当场生效**不用重启：那两个库的
-    /// 连接在 `main` 里打开后就交给了界面，而自带词典由 `State` 自己持有。
+    /// 连接在 `main` 里打开后就交给了界面，而用户词典由 `State` 自己持有。
     fn set_user_dict_dir(&self, dir: Option<std::path::PathBuf>) {
         self.settings.borrow_mut().user_dict_dir = dir;
         if self.save_settings() {
@@ -1982,11 +2007,15 @@ impl State {
         true
     }
 
-    /// 开关单个码表方案。键是方案 id，与自带词典共用 `disabled_dicts`。
+    /// 开关任意一个来源。键是稳定键：内置词库是 `ecdict`/`cedict`，用户词典是文件名，
+    /// 码表是方案 id。
     ///
-    /// **不触发设置页重建**：与 `toggle_user_dict` 同一条理由——这一条是从 widget 的
-    /// `on_update` 里调进来的，重建会把调用者所在的子树连同它读的信号一起回收。
-    fn toggle_code_table(&self, key: &str, on: bool) -> bool {
+    /// 三类来源共用一张 `disabled_dicts`，也共用这一个入口——它们在「要不要查这一本」
+    /// 这件事上没有区别，而分三个方法写就意味着三处各自维护同一条语义。
+    ///
+    /// **不触发设置页重建**：这一条是从 widget 的 `on_update` 里调进来的，重建会把
+    /// 调用者所在的子树连同它读的信号一起回收。开关本身已经把状态画出来了。
+    fn toggle_source(&self, key: &str, on: bool) -> bool {
         {
             let mut s = self.settings.borrow_mut();
             s.disabled_dicts.retain(|x| x != key);
@@ -1997,9 +2026,25 @@ impl State {
         if !self.save_settings() {
             return false;
         }
+        // 用户词典与码表是「关掉就不装载」，内置那两份则是查完再滤（见 `lookup`）——
+        // 后者没有可重扫的东西，这里一并重扫也不会多做什么。
+        self.reload_user_dicts();
         self.reload_code_tables();
         self.rebuild_tabs();
         true
+    }
+
+    /// 打开某本词典的设置对话框。
+    fn open_dict_dialog(&self, key: &str) {
+        *self.dict_editing.borrow_mut() = Some(key.to_string());
+        self.dict_dialog.set(true);
+        self.bump_settings();
+    }
+
+    fn close_dict_dialog(&self) {
+        self.dict_dialog.set(false);
+        *self.dict_editing.borrow_mut() = None;
+        self.bump_settings();
     }
 
     /// 手动添加一处方案目录。
@@ -2046,26 +2091,6 @@ impl State {
         }
     }
 
-    /// 开关一本自带词典。`file` 是文件名，见 `Settings::disabled_dicts`。返回是否落实。
-    ///
-    /// **不触发设置页重建**：这一条是从 widget 的 `on_update` 里调进来的，而重建会把
-    /// 调用者所在的那棵子树连同它读的信号一起回收。开关本身已经把状态画出来了，
-    /// 那一行的其余文字（词典名、词条数）描述的是这个文件，与开关与否无关。
-    fn toggle_user_dict(&self, file: &str, on: bool) -> bool {
-        {
-            let mut s = self.settings.borrow_mut();
-            s.disabled_dicts.retain(|x| x != file);
-            if !on {
-                s.disabled_dicts.push(file.to_string());
-            }
-        }
-        if !self.save_settings() {
-            return false;
-        }
-        self.reload_user_dicts();
-        true
-    }
-
     /// 重扫词典目录并打开启用的那些。
     ///
     /// 整个重来而不是增量增删：目录才是唯一的真相——用户可能在程序开着的时候往里
@@ -2103,7 +2128,7 @@ impl State {
                 if !seen.insert(sc.key.clone()) || disabled.contains(&sc.key) {
                     continue;
                 }
-                // 一份表读坏了只是少一个页签，不该拖垮别的方案——与自带词典同一条纪律。
+                // 一份表读坏了只是少一个页签，不该拖垮别的方案——与用户词典同一条纪律。
                 if let Ok(mut t) = CodeTable::load(&sc) {
                     t.set_multi_char(multi);
                     out.push(t);
@@ -2432,9 +2457,160 @@ impl State {
             .unwrap_or(TabKey::All)
     }
 
+    /// 此刻**真正在用**的词库目录。
+    ///
+    /// 与设置里写着的那个可能不同：设置的目录失效时 `main` 会回退到程序同目录，否则
+    /// 用户会被锁在启动失败里。这里跟 `main::resolve_dict_dir` 走同一套判断。
+    fn dict_dir_in_use(&self) -> std::path::PathBuf {
+        use crate::source::offline;
+        match &self.settings.borrow().dict_dir {
+            Some(d) if offline::check_dir(d).usable() => d.clone(),
+            _ => offline::exe_dir(),
+        }
+    }
+
+    /// 某个来源的默认名（没改过时显示的那个）。
+    fn default_name_of(&self, key: &str) -> String {
+        use crate::source::offline::{CEDICT_KEY, CEDICT_NAME, ECDICT_KEY, ECDICT_NAME};
+        if key == ECDICT_KEY {
+            return ECDICT_NAME.to_string();
+        }
+        if key == CEDICT_KEY {
+            return CEDICT_NAME.to_string();
+        }
+        // 用户词典的默认名是 MDX 自己的标题, 码表的是方案名——都要现开一次才知道。
+        // 拿不到就退回键本身（文件名/方案 id），那至少是个认得出的东西。
+        if let Some(dir) = self.user_dict_dir() {
+            for f in crate::source::user::scan(&dir) {
+                if crate::source::user::key_of(&f) == key {
+                    if let Ok(d) = crate::source::user::probe(&f) {
+                        return d.name().to_string();
+                    }
+                }
+            }
+        }
+        for sc in self.discover_schemas() {
+            if sc.key == key {
+                return sc.name;
+            }
+        }
+        key.to_string()
+    }
+
+    /// 扫得到的全部码表方案（含被关掉的）。
+    fn discover_schemas(&self) -> Vec<crate::source::codetable::SchemaRef> {
+        if !self.settings.borrow().codetables {
+            return Vec::new();
+        }
+        let mut dirs: Vec<std::path::PathBuf> = crate::source::windinput::schema_dirs()
+            .into_iter()
+            .map(|d| d.path)
+            .collect();
+        dirs.extend(self.settings.borrow().codetable_dirs.iter().cloned());
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for dir in &dirs {
+            for sc in crate::source::codetable::discover(dir) {
+                if seen.insert(sc.key.clone()) {
+                    out.push(sc);
+                }
+            }
+        }
+        out
+    }
+
+    /// 设置页要列的全部来源，按用户配置的顺序。
+    ///
+    /// 与 [`Self::ordered_sources`] 分开：这里要**逐本打开**去拿词条数（一本约 3 ms），
+    /// 而那个每次重建页签都会调。关掉的也列出来、也打开——不打开就只剩一个文件名，
+    /// 而用户此刻要判断的正是「这本是不是我想开的那本」。
+    fn sources_for_settings(&self) -> Vec<SourceRow> {
+        use crate::source::offline::{
+            CEDICT_FILE, CEDICT_KEY, CEDICT_NAME, ECDICT_FILE, ECDICT_KEY, ECDICT_NAME,
+        };
+        let (disabled, names) = {
+            let s = self.settings.borrow();
+            (s.disabled_dicts.clone(), s.dict_names.clone())
+        };
+        let named = |key: &str, default: &str| -> String {
+            names
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| default.to_string())
+        };
+        let is_on = |key: &str| !disabled.iter().any(|k| k == key);
+
+        let status = crate::source::offline::check_dir(&self.dict_dir_in_use());
+        let size_or_err = |r: &Result<u64, String>, file: &str| match r {
+            Ok(n) => format!("{file} · {}", mb(*n)),
+            Err(e) => format!("{file} · 打不开：{e}"),
+        };
+        let mut v = vec![
+            SourceRow {
+                key: ECDICT_KEY.to_string(),
+                name: named(ECDICT_KEY, ECDICT_NAME),
+                kind: "内置 · 英汉",
+                detail: size_or_err(&status.ecdict, ECDICT_FILE),
+                on: is_on(ECDICT_KEY),
+            },
+            SourceRow {
+                key: CEDICT_KEY.to_string(),
+                name: named(CEDICT_KEY, CEDICT_NAME),
+                kind: "内置 · 汉英",
+                detail: size_or_err(&status.cedict, CEDICT_FILE),
+                on: is_on(CEDICT_KEY),
+            },
+        ];
+        if let Some(dir) = self.user_dict_dir() {
+            for f in crate::source::user::scan(&dir) {
+                let key = crate::source::user::key_of(&f);
+                let (name, detail) = match crate::source::user::probe(&f) {
+                    Ok(d) => (
+                        d.name().to_string(),
+                        format!("{key} · {} 词条", thousands(d.entry_count())),
+                    ),
+                    // 打不开必须**说出原因**：否则用户只看到一个拨不动的开关，无从判断
+                    // 是文件坏了，还是我们不支持它用的压缩方式。
+                    Err(e) => (key.clone(), format!("{key} · 打不开：{e:#}")),
+                };
+                v.push(SourceRow {
+                    key: key.clone(),
+                    name: named(&key, &name),
+                    kind: "用户词典",
+                    detail,
+                    on: is_on(&key),
+                });
+            }
+        }
+        for sc in self.discover_schemas() {
+            let detail = match self
+                .code_tables
+                .borrow()
+                .iter()
+                .find(|t| t.key() == sc.key)
+                .map(|t| t.len())
+            {
+                Some(n) => format!("{} · {n} 字", sc.key),
+                // 关掉的方案不装载, 故没有字数可报。不去为了显示一个数把它读进内存。
+                None => format!("{} · 已关闭", sc.key),
+            };
+            v.push(SourceRow {
+                key: sc.key.clone(),
+                name: named(&sc.key, &sc.name),
+                kind: "码表",
+                detail,
+                on: is_on(&sc.key),
+            });
+        }
+        let order = self.settings.borrow().dict_order.clone();
+        v.sort_by_key(|r| order_pos(&order, &r.key));
+        v
+    }
+
     /// 所有来源，**按用户配置的顺序**。返回 `(稳定键, 显示名, 类型说明)`。
     ///
-    /// 一份统一的名单：内置词库、自带词典、码表方案都在里面。页签、结果区的词条次序、
+    /// 一份统一的名单：内置词库、用户词典、码表方案都在里面。页签、结果区的词条次序、
     /// 设置页那个可拖的列表，三处读的都是它——否则「顺序」这件事就会有三份各自为政的
     /// 实现，而用户以为自己只排了一次。
     fn ordered_sources(&self) -> Vec<(String, String, &'static str)> {
@@ -2455,7 +2631,7 @@ impl State {
             ]
         };
         for d in self.user_dicts.borrow().iter() {
-            v.push((d.key().to_string(), d.name().to_string(), "自带词典"));
+            v.push((d.key().to_string(), d.name().to_string(), "用户词典"));
         }
         for t in self.code_tables.borrow().iter() {
             v.push((t.key().to_string(), t.name().to_string(), "码表"));
@@ -2710,6 +2886,8 @@ pub fn build(
         tray,
         dict_tab: signal(DICT_ALL),
         tabs: RefCell::new(Vec::new()),
+        dict_editing: RefCell::new(None),
+        dict_dialog: signal(false),
         settings_tab: signal(0),
         tabs_rev: signal(vec![0]),
         sel_scope: SelectionScope::new(),
@@ -2954,7 +3132,7 @@ fn brand() -> Element {
             crate::icon::app(20),
         )
         .child(
-            Element::label(crate::APP_TITLE)
+            Element::label(crate::app_title())
                 .font_size(12.5)
                 .font_weight(600)
                 .fg_role(Role::Text),
@@ -3518,6 +3696,14 @@ fn settings_nav(st: Rc<State>) -> Element {
 /// 设置页正文。每次 `settings_rev` 变动整体重建，故其中的构建时求值（选中环、
 /// 词库路径）总是新鲜的。
 fn settings_body(st: Rc<State>) -> Element {
+    // 对话框叠在整页之上：`Element::dialog` 是全窗遮罩，放进右侧滚动区里会被裁掉。
+    Element::stack()
+        .fill()
+        .child(settings_main(st.clone()))
+        .child(dict_dialog_el(st))
+}
+
+fn settings_main(st: Rc<State>) -> Element {
     Element::row()
         .width_match()
         .height_match()
@@ -3544,24 +3730,26 @@ fn settings_pane(st: Rc<State>) -> Element {
         .padding_xy(40, 26)
         .spacing(28);
     inner = match st.settings_tab.get() {
+        // 启动在前、热键在后：开机自启是「装好之后设一次」，热键是「用着用着想换」，
+        // 前者在时间上先发生。快捷键一览沉到本类最后——它是说明书，读一次就记住了。
         0 => inner
-            .child(group("唤起", hotkey_row(st.clone())))
-            .child(group("启动", autostart_row(st))),
+            .child(group("启动", autostart_row(st.clone())))
+            .child(group("唤起", hotkey_row(st)))
+            .child(group("快捷键", shortcut_rows())),
         1 => inner
             .child(group("外观", appearance_group(st.clone())))
             .child(group("布局", pane_w_row(st))),
+        // 先列「装了哪些」，再列「从哪儿读」。前者是天天要看的，后者装好之后基本不动。
         2 => inner
-            .child(group("词典顺序", dict_order_rows(st.clone())))
-            .child(group("词库", dict_rows(st.clone())))
-            .child(group("自带词典", user_dict_rows(st.clone())))
+            .child(dict_list_rows(st.clone()))
+            .child(group("词库目录", dict_rows(st.clone())))
+            .child(group("用户词典目录", user_dict_rows(st.clone())))
             .child(group("码表反查", codetable_rows(st.clone())))
             .child(group("释义显示", expand_en_row(st))),
         3 => inner.child(group("数据", data_rows(st))),
-        // 快捷键一览是**说明书**，不是设置——读一次就记住了，故与「关于」同处最后一类，
-        // 不占前面几类的位置。
-        _ => inner
-            .child(group("快捷键", shortcut_rows()))
-            .child(group("关于", about_rows())),
+        // 「关于」就只是关于：版本、项目地址、许可。快捷键一览挪去了「常规」——那是
+        // 一份操作说明，和「这个软件是什么」不是一回事。
+        _ => inner.child(group("关于", about_rows())),
     };
     // 内容居中：右侧比 620 宽出来的部分两边匀开，不靠着分类列那一边贴边。
     Element::col()
@@ -3598,7 +3786,23 @@ fn data_rows(st: Rc<State>) -> Element {
     } else {
         format!("已记录 {hist} 条")
     };
+    // 配置与数据在同一个目录里（`userdata.db` 一个文件装下设置、历史、收藏），故这一行
+    // 既是「配置在哪」也是「数据在哪」。给「打开」而不只是显示路径：用户来这一栏多半是
+    // 想备份或者拷走它，光看见一行字还得自己去粘贴。
+    let data_dir = crate::store::userdata::data_dir();
+    let dir_row = match &data_dir {
+        Ok(d) => {
+            let d2 = d.clone();
+            row(
+                "配置与数据目录",
+                Some(&d.display().to_string()),
+                Element::button("打开").on_click(move |_| reveal(&d2)),
+            )
+        }
+        Err(e) => row("配置与数据目录", Some(e), Element::col()),
+    };
     card(vec![
+        dir_row,
         row("历史记录", Some(&sub), clear_btn),
         row(
             "收藏",
@@ -3617,7 +3821,7 @@ fn data_rows(st: Rc<State>) -> Element {
 /// **建托盘时与改热键时共用这一处**：两边各写一句 `format!` 的话，用户改一次热键，
 /// 提示的措辞就会跟着变一次——而那两句本该是同一句话的不同时刻。
 pub fn tray_tip(hotkey: &crate::settings::HotkeySpec) -> String {
-    format!("{} — {hotkey} 查询", crate::APP_TITLE)
+    format!("{} — {hotkey} 查询", crate::app_title())
 }
 
 /// 项目主页。关于页与包内 README 都指这里。
@@ -3631,7 +3835,7 @@ const REPO_URL: &str = "https://github.com/huanfeng/wind-dict";
 fn about_rows() -> Element {
     card(vec![
         row(
-            crate::APP_TITLE,
+            crate::app_title(),
             Some(&format!("版本 {}", env!("CARGO_PKG_VERSION"))),
             Element::col(),
         ),
@@ -3655,7 +3859,7 @@ fn about_rows() -> Element {
 /// 与 `reveal` 同一条路子。
 ///
 /// 只喂常量（[`REPO_URL`]）。这个函数**不接受**任何来自词典内容或用户输入的字符串——
-/// 自带词典的正文里就有链接，把它们直接递给 shell 是另一回事，要先有白名单。
+/// 用户词典的正文里就有链接，把它们直接递给 shell 是另一回事，要先有白名单。
 fn open_url(url: &str) {
     let _ = std::process::Command::new("explorer").arg(url).spawn();
 }
@@ -4015,33 +4219,243 @@ fn expand_en_row(st: Rc<State>) -> Element {
     )
 }
 
-/// 词典顺序：一份可拖的名单，内置词库、自带词典、码表方案都在里面。
+/// 一个来源在设置页里要显示的全部信息。
+struct SourceRow {
+    key: String,
+    name: String,
+    /// 类别：「内置 · 英汉」「用户词典」「码表」。
+    kind: &'static str,
+    /// 一行说明：文件名、大小或词条数，打不开时是原因。
+    detail: String,
+    on: bool,
+}
+
+/// 词典列表：**一处看全，一处调全**。
 ///
-/// 分三处各排各的等于让用户在三个地方拼出一个顺序，而他心里只有一份「先看哪本」。
-fn dict_order_rows(st: Rc<State>) -> Element {
-    let items = st.ordered_sources();
-    if items.len() < 2 {
+/// 顺序（拖拽）、启用（开关）、来源与规模（副标题）、改名（设置对话框）都在这一个列表
+/// 里。此前它们散在三组里各做各的——改名框是三份、开关是两份，而用户要回答的
+/// 「我装了哪些、谁在前、哪个关着」这个问题，得把三组都看一遍才拼得出来。
+///
+/// 下面那几组只剩**目录**：那才是三类来源真正不同的地方（各自从哪儿读）。
+fn dict_list_rows(st: Rc<State>) -> Element {
+    let items = st.sources_for_settings();
+    if items.is_empty() {
         return card(vec![row(
-            "暂时无需排序",
-            Some("装上第二本词典（或打开码表反查）之后，这里可以拖动调整先后"),
+            "没有可用的词典",
+            Some("词库目录里应有 ecdict.db 与 cedict.db；见下面的「词库目录」"),
             Element::col(),
         )]);
     }
     let rows: Vec<Element> = items
         .iter()
-        .map(|(_, name, kind)| row(name, Some(kind), Element::col()))
+        .enumerate()
+        .map(|(i, it)| dict_list_row(st.clone(), it, i > 0))
         .collect();
     let st2 = st.clone();
     card(vec![
         row(
-            "拖动调整顺序",
-            Some("页签从左到右、同一个词头下的词条从上到下，都按这个顺序"),
+            "词典",
+            Some("拖动调整顺序；页签从左到右、同一个词头下的词条从上到下都按它"),
             Element::col(),
         ),
         Element::reorder_list(rows)
             .width_match()
             .on_reorder(move |_ctx, from, to| st2.move_dict_order(from, to)),
     ])
+}
+
+/// 列表里的一行：名字 + 类别·详情 + 开关 + 设置。
+///
+/// `sep` 决定要不要画上边框。`card` 只给它自己的直接子节点补分隔线，而这些行是
+/// `reorder_list` 的子节点，隔了一层——不自己画就是一片连不起来的文字。线从内容那一格
+/// 起（手柄那一列不画），与列表类界面的惯例一致。
+fn dict_list_row(st: Rc<State>, it: &SourceRow, sep: bool) -> Element {
+    let on = signal(it.on);
+    let key_for_toggle = it.key.clone();
+    let key_for_dialog = it.key.clone();
+    let st2 = st.clone();
+    let mut line = Element::row()
+        .width_match()
+        .cross(Align::Center)
+        // 上下 9 而非 14：这些行是**一列同类项**，挨着看的时候紧凑一点更好扫；
+        // 左边 14 是给手柄留的——手柄本身在行外，贴着文字会显得挤。
+        .padding_edges(Insets::new(14, 9, 18, 9))
+        .spacing(12)
+        .child(
+            Element::col()
+                .spacing(2)
+                .weight(1.0)
+                .child(
+                    Element::label(it.name.clone())
+                        .font_size(14.0)
+                        .font_weight(500)
+                        .fg_role(Role::Text)
+                        .width_match(),
+                )
+                .child(
+                    Element::label(format!("{} · {}", it.kind, it.detail))
+                        .font_size(12.0)
+                        .fg_role(Role::TextMuted)
+                        .width_match(),
+                ),
+        )
+        // 监听器须先于开关注册（on_update 按注册顺序广播），且必须盯信号而非挂
+        // `on_toggle`——后者被 windui 静默吞掉，见 `SettingToggle`。
+        .child(
+            Element::leaf()
+                .reactive()
+                .widget(SourceToggle {
+                    st,
+                    key: key_for_toggle,
+                    on,
+                    last_version: on.version(),
+                })
+                .size(0, 0),
+        )
+        .child(Element::switch(on))
+        .child(Element::button("设置…").on_click(move |_| st2.open_dict_dialog(&key_for_dialog)));
+    if sep {
+        line = line.border_role(Role::Divider, 1).border_edges(Edges::TOP);
+    }
+    line
+}
+
+/// 某本词典的设置对话框：改名 + 详情。
+///
+/// 改名此前是列表里一个光秃秃的输入框，没有任何提示说它是干什么的——用户看到的是一格
+/// 空白，既不知道能填什么，也不知道填了会怎样。放进对话框之后有标题、有说明、有「恢复
+/// 默认」，而列表那一行也腾出了位置给开关。
+fn dict_dialog_el(st: Rc<State>) -> Element {
+    let show = st.dict_dialog;
+    let editing = st.dict_editing.borrow().clone();
+    let Some(key) = editing else {
+        // 没在编辑：给一个空面板。对话框元素本身必须一直在树里——它带着显示信号，
+        // 而信号是在 `State` 上的，节点没了信号也就没人读了。
+        return Element::dialog(show, Element::col());
+    };
+    let it = st.sources_for_settings().into_iter().find(|r| r.key == key);
+    let st_close = st.clone();
+    let close = move |_: &mut EventCtx| st_close.close_dict_dialog();
+    let Some(it) = it else {
+        // 词典在对话框开着的时候没了（换了目录、文件被删）。如实说，不装作还在。
+        let panel = dialog_panel(
+            Element::col()
+                .spacing(8)
+                .child(dialog_title("这本词典已经不在了"))
+                .child(
+                    Element::label("它可能被移出了目录，或者所在的目录改了。")
+                        .font_size(13.0)
+                        .fg_role(Role::TextMuted),
+                ),
+            st.clone(),
+        );
+        return Element::dialog_closable(show, panel, close);
+    };
+
+    let default_name = st.default_name_of(&key);
+    let text = signal(st.settings.borrow().dict_name(&key, ""));
+    let st_save = st.clone();
+    let st_reset = st.clone();
+    let key_reset = key.clone();
+    let body = Element::col()
+        .spacing(14)
+        .child(dialog_title(&format!("{} 的设置", it.name)))
+        .child(
+            Element::col()
+                .spacing(6)
+                .child(
+                    Element::label("显示名")
+                        .font_size(12.0)
+                        .font_weight(600)
+                        .fg_role(Role::TextMuted),
+                )
+                .child(
+                    Element::row()
+                        .cross(Align::Center)
+                        .spacing(8)
+                        // 监听器须先于输入框注册：`on_update` 按注册顺序广播。
+                        .child(
+                            Element::leaf()
+                                .reactive()
+                                .widget(DictNameSaver {
+                                    st: st_save,
+                                    key: key.clone(),
+                                    text,
+                                    last_version: text.version(),
+                                })
+                                .size(0, 0),
+                        )
+                        .child(
+                            Element::text_input(text, &default_name)
+                                .font_size(13.0)
+                                .weight(1.0),
+                        )
+                        .child(Element::button("恢复默认").on_click(move |_| {
+                            text.set(String::new());
+                            st_reset.set_dict_name(&key_reset, "");
+                        })),
+                )
+                .child(
+                    Element::label("留空即用默认名")
+                        .font_size(11.5)
+                        .fg_role(Role::TextMuted),
+                ),
+        )
+        .child(Element::divider())
+        .child(
+            Element::col()
+                .spacing(6)
+                .child(dialog_field("类别", it.kind))
+                .child(dialog_field("详情", &it.detail))
+                .child(dialog_field("稳定键", &it.key)),
+        );
+    Element::dialog_closable(show, dialog_panel(body, st), close)
+}
+
+/// 对话框面板的外壳：自带背景（`dialog` 要求，否则空白处会穿透遮罩去当窗口拖动区）。
+fn dialog_panel(body: Element, st: Rc<State>) -> Element {
+    let st2 = st;
+    Element::col()
+        .width(440)
+        .bg_role(Role::Surface)
+        .border_role(Role::Border, 1)
+        .corner(14.0)
+        .padding_xy(24, 20)
+        .spacing(18)
+        .child(body)
+        .child(
+            // 按钮靠右：线性容器没有主轴对齐方法, 用一个占满剩余宽度的空子把它顶过去。
+            Element::row()
+                .width_match()
+                .child(Element::col().weight(1.0))
+                .child(Element::button("完成").on_click(move |_| st2.close_dict_dialog())),
+        )
+}
+
+fn dialog_title(text: &str) -> Element {
+    Element::label(text.to_string())
+        .font_size(16.0)
+        .font_weight(600)
+        .fg_role(Role::Text)
+}
+
+/// 对话框里的一条只读信息。
+fn dialog_field(label: &str, value: &str) -> Element {
+    Element::row()
+        .width_match()
+        .spacing(10)
+        .child(
+            Element::label(label.to_string())
+                .font_size(12.5)
+                .fg_role(Role::TextMuted)
+                .width(56),
+        )
+        .child(
+            Element::label(value.to_string())
+                .font_size(12.5)
+                .fg_role(Role::Text)
+                .weight(1.0),
+        )
 }
 
 /// 码表反查设置：总开关 + 方案来源 + 每个方案一行。
@@ -4051,7 +4465,7 @@ fn dict_order_rows(st: Rc<State>) -> Element {
 /// 以及想去掉时该动谁。
 fn codetable_rows(st: Rc<State>) -> Element {
     let on = st.settings.borrow().codetables;
-    let mut rows = vec![toggle_row(
+    let mut rows = vec![toggle_line(
         st.clone(),
         "码表反查",
         "查一个字，顺带看它在五笔等输入方案里怎么打、怎么拆",
@@ -4062,7 +4476,7 @@ fn codetable_rows(st: Rc<State>) -> Element {
         return card(rows);
     }
 
-    rows.push(toggle_row(
+    rows.push(toggle_line(
         st.clone(),
         "词组逐字列出",
         "关掉后只对单字给编码；查词组时不再在释义中间铺开三五行",
@@ -4136,83 +4550,8 @@ fn codetable_rows(st: Rc<State>) -> Element {
             })),
     ));
 
-    // 每个方案一行：名字 + 字数 + 改名框 + 开关。
-    //
-    // **顺序只由目录序与文件名决定，与开关无关。** 从磁盘扫出全部方案、再标注哪些启用，
-    // 而不是「先列已加载的、再补上关掉的」——后者会让一个方案在关掉的瞬间跳到列表末尾，
-    // 用户想再打开它得先去别处找。开关是用来改状态的，不是用来改位置的。
-    //
-    // 关掉的方案不在 `code_tables` 里（`reload_code_tables` 直接跳过），故这里另行扫盘，
-    // 否则关掉之后那一行连同它的开关一起消失，用户再也开不回来。
-    let disabled = st.settings.borrow().disabled_dicts.clone();
-    let mut dirs: Vec<std::path::PathBuf> = found.iter().map(|d| d.path.clone()).collect();
-    dirs.extend(st.settings.borrow().codetable_dirs.iter().cloned());
-    let mut seen = std::collections::HashSet::new();
-    let mut listed: Vec<(String, String, Option<usize>)> = Vec::new();
-    for dir in &dirs {
-        for sc in crate::source::codetable::discover(dir) {
-            if !seen.insert(sc.key.clone()) {
-                continue;
-            }
-            // 字数只有加载了才知道；没加载就是被关掉了。
-            let chars = st
-                .code_tables
-                .borrow()
-                .iter()
-                .find(|t| t.key() == sc.key)
-                .map(|t| t.len());
-            listed.push((sc.key, sc.name, chars));
-        }
-    }
-    for (key, name, chars) in listed {
-        let sub = match chars {
-            Some(n) => format!("{n} 字 · {key}"),
-            None => format!("已关闭 · {key}"),
-        };
-        let on = signal(!disabled.contains(&key));
-        let toggle = Element::row()
-            .cross(Align::Center)
-            // 监听器须先于开关注册（on_update 按注册顺序广播），且必须盯信号而非挂
-            // `on_toggle`——后者被 windui 静默吞掉，见 `SettingToggle`。
-            .child(
-                Element::leaf()
-                    .reactive()
-                    .widget(CodeTableToggle {
-                        st: st.clone(),
-                        key: key.clone(),
-                        on,
-                        last_version: on.version(),
-                    })
-                    .size(0, 0),
-            )
-            .child(Element::switch(on));
-        rows.push(dict_name_row(st.clone(), &key, &name, &sub, toggle));
-    }
+    // 方案本身（名字、开关、顺序）在上面那个统一的词典列表里，这一组只管「从哪儿读」。
     card(rows)
-}
-
-/// 监视码表方案开关、落库的响应式控件。与 [`DictToggle`] 同构，理由相同。
-struct CodeTableToggle {
-    st: Rc<State>,
-    key: String,
-    on: Signal<bool>,
-    last_version: u64,
-}
-
-impl Widget for CodeTableToggle {
-    fn on_update(&mut self, _ctx: &mut EventCtx) {
-        let v = self.on.version();
-        if v == self.last_version {
-            return;
-        }
-        self.last_version = v;
-        let want = self.on.get();
-        if !self.st.toggle_code_table(&self.key, want) {
-            self.on.set(!want);
-            // 回拨自己也会推高版本，须同步记下，否则下一帧会把回拨当成新的用户操作。
-            self.last_version = self.on.version();
-        }
-    }
 }
 
 /// 一行开关设置：初值由 `init` 取，翻转由 `apply` 落实（失败则自动拨回）。
@@ -4223,8 +4562,23 @@ fn toggle_row(
     init: fn(&State) -> bool,
     apply: fn(&State, bool) -> bool,
 ) -> Element {
+    card(vec![toggle_line(st, title, subtitle, init, apply)])
+}
+
+/// 一行开关，**不带卡片**：供已经在一张卡片里的场合用。
+///
+/// 与 [`toggle_row`] 分开是因为卡片不能套卡片：`card` 会给每一行补上边框分隔线，而内层
+/// 那个 `card` 自带圆角与背景——叠起来的样子是「一行莫名其妙带着圆角边框，左右还各缩进
+/// 一截」，与同一张卡片里别的行对不齐。
+fn toggle_line(
+    st: Rc<State>,
+    title: &str,
+    subtitle: &str,
+    init: fn(&State) -> bool,
+    apply: fn(&State, bool) -> bool,
+) -> Element {
     let on = signal(init(&st));
-    card(vec![row(
+    row(
         title,
         Some(subtitle),
         Element::row()
@@ -4242,7 +4596,7 @@ fn toggle_row(
                     .size(0, 0),
             )
             .child(Element::switch(on)),
-    )])
+    )
 }
 
 /// 词库目录：随程序分发的三份库住在哪。
@@ -4292,47 +4646,14 @@ fn dict_rows(st: Rc<State>) -> Element {
         );
     }));
 
-    // 两份词库各占一行而不是合成「已装词库」一行：它们现在各有一个页签、各有一个
-    // 可改的名字，那一行里塞不下，也说不清哪个大小对应哪个名字。
+    let _ = &st;
     card(vec![
         row("词库目录", Some(&sub), right),
-        builtin_dict_row(
-            st.clone(),
-            offline::ECDICT_KEY,
-            offline::ECDICT_NAME,
-            "英汉",
-            offline::ECDICT_FILE,
-            &status.ecdict,
-        ),
-        builtin_dict_row(
-            st,
-            offline::CEDICT_KEY,
-            offline::CEDICT_NAME,
-            "汉英",
-            offline::CEDICT_FILE,
-            &status.cedict,
-        ),
-        // 字形库**没有改名框**：它不出词条，也就没有页签，名字无处可显示。多一个
-        // 改了看不见效果的输入框只会让人以为坏了。
+        // 英汉与汉英两份在上面那个词典列表里（能改名、能开关、能排序）。这里只剩字形库：
+        // 它**不出词条**（ADR-0013），没有页签、进不了那个列表，可它确实是这个目录里的
+        // 第三份文件，用户来看目录时需要知道它在不在。
         row("字形库", Some(&glyph_line(&status)), Element::col()),
     ])
-}
-
-/// 一份内置词库的设置行：当前名字 + 方向/文件/大小 + 改名框。
-fn builtin_dict_row(
-    st: Rc<State>,
-    key: &'static str,
-    default_name: &str,
-    dir_label: &str,
-    file: &str,
-    stat: &Result<u64, String>,
-) -> Element {
-    let sub = match stat {
-        Ok(n) => format!("{dir_label} · {file} · {}", mb(*n)),
-        // 打不开必须说出原因：否则用户只看到一行名字，无从判断是文件没了还是坏了。
-        Err(e) => format!("{dir_label} · {file} · 打不开：{e}"),
-    };
-    dict_name_row(st, key, default_name, &sub, Element::col())
 }
 
 /// 字形库那一行的说明。它可缺，故说法与另外两份不同：不在只是少一行部首笔画，
@@ -4352,50 +4673,6 @@ fn glyph_line(st: &crate::source::offline::DirStatus) -> String {
 /// 770,611 与 700,000 的差别，却一眼看得出 169 MB 与 0 字节的差别。
 fn mb(n: u64) -> String {
     format!("{:.0} MB", n as f64 / 1_048_576.0)
-}
-
-/// 一行「某本词典」：当前显示名 + 说明 + 改名框（+ 右侧附加控件）。
-///
-/// 输入框里**留空表示用默认名**，占位符就是那个默认名——而不是把默认名填进去。
-/// 填进去的话，「我没改过」与「我把它改成了跟默认一样」在存储里就分不开，用户也
-/// 没有一个明确的「恢复默认」动作可做（清空即恢复，见 `Settings::set_dict_name`）。
-fn dict_name_row(
-    st: Rc<State>,
-    key: &str,
-    default_name: &str,
-    sub: &str,
-    extra: Element,
-) -> Element {
-    let (custom, title) = {
-        let s = st.settings.borrow();
-        (s.dict_name(key, ""), s.dict_name(key, default_name))
-    };
-    let text = signal(custom);
-    Element::row().width_match().cross(Align::Center).child(row(
-        &title,
-        Some(sub),
-        Element::row()
-            .cross(Align::Center)
-            .spacing(8)
-            // 监听器须先于输入框注册：`on_update` 按注册顺序广播。
-            .child(
-                Element::leaf()
-                    .reactive()
-                    .widget(DictNameSaver {
-                        st,
-                        key: key.to_string(),
-                        text,
-                        last_version: text.version(),
-                    })
-                    .size(0, 0),
-            )
-            .child(
-                Element::text_input(text, default_name)
-                    .font_size(13.0)
-                    .width(150),
-            )
-            .child(extra),
-    ))
 }
 
 /// 打开一个目录（资源管理器）。
@@ -4422,20 +4699,23 @@ fn thousands(n: u64) -> String {
     out
 }
 
-/// 自带词典：一行目录 + 扫到的每本一行开关。
+/// 用户词典目录：用户自己放的 MDX 从哪儿读。
 ///
-/// 没有「添加」按钮，这是刻意的：添加一本词典 = 把文件放进这个目录。设置页能做的
-/// 只有换目录和开关某一本——凡是用户已经在文件管理器里做过的事，不该再让他来这里
-/// 向程序汇报一遍。
+/// **只管目录**。哪几本、叫什么、开着没有，都在上面那个统一的词典列表里——那些问题
+/// 对三类来源是同一个问题，分到三组里各答一遍只会让人来回找。
 fn user_dict_rows(st: Rc<State>) -> Element {
     let dir = st.user_dict_dir();
     let custom = st.settings.borrow().user_dict_dir.is_some();
-    let disabled = st.settings.borrow().disabled_dicts.clone();
-
     let shown = match &dir {
         Some(d) => d.display().to_string(),
         None => "无法确定（LOCALAPPDATA 未设置）".to_string(),
     };
+    let n = dir
+        .as_deref()
+        .map(crate::source::user::scan)
+        .unwrap_or_default()
+        .len();
+
     let mut right = Element::row().cross(Align::Center).spacing(8);
     // 只在用过自定义目录时才给「恢复默认」：本来就是默认值时这个按钮点了没意义。
     if custom {
@@ -4451,8 +4731,7 @@ fn user_dict_rows(st: Rc<State>) -> Element {
         st4.reload_user_dicts();
         let n = st4.user_dicts.borrow().len();
         st4.note_ok(format!("已重新扫描词典目录，可用 {n} 本"));
-        // 重建设置页：那几行词典名与词条数是构建期扫出来的，不重建就还停在旧的一批上
-        // ——而用户点刷新，要的正是看见新的那一批。
+        // 重建设置页：上面那个列表是构建期扫出来的，不重建就还停在旧的一批上。
         st4.bump_settings();
     }));
     if let Some(d) = dir.clone() {
@@ -4471,71 +4750,27 @@ fn user_dict_rows(st: Rc<State>) -> Element {
         );
     }));
 
-    let mut rows = vec![row("词典目录", Some(&shown), right)];
-
-    let files = dir
-        .as_deref()
-        .map(crate::source::user::scan)
-        .unwrap_or_default();
-    if files.is_empty() {
-        rows.push(row(
-            "还没有词典",
-            Some("把 .mdx 文件放进上面这个目录（可以带子目录），回到这里就能看到"),
-            Element::col(),
-        ));
-        return card(rows);
-    }
-
-    // 逐本打开一次，为的是拿到词典名与词条数——**关掉的也开**：不开就只能显示一个
-    // 文件名，而用户此刻要判断的正是「这本是不是我想开的那本」。一本约 3 ms，
-    // 且只在设置页打开时才走这一遭。
-    for p in &files {
-        let file = crate::source::user::key_of(p);
-        let (title, sub) = match crate::source::user::probe(p) {
-            Ok(d) => (
-                d.name().to_string(),
-                format!("{} 词条 · {file}", thousands(d.entry_count())),
-            ),
-            // 打不开必须**说出原因**：否则用户只看到一个拨不动的开关，无从判断是
-            // 文件坏了，还是我们不支持它用的压缩方式。
-            Err(e) => (file.clone(), format!("打不开：{e:#}")),
-        };
-        let on = signal(!disabled.contains(&file));
-        let toggle = Element::row()
-            .cross(Align::Center)
-            // 监听器须先于开关注册（on_update 按注册顺序广播），且必须盯信号而非
-            // 挂 `on_toggle`——后者被 windui 静默吞掉，见 `SettingToggle`。
-            .child(
-                Element::leaf()
-                    .reactive()
-                    .widget(DictToggle {
-                        st: st.clone(),
-                        file: file.clone(),
-                        on,
-                        last_version: on.version(),
-                    })
-                    .size(0, 0),
-            )
-            .child(Element::switch(on));
-        // 键是文件名，与页签、开关用的是同一个（见 `source::user::key_of`）。
-        rows.push(dict_name_row(st.clone(), &file, &title, &sub, toggle));
-    }
-    card(rows)
+    let sub = if n == 0 {
+        format!("{shown}\n把 .mdx 放进这个目录（可以带子目录），回到这里点「刷新」")
+    } else {
+        format!("{shown}\n扫到 {n} 本")
+    };
+    card(vec![row("词典目录", Some(&sub), right)])
 }
 
-/// 监视某一本自带词典的开关。
+/// 监视某一个来源的开关（内置词库、用户词典、码表方案共用）。
 ///
 /// 与 `SettingToggle` 分开而不是把它泛化：那个持有的是 `fn` 指针（无捕获），而这里
 /// 必须带上「是哪一本」。为一处需要闭包的用法把另一处改成 `Box<dyn FnMut>`，是让
 /// 已经好用的代码替新代码付账。
-struct DictToggle {
+struct SourceToggle {
     st: Rc<State>,
-    file: String,
+    key: String,
     on: Signal<bool>,
     last_version: u64,
 }
 
-impl Widget for DictToggle {
+impl Widget for SourceToggle {
     fn on_update(&mut self, _ctx: &mut EventCtx) {
         let v = self.on.version();
         if v == self.last_version {
@@ -4543,7 +4778,7 @@ impl Widget for DictToggle {
         }
         self.last_version = v;
         let want = self.on.get();
-        if !self.st.toggle_user_dict(&self.file, want) {
+        if !self.st.toggle_source(&self.key, want) {
             self.on.set(!want);
             // 回拨自己也会推高版本，须同步记下，否则下一帧会把回拨当成新的用户操作，
             // 来回翻转停不下来。
@@ -5076,12 +5311,12 @@ fn entry_view(e: Entry, expanded: Signal<bool>, st: Rc<State>, show_source: bool
                 Element::col()
             })
             .child(selectable(code_doc(&x), &st)),
-        // 自带词典：出处一行（仅「全部」页）+ 一整段富文本。
+        // 用户词典：出处一行（仅「全部」页）+ 一整段富文本。
         Entry::User(x) => Element::col()
             .spacing(6)
             .width_match()
             // 出处那行在专属页签里省掉：页签名已经回答了「这是谁说的」。在「全部」页
-            // 它仍**必须画出来**——随程序分发的两个库是我们挑过的，自带词典是用户放
+            // 它仍**必须画出来**——随程序分发的两个库是我们挑过的，用户词典是用户放
             // 进来的、来源与质量我们一无所知，两者以相同样式并排出现时，用户没有任何
             // 线索区分。这与 ADR-0008 要求标注「由 AI 生成」是同一条理由的另一面。
             .child(if show_source {
@@ -5093,7 +5328,7 @@ fn entry_view(e: Entry, expanded: Signal<bool>, st: Rc<State>, show_source: bool
             })
             .child(
                 selectable(user_doc(&x), &st)
-                    // 词典内部的交叉引用（「参见 X」）点了就跳过去——这是自带词典
+                    // 词典内部的交叉引用（「参见 X」）点了就跳过去——这是用户词典
                     // 唯一的导航手段，它的正文里没有别的可操作元素。
                     .on_span_click(move |_, id| st.select(id)),
             ),
@@ -5132,10 +5367,10 @@ fn code_doc(x: &crate::domain::CodeEntry) -> RichDoc {
     doc
 }
 
-/// 自带词典正文里每级列表的缩进。
+/// 用户词典正文里每级列表的缩进。
 const USER_INDENT: i32 = 20;
 
-/// 自带词典的正文：段落 + 行内粗体 / 斜体 / 跳转。
+/// 用户词典的正文：段落 + 行内粗体 / 斜体 / 跳转。
 ///
 /// 这三个样式位就是 CSS 被剥掉之后**全部**幸存的语义（见 `crate::html`）。斜体尤其
 /// 承重：例句、语体标注（*informal*）、拉丁学名都只剩它了。
@@ -5692,7 +5927,7 @@ mod tests {
     fn 自带来自(w: &str, key: &str) -> Entry {
         Entry::User(crate::domain::UserEntry {
             headword: Headword::from_store(w),
-            source: "某本自带词典".into(),
+            source: "某本用户词典".into(),
             source_key: key.into(),
             body: vec![crate::domain::TextBlock {
                 indent: 0,
@@ -5731,9 +5966,9 @@ mod tests {
         }
     }
 
-    /// 内置两份各归各的页，且**自带词典的词条不进内置页**。
+    /// 内置两份各归各的页，且**用户词典的词条不进内置页**。
     ///
-    /// 这是页签从「方向」改成「来源」之后最要紧的一条：此前自带词典的英文词条会
+    /// 这是页签从「方向」改成「来源」之后最要紧的一条：此前用户词典的英文词条会
     /// 落进「英汉」页，因为那时判的是词头的方向。现在「简明英汉字典」这一页只该有
     /// 简明英汉字典的东西——否则页签名就是在撒谎。
     #[test]
@@ -5753,7 +5988,7 @@ mod tests {
     /// 混装卡片按页签**拆开**：内置页只留内置的词条，自带页只留那一本的。
     ///
     /// 这是「逐条筛而不是整张筛」的全部理由。查 hello 时一个词头下面既有内置英汉库
-    /// 的词条、又有自带词典的——整张留下，点进「简明英汉字典」还看得见另一本的内容；
+    /// 的词条、又有用户词典的——整张留下，点进「简明英汉字典」还看得见另一本的内容；
     /// 整张丢掉，这个词头就会从它确实收录的那一页里消失。
     #[test]
     fn 混装卡片按来源拆开() {
@@ -5850,12 +6085,12 @@ mod tests {
         assert_eq!(k, 名单(&["a", "b"]), "边界情形下名单不该被改动");
     }
 
-    /// 自带词典按**稳定键**认，不按显示名。
+    /// 用户词典按**稳定键**认，不按显示名。
     ///
     /// 两本词典的 MDX 标题一模一样是常有的事，且用户随时能改名；拿名字当依据会把
     /// 两本的词条混进同一页，而用户看到的是「这一页里混着别本的东西」。
     #[test]
-    fn 自带词典按文件名分页() {
+    fn 用户词典按文件名分页() {
         let a = 自带来自("apple", "牛津.mdx");
         let b = 自带来自("apple", "柯林斯.mdx");
         let 牛津 = 页("牛津.mdx");

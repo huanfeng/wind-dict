@@ -71,7 +71,7 @@ ECDICT 官方发布了现成的 SQLite 数据库（`ecdict-sqlite-28.zip`），�
 
 对齐之后，本项目的词库文件与 ECDICT 生态**双向互换**：官方发布的 `ecdict-sqlite-*.zip`、`ECDICT-ultimate`，以及任何按 `stardict.py` 格式生成的第三方词库，都可以直接替换本库而无需改动一行代码（设置页本就支持指定词库路径，`probe_dict` 负责挡住选错方向的文件）。
 
-这**不与 ADR-0001 冲突**，尽管那份 ADR 写着「用户无法自带词典」。ADR-0001 否决的是 MDX / StarDict 这类**正文为 HTML 的格式**——理由是 windui 没有富文本渲染能力，那个否决至今成立。而这里支持的是**字段化的 SQLite**，每个字段仍是纯文本、仍直接映射到现成控件。两者拒绝与接纳的是不同的东西。
+这**不与 ADR-0001 冲突**，尽管那份 ADR 写着「用户无法用户词典」。ADR-0001 否决的是 MDX / StarDict 这类**正文为 HTML 的格式**——理由是 windui 没有富文本渲染能力，那个否决至今成立。而这里支持的是**字段化的 SQLite**，每个字段仍是纯文本、仍直接映射到现成控件。两者拒绝与接纳的是不同的东西。
 
 命名上有个坑值得记下：`ecdict-stardict-28.zip` 里的 "stardict" 指**星际译王软件的二进制格式**（.ifo/.idx/.dict），而我们对齐的是 `ecdict-sqlite-28.zip` 内 `stardict.db` 的**表名** `stardict`。同名，两回事——ADR-0001 否决的是前者，本次对齐的是后者。
 

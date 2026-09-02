@@ -26,7 +26,7 @@ use wind_dict::settings::Settings;
 use wind_dict::source::offline::{self, OfflineDictionary};
 use wind_dict::store::userdata::{UserData, UserDataState};
 use wind_dict::ui;
-use wind_dict::APP_TITLE;
+use wind_dict::{app_title, APP_TITLE};
 
 /// 单实例标识。
 ///
@@ -118,7 +118,7 @@ fn main() {
 
     // 窗口 920 宽：界面是左右两栏（`ui::dict_page`），左栏定宽 280，故释义那一栏拿到
     // 640——正文限宽已撤（见 `ui::EN_DEF_MAX_W`），一行排满正好是舒适的阅读宽度。
-    let mut app = App::new(APP_TITLE, 920, 620)
+    let mut app = App::new(app_title(), 920, 620)
         // 下限 720：扣掉左栏那 280 还剩 440 给释义，勉强够读。再窄就该让左栏改为可收起
         // 而不是继续压缩释义（尚未实现），而不是让用户拖到一个不可用的尺寸。
         .min_size(720, 480)
@@ -302,7 +302,7 @@ fn userdata_path() -> Result<PathBuf, String> {
     Ok(userdata_dir()?.join("userdata.db"))
 }
 
-/// 用户数据目录。实现在库里（`store::userdata::data_dir`）——自带词典的默认目录
+/// 用户数据目录。实现在库里（`store::userdata::data_dir`）——用户词典的默认目录
 /// 也要落在它下面，而「这个目录在哪」写两遍就等着漂移。
 fn userdata_dir() -> Result<PathBuf, String> {
     wind_dict::store::userdata::data_dir()

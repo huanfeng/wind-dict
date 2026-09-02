@@ -17,6 +17,21 @@
 /// 显示名归显示名，标识名归标识名，混在一起的代价全落在升级路径上。
 pub const APP_TITLE: &str = "清风词典";
 
+/// 界面上显示的名字。**dev 构建带后缀**。
+///
+/// 两个变体常常同时装着（部署目录、用户数据、自启项都是分开的），而窗口标题、任务栏、
+/// 托盘提示上它们此前一模一样——手上开着两个窗口时分不出哪个是哪个，改完代码验证时
+/// 很容易对着 release 那个看半天。
+///
+/// 判据与 `userdata::data_dir()`、`autostart::VALUE_NAME` 同源：`debug_assertions`。
+pub fn app_title() -> &'static str {
+    if cfg!(debug_assertions) {
+        concat!("清风词典", " (开发版)")
+    } else {
+        APP_TITLE
+    }
+}
+
 pub mod autostart;
 pub mod domain;
 pub mod html;
