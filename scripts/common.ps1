@@ -20,6 +20,29 @@ $MdxDir      = "$CacheDir\mdx"         # 下载的示例 .mdx (不入库)
 $BuildDir    = "$Root\build"           # release 产物 (= 部署内容)
 $BuildDevDir = "$Root\build_dev"       # dev 产物
 $ArtifactDir = "$Root\artifacts"       # 截图、发布包等 (不入库)
+$PinFile     = "$Root\windui.ref"      # windui 的提交号 (CI 按它检出)
+
+# ---------- path 依赖的提交号 ----------
+# windui.ref 里第一个非注释非空行就是那个提交号。为什么需要它、谁来维护，
+# 都写在那个文件自己的注释里——这里只负责读，不重复一遍理由。
+#
+# 读不到就返回 $null（文件被删、或只剩注释）：调用方各自决定这算警告还是硬失败。
+function Get-PinnedWindui {
+    if (-not (Test-Path $PinFile)) { return $null }
+    foreach ($line in Get-Content $PinFile -Encoding UTF8) {
+        $t = $line.Trim()
+        if ($t -and -not $t.StartsWith("#")) { return $t }
+    }
+    return $null
+}
+
+# 本机 ../wind-ui-rust 当前的提交号（完整 40 位）。不在 git 工作树里则返回 $null。
+function Get-LocalWindui ([string]$path) {
+    if (-not (Test-Path $path)) { return $null }
+    git -C $path rev-parse --git-dir *> $null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return (git -C $path rev-parse HEAD).Trim()
+}
 
 # ---------- 原生命令的失败方式 ----------
 # PowerShell 7.3 起 $PSNativeCommandUseErrorActionPreference 会让"退出码非零的原生

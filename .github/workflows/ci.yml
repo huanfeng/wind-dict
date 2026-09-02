@@ -5,12 +5,23 @@
 #
 # 不需要词库：探真实词库的那几个测试自己会跳过（"跳过：本机没有词库文件"），
 # MDX 那几个用的是 tests/fixtures 里入库的小样本。故这里不下载 190MB 的东西。
+#
+# 本文件同时是 `release.yml` 的前置门（`workflow_call`）——发布前必须先绿。
+# 打了 tag 才发现代码编不过，是这条流水线里最贵的一种失败。
 name: ci
 
 on:
   push:
     branches: [master, main]
   pull_request:
+  # 供 release.yml 复用。发布逻辑一份、检查也一份，不要各写一遍然后慢慢漂移。
+  workflow_call:
+
+# 同一分支上新的推送把旧的取消：一次运行要几分钟，连推三次时后两次的结果才作数。
+# 排除 tag：发布跑的那次不能被任何东西掐掉。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,14 +34,30 @@ jobs:
       # (`path = "../wind-ui-rust"`)，少了它 cargo 连解析都过不去。
       # GitHub 的检出路径必须在 $GITHUB_WORKSPACE 之下，故两边都放进工作区根，
       # 兄弟关系与本机的目录结构一致。
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: wind-dict
-      - uses: actions/checkout@v4
+
+      # windui 检出**哪一版**由仓库里的 windui.ref 说了算，不是它的默认分支 HEAD。
+      # 两个仓库独立推送，抓 HEAD 等于让 CI 的成败取决于两次 push 的先后。
+      # 完整理由见 windui.ref 自己的注释。
+      - name: 定位 windui
+        id: windui
+        shell: pwsh
+        run: |
+          $ref = "${{ vars.WINDUI_REF }}".Trim()
+          if (-not $ref) {
+            $lines = @(Get-Content wind-dict/windui.ref | Where-Object { $_ -notmatch '^\s*(#|$)' })
+            if ($lines.Count -eq 0) { throw "windui.ref 里没有提交号" }
+            $ref = $lines[0].Trim()
+          }
+          Write-Host "windui → $ref"
+          "ref=$ref" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - uses: actions/checkout@v5
         with:
           repository: huanfeng/wind-ui-rust
-          # 仓库变量 WINDUI_REF 可钉住某个 tag/commit；留空即默认分支。
-          ref: ${{ vars.WINDUI_REF }}
+          ref: ${{ steps.windui.outputs.ref }}
           path: wind-ui-rust
           # windui 若是私有库，需要一个有其读权限的 PAT 存成 WINDUI_TOKEN；
           # 公开库不必设，会退到本次运行的 github.token。
@@ -44,14 +71,20 @@ jobs:
 
       # 缓存注册表与构建产物。rusqlite 走 bundled，每次冷构建都要编译一遍 SQLite 的
       # C 源码——那是这条流水线里最贵的一段，值得缓存。
+      #
+      # 键里**必须带上 windui 的提交号**：target\ 里躺着的是针对某一版 windui 编出来
+      # 的产物，换了 windui 却复用它，轻则白编一遍，重则拿到一份说不清是对着哪版编的
+      # 增量结果。Cargo.lock 管不到这件事——path 依赖在 lock 里只有一个版本号。
       - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             wind-dict/target
-          key: ci-${{ runner.os }}-${{ hashFiles('wind-dict/Cargo.lock') }}
-          restore-keys: ci-${{ runner.os }}-
+          key: ci-${{ runner.os }}-${{ steps.windui.outputs.ref }}-${{ hashFiles('wind-dict/Cargo.lock') }}
+          restore-keys: |
+            ci-${{ runner.os }}-${{ steps.windui.outputs.ref }}-
+            ci-${{ runner.os }}-
 
       - name: fmt
         working-directory: wind-dict
@@ -59,10 +92,13 @@ jobs:
 
       # -D warnings：本仓库当前是零告警，让它保持零。告警一旦允许堆积，
       # 就再也没人看 clippy 的输出了。
+      #
+      # --locked：Cargo.lock 已入库，就该由它说了算。少了这个开关，cargo 会为了让
+      # 构建过去而**就地改写** lock，于是 CI 验的是一份仓库里不存在的依赖组合。
       - name: clippy
         working-directory: wind-dict
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: test
         working-directory: wind-dict
-        run: cargo test
+        run: cargo test --locked

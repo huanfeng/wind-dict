@@ -27,6 +27,8 @@
 #   gm            下载一本示例 MDX (~70MB), 供手动测试「用户词典」; 部署时自动装进词典目录
 #   rel           发布: 构建 + 组装 + 验证 + 压成带版本的 zip → artifacts\release\
 #                 (要传参数就直接调 scripts\release.ps1, 见那个文件的头部)
+#   pin           把当前 ../wind-ui-rust 的 HEAD 写进 windui.ref —— CI 按它检出那个
+#                 path 依赖。两个仓库独立推送, 不钉住就只能听天由命, 见 windui.ref
 #   k=check  l=clippy  t=test  f=fmt  fc=fmt-check  ci(=fc+l+t)  clean
 #
 # 部署目标 (默认 %LOCALAPPDATA%\wind-dict, 免管理员; 在 scripts\deploy.local.ps1 覆盖):
@@ -477,6 +479,60 @@ function Do-Release {
     return $true
 }
 
+# ---------- windui 提交号 ----------
+# 把当前 ../wind-ui-rust 的 HEAD 写进 windui.ref，CI 便按它检出。
+#
+# **拒绝写入未推送的提交**：这个号是给 CI 用的，CI 只能从远端取。写一个本机独有的
+# 提交进去，表现是下一次 CI 在 checkout 那一步就红，而错误信息（"could not find
+# <sha>"）离真正的原因隔着一层。当场拦住，比让它在两分钟后的日志里现形便宜得多。
+function Do-Pin {
+    $deps = @(Get-PathDepPaths)
+    $wu = $deps | Where-Object { (Split-Path $_ -Leaf) -like "wind-ui*" } | Select-Object -First 1
+    if (-not $wu) { ErrMsg "Cargo.toml 里找不到 windui 的 path 依赖"; return $false }
+
+    $head = Get-LocalWindui $wu
+    if (-not $head) { ErrMsg "$wu 不是 git 工作树, 取不到提交号"; return $false }
+
+    # 有没有任何一个远端分支包含它。--contains 比"HEAD 是否等于某个 remote ref"宽松，
+    # 因为本地可能落后于远端若干个提交, 那种情况下这个号照样是 CI 取得到的。
+    $onRemote = @(git -C $wu branch -r --contains $head 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $onRemote.Count -eq 0) {
+        ErrMsg "windui 的 $($head.Substring(0,7)) 还没推到远端, 不能钉它"
+        Gray "  先在 $wu 里 git push, 或者钉一个已推的提交"
+        return $false
+    }
+
+    $old = Get-PinnedWindui
+    if ($old -eq $head) { Say "`nwindui.ref 已是 $($head.Substring(0,7)), 无需改动"; return $true }
+
+    # 只换最后那一行, 注释原样留着 —— 那段注释是这个文件存在的全部理由。
+    $lines = @(Get-Content $PinFile -Encoding UTF8)
+    $done = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -and -not $t.StartsWith("#")) { $lines[$i] = $head; $done = $true; break }
+    }
+    if (-not $done) { $lines += $head }
+    [System.IO.File]::WriteAllText($PinFile, ($lines -join "`r`n") + "`r`n",
+        (New-Object System.Text.UTF8Encoding $false))
+
+    Say "`nwindui.ref: $(if ($old) { $old.Substring(0,7) } else { '(空)' }) → $($head.Substring(0,7))"
+    Gray "  记得把 windui.ref 一起提交, 否则 CI 仍按旧的那版检出"
+    return $true
+}
+
+# Cargo.toml 里所有 path 依赖的绝对路径。与 release.ps1 的 Get-PathDeps 同一条判据,
+# 但这里只要路径 —— 那边还要 git 状态, 合并成一个反而两头将就。
+function Get-PathDepPaths {
+    $out = @()
+    foreach ($line in Get-Content "$Root\Cargo.toml" -Encoding UTF8) {
+        if ($line -notmatch 'path\s*=\s*"([^"]+)"') { continue }
+        $raw = Join-Path $Root $Matches[1]
+        if (Test-Path $raw) { $out += (Resolve-Path $raw).Path }
+    }
+    return $out
+}
+
 # ---------- 代码质量 ----------
 function Do-Check    { Say "`ncargo check...";       Push-Location $Root; try { cargo check }                    finally { Pop-Location } }
 function Do-Clippy   { Say "`ncargo clippy...";      Push-Location $Root; try { cargo clippy --all-targets }     finally { Pop-Location } }
@@ -486,6 +542,7 @@ function Do-FmtCheck { Say "`ncargo fmt --check..."; Push-Location $Root; try { 
 function Do-Clean    { Say "`ncargo clean...";       Push-Location $Root; try { cargo clean }                    finally { Pop-Location } }
 
 function Do-Ci {
+    Test-PinFresh | Out-Null
     Push-Location $Root
     try {
         Do-FmtCheck; if ($LASTEXITCODE -ne 0) { ErrMsg "fmt 检查失败!"; return $false }
@@ -493,6 +550,24 @@ function Do-Ci {
         Do-Test;     if ($LASTEXITCODE -ne 0) { ErrMsg "test 失败!";   return $false }
     } finally { Pop-Location }
     Say "`nCI 全部通过 ✓"; return $true
+}
+
+# windui.ref 与本机 ../wind-ui-rust 的 HEAD 对不对得上。**只警告, 不拦**。
+#
+# 本地同时改两个仓库是常态, 那时两者必然不一致 —— 拦下来只会逼人绕过检查。
+# 但这一句得说出来: 本机绿了不代表 CI 会绿, 因为 CI 编的是 windui.ref 指的那一版。
+# 上一次 CI 挂掉正是这个原因 (见 windui.ref 的注释), 而当时没有任何地方提醒过。
+#
+# release.ps1 里同一件事是**硬失败** —— 发布包必须能由两个确定的提交重现。
+function Test-PinFresh {
+    $pin = Get-PinnedWindui
+    $wu  = @(Get-PathDepPaths) | Where-Object { (Split-Path $_ -Leaf) -like "wind-ui*" } | Select-Object -First 1
+    if (-not $pin -or -not $wu) { return $true }
+    $head = Get-LocalWindui $wu
+    if (-not $head -or $head -eq $pin) { return $true }
+    Warn "`nwindui.ref 钉的是 $($pin.Substring(0,7)), 本机 windui 在 $($head.Substring(0,7))"
+    Gray "  CI 编的是前者。要让 CI 跟上本机, 先在 windui 里 git push, 再 .\scripts\dev.ps1 pin"
+    return $false
 }
 
 # ---------- 命令分发 ----------
@@ -518,6 +593,7 @@ function Invoke-Command ([string]$cmd) {
         { $_ -in "f", "fmt" }       { Do-Fmt;      return $true }
         { $_ -in "fc", "fmt-check" }{ Do-FmtCheck; return $true }
         "ci"                        { return (Do-Ci) }
+        "pin"                       { return (Do-Pin) }
         "clean"                     { Do-Clean;    return $true }
         default { ErrMsg "未知命令: $cmd"; return $false }
     }
@@ -539,6 +615,7 @@ function Show-Menu {
     Write-Host "            gm  下载示例 MDX (用户词典手动测试用)"
     Write-Host "  发布      rel 打成带版本的 zip → artifacts\release\ (构建+验证+压包)"
     Write-Host "  质量      k check   l clippy   t test   f fmt   fc fmt-check   ci   clean"
+    Write-Host "  依赖      pin 把当前 windui 的提交号写进 windui.ref (CI 按它检出)"
     Write-Host "            q 退出"
     Write-Host ""
     $sel = Read-Host "请选择"

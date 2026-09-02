@@ -4,9 +4,19 @@
 # **发布逻辑一份，不是两份**——本地 `.\scripts\dev.ps1 rel` 与这里跑的是同一个脚本，
 # 否则"本地打的包"和"CI 打的包"迟早不是一回事，而那种差异只有用户会发现。
 #
-# 用法：
-#   把 Cargo.toml 的版本改成 0.2.0 并提交 → git tag v0.2.0 → git push origin v0.2.0
-# 脚本会核对 tag 与 Cargo.toml；对不上就当场失败，不会发出一个版本号说不清的包。
+# ## 两种跑法
+#
+# **正式发布**：把 Cargo.toml 的版本改成 0.2.0 并提交 → `git tag v0.2.0` →
+# `git push origin v0.2.0`。脚本会核对 tag 与 Cargo.toml，对不上就当场失败，
+# 不会发出一个版本号说不清的包。
+#
+# **试发布**（本文件在任意分支上手动 workflow_dispatch）：走完一模一样的
+# 构建 → 组装 → 验证 → 压包，但**不建 Release、不动任何 tag**，产物只作为
+# 构建物留 5 天。这条路存在的理由是：这条流水线上真正没把握的是打包与冒烟那几步
+# （runner 上能不能建窗口、能不能渲染），而它们不该等到第一次真发布时才第一次跑。
+#
+# 发不发布由 `github.ref` 是不是 tag 决定，不由某个输入开关决定——开关会被忘在
+# 打开的位置上，而"这是不是一个 tag"没有中间状态。
 name: release
 
 on:
@@ -19,26 +29,53 @@ on:
         type: boolean
         default: true
 
-permissions:
-  contents: write # 建 Release、传附件
-
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # 发布前先过一遍与日常推送**同一套**检查。
+  #
+  # tag 指向的提交未必被 CI 跑过：可以打在几天前的某个提交上，也可以打在一个只改了
+  # Cargo.toml 版本号、还没推过的提交上。到那时才发现编不过，是这条流水线里最贵的
+  # 一种失败——词库已经下完、包已经打了一半。
+  check:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   release:
+    needs: check
     runs-on: windows-latest
+    permissions:
+      contents: write # 建 Release、传附件
     steps:
       # 并排检出，理由同 ci.yml：windui 是 path 依赖。
       # 这一步还有个发布专有的意义：release.ps1 会记下 windui 的提交号写进包内
       # README——path 依赖占了这个 exe 的一大半，不记它，"这个包从哪来的"只答对一半。
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: wind-dict
-      - uses: actions/checkout@v4
+
+      # windui 检出哪一版由 windui.ref 说了算，理由见 ci.yml 与那个文件本身。
+      # 发布这边尤其要紧：包内 README 写着的那个 windui 提交号必须**确有其事**，
+      # 而不是"发布那天默认分支恰好是什么"。
+      - name: 定位 windui
+        id: windui
+        shell: pwsh
+        run: |
+          $ref = "${{ vars.WINDUI_REF }}".Trim()
+          if (-not $ref) {
+            $lines = @(Get-Content wind-dict/windui.ref | Where-Object { $_ -notmatch '^\s*(#|$)' })
+            if ($lines.Count -eq 0) { throw "windui.ref 里没有提交号" }
+            $ref = $lines[0].Trim()
+          }
+          Write-Host "windui → $ref"
+          "ref=$ref" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - uses: actions/checkout@v5
         with:
           repository: huanfeng/wind-ui-rust
-          ref: ${{ vars.WINDUI_REF }}
+          ref: ${{ steps.windui.outputs.ref }}
           path: wind-ui-rust
           token: ${{ secrets.WINDUI_TOKEN || github.token }}
 
@@ -51,26 +88,31 @@ jobs:
       # 缓存能省下每次约十分钟（下 63MB 的 ECDICT CSV + 建 190MB 的库），但代价是
       # 发布出去的词库内容会被冻在缓存里，而这件事**没有任何外在表现**——版本号照涨，
       # 词库还是上个月那份。发布一年也就几次，十分钟买一个"词库确实是这次现下的"，
-      # 划算。cargo 那边照缓存：它是按 Cargo.lock 定址的，不存在同样的问题。
+      # 划算。cargo 那边照缓存：它是按 Cargo.lock + windui 提交号定址的，不存在同样
+      # 的问题。
       - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: release-${{ runner.os }}-${{ hashFiles('wind-dict/Cargo.lock') }}
+          key: release-${{ runner.os }}-${{ steps.windui.outputs.ref }}-${{ hashFiles('wind-dict/Cargo.lock') }}
+          restore-keys: release-${{ runner.os }}-
 
       - name: 打包
         shell: pwsh
         working-directory: wind-dict
         run: |
-          # 冒烟这一步在 GitHub 的 windows runner 上能不能跑通尚未验证（要建窗口、
-          # 要渲染）。跑不通就用 workflow_dispatch 把 smoke 关掉，**不要**为了让流水线
-          # 变绿把它默认改成关——那是唯一一道端到端的检查。
+          # 冒烟这一步要建窗口、要渲染。跑不通就用 workflow_dispatch 把 smoke 关掉，
+          # **不要**为了让流水线变绿把它默认改成关——那是唯一一道端到端的检查。
           # 变量名避开 $args：那是 PowerShell 的自动变量，往里写值能跑，但读起来
           # 像在改函数的入参。
-          $smoke = "${{ github.event.inputs.smoke }}"
-          $relArgs = @("-ExpectVersion", "${{ github.ref_name }}", "-Repo", "${{ github.repository }}")
-          if ($smoke -eq "false") { $relArgs += "-NoSmoke" }
+          $relArgs = @("-Repo", "${{ github.repository }}")
+          # 只有 tag 触发时才核对版本号。手动试跑时 github.ref_name 是分支名，
+          # 拿它去比 Cargo.toml 只会得到一句"版本对不上: main"。
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $relArgs += @("-ExpectVersion", "${{ github.ref_name }}")
+          }
+          if ("${{ github.event.inputs.smoke }}" -eq "false") { $relArgs += "-NoSmoke" }
           .\scripts\release.ps1 @relArgs
 
       # 冒烟的截图留作构建物：出问题时"那个包长什么样"是第一手证据，而它不进发布包。
@@ -82,7 +124,23 @@ jobs:
           path: wind-dict/artifacts/release/*.png
           if-no-files-found: ignore
 
+      # 试跑时把整个包留下来，好让人真的解压双击一次。
+      # tag 触发时不留：同一份 190MB 传两遍（一份 Release 附件、一份构建物）没有意义。
+      - name: 留存待发布的包（试跑）
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dry-run-package
+          path: |
+            wind-dict/artifacts/release/*.zip
+            wind-dict/artifacts/release/*.zip.sha256
+            wind-dict/artifacts/release/wind-dict.json
+          retention-days: 5
+          # 词库已是压过的 .db，再压一遍只是白费时间。
+          compression-level: 0
+
       - name: 建 Release 并上传
+        if: github.ref_type == 'tag'
         shell: pwsh
         working-directory: wind-dict
         env:
@@ -102,3 +160,10 @@ jobs:
             --title "${{ github.ref_name }}" `
             --generate-notes `
             @files
+
+      - name: 试跑结束（未发布）
+        if: github.ref_type != 'tag'
+        shell: pwsh
+        run: |
+          Write-Host "试跑完成：包已打出并通过全部验证，但**没有**建 Release。"
+          Write-Host "正式发布请改 Cargo.toml 版本、提交，然后 git tag vX.Y.Z && git push origin vX.Y.Z"

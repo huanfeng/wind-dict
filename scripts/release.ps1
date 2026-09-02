@@ -183,7 +183,7 @@ function Write-Readme ([string]$path, [string]$version, [hashtable]$git, [array]
 构建于 $stamp · $from
 
 绿色应用：解压到任意目录，双击 wind-dict.exe 即可使用。
-默认唤起热键 Ctrl+Alt+D（可在设置里改）。关闭窗口只是收起，程序留在托盘等热键。
+默认唤起热键 Ctrl+Alt+X（可在设置里改）。关闭窗口只是收起，程序留在托盘等热键。
 
 ── 这个目录里有什么 ────────────────────────────────
   wind-dict.exe   程序
@@ -420,6 +420,32 @@ foreach ($d in $deps) {
         exit 1
     }
     if ($d.Dirty) { Warn "路径依赖 $($d.Name) 不干净, 这个包无法由 $($d.Commit) 重现" }
+}
+
+# windui.ref 必须与真正参与构建的那份 windui 对上。
+#
+# 那个文件是 CI 检出 windui 的依据, 也是"这个包由哪两个提交产生"里的另一半。对不上
+# 意味着:本机打出来的包与 CI 按同一个 tag 打出来的**不是同一个程序**, 而包内 README
+# 上写着的那个 windui 提交号会指向一份并非用来构建它的代码 —— 一个看不出错的错误。
+#
+# 与 dev.ps1 里同名的检查不同, 这里是**硬失败**: 日常开发容得下两边不同步, 发布容不下。
+# CI 上这一条永远成立(windui 就是按 pin 检出的), 除非有人用 WINDUI_REF 覆盖了它 ——
+# 那种情况下更要拦。
+$pin = Get-PinnedWindui
+if ($pin) {
+    foreach ($d in $deps) {
+        if (-not $d.Known -or ($d.Name -notlike "wind-ui*")) { continue }
+        $head = Get-LocalWindui $d.Path
+        if ($head -and $head -ne $pin) {
+            ErrMsg "windui.ref 与实际参与构建的 windui 对不上:"
+            ErrMsg "  windui.ref  $($pin.Substring(0, 7))"
+            ErrMsg "  $($d.Path)  $($head.Substring(0, 7))"
+            Gray  "  先把 windui 推上去, 再 .\scripts\dev.ps1 pin, 然后提交 windui.ref"
+            exit 1
+        }
+    }
+} else {
+    Warn "windui.ref 读不出提交号, 无从核对 path 依赖的版本"
 }
 
 $name     = "wind-dict-$version-$Arch"

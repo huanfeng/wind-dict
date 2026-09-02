@@ -1,0 +1,25 @@
+# windui 的提交号。CI 按它检出 ../wind-ui-rust。
+#
+# ## 为什么要有这个文件
+#
+# windui 是 **path 依赖**（`Cargo.toml` 里 `path = "../wind-ui-rust"`），两个仓库各自
+# 独立推送。CI 此前抓 windui 默认分支的 HEAD，于是「先推 wind-dict、后推 windui」
+# 必红——2026-09-02 第一次 CI 就是这么挂的：找不到 `SelectionScope`、
+# `TabItem::enabled`、`platform::TrayHandle`，全是当时还躺在本机没推的东西。
+#
+# 更麻烦的是本地那份 `../wind-ui-rust` 是一个**可变的工作副本**：同一个 wind-dict
+# 提交，隔壁改一行就编出另一个程序，而以前没有任何地方记录这次构建用的是哪一版。
+# 于是 CI 绿不绿取决于两次 push 的先后，而那个先后不在任何人的检查清单上。
+#
+# ## 怎么维护
+#
+#   .\scripts\dev.ps1 pin    把当前 windui 的 HEAD 写进来（必须已推到远端）
+#
+# `dev.ps1 ci` 在它与本地 windui HEAD 不一致时**警告**——本地正在两个仓库之间来回
+# 改是常态，不该被拦。`release.ps1` 则**直接拒绝打包**：发布包必须能由两个确定的
+# 提交重现，这是 README 里那行「提交 xxx · wind-ui-rust yyy」的唯一依据。
+#
+# 仓库变量 `WINDUI_REF` 可临时覆盖它（调 CI 时用），留空即以本文件为准。
+#
+# 格式：首个非注释非空行是一个完整的 40 位提交号。
+1fb126b753cee12fbffed9b3b926157f56a638c9
