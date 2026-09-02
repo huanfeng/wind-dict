@@ -275,11 +275,24 @@ pub struct Settings {
     /// 只存改过的那些。没有条目就用默认名，故「恢复默认」等同于删掉这一条，不需要
     /// 另存一个「是否用了默认名」的标志——那种标志迟早会与实际的名字对不上。
     pub dict_names: Vec<(String, String)>,
+    /// 词典顺序：来源的**稳定键**，从前到后。
+    ///
+    /// 一份统一的名单，内置词库、自带词典、码表方案都在里面——用户眼里它们都是「一本
+    /// 词典」，分三处各排各的等于让他在三个地方拼出一个顺序。
+    ///
+    /// 只存用户排过的那些，**不在名单里的排在末尾**（保持各自的自然序）：新装一本词典
+    /// 时它出现在最后，而不是插进用户精心排好的序列中间某处。
+    pub dict_order: Vec<String>,
     /// 是否启用码表反查（由字查它在某个输入方案里的编码与拆分）。
     ///
     /// 默认**开**：数据来自机器上已装的清风输入法，探测不到就什么也不会出现，开着没有
     /// 副作用；而默认关意味着装了兄弟软件的用户还得先来设置页找一遍才知道有这功能。
     pub codetables: bool,
+    /// 查词组时要不要逐字列出编码。
+    ///
+    /// 默认**开**：关掉的话查任何多字词，码表那一页都是空的，用户多半会以为功能坏了。
+    /// 但逐字铺开确实会在释义中间夹三五行编码，嫌乱的人可以关——那时只有单字给编码。
+    pub code_multi_char: bool,
     /// 手动指定的方案目录，自动探测之外的补充。
     ///
     /// 探测走的是注册表里的安装位置与 `datadir.conf`（见 `source::windinput`），覆盖不到
@@ -307,7 +320,9 @@ impl Default for Settings {
             user_dict_dir: None,
             disabled_dicts: Vec::new(),
             dict_names: Vec::new(),
+            dict_order: Vec::new(),
             codetables: true,
+            code_multi_char: true,
             codetable_dirs: Vec::new(),
             left_pane_w: LEFT_PANE_W_DEFAULT,
         }
@@ -352,7 +367,9 @@ pub mod keys {
     pub const USER_DICT_DIR: &str = "user_dict_dir";
     pub const DISABLED_DICTS: &str = "disabled_dicts";
     pub const DICT_NAMES: &str = "dict_names";
+    pub const DICT_ORDER: &str = "dict_order";
     pub const CODETABLES: &str = "codetables";
+    pub const CODE_MULTI_CHAR: &str = "code_multi_char";
     pub const CODETABLE_DIRS: &str = "codetable_dirs";
     pub const LEFT_PANE_W: &str = "left_pane_w";
 }
@@ -406,9 +423,15 @@ impl Settings {
             disabled_dicts: get(keys::DISABLED_DICTS)
                 .map(|s| lines_of(&s))
                 .unwrap_or_default(),
+            dict_order: get(keys::DICT_ORDER)
+                .map(|s| lines_of(&s))
+                .unwrap_or_default(),
             codetables: get(keys::CODETABLES)
                 .map(|s| s == "1")
                 .unwrap_or(d.codetables),
+            code_multi_char: get(keys::CODE_MULTI_CHAR)
+                .map(|s| s == "1")
+                .unwrap_or(d.code_multi_char),
             codetable_dirs: get(keys::CODETABLE_DIRS)
                 .map(|s| lines_of(&s).into_iter().map(PathBuf::from).collect())
                 .unwrap_or_default(),
@@ -441,7 +464,9 @@ impl Settings {
                     .collect::<Vec<_>>()
                     .join("\n"),
             ),
+            (keys::DICT_ORDER, self.dict_order.join("\n")),
             (keys::CODETABLES, bool_str(self.codetables).into()),
+            (keys::CODE_MULTI_CHAR, bool_str(self.code_multi_char).into()),
             (
                 keys::CODETABLE_DIRS,
                 self.codetable_dirs
@@ -753,8 +778,12 @@ cedict
                 ("ecdict".into(), "我的英汉".into()),
                 ("朗文 当代.mdx".into(), "朗文".into()),
             ],
+            // 三条，验顺序本身也往返得回来（而不只是集合相等）。
+            dict_order: vec!["cedict".into(), "ecdict".into(), "wubi86".into()],
             // 取非默认值（默认为 true）：等于默认时兜底分支也能让断言过，就验不出往返。
             codetables: false,
+            // 同样取非默认值（默认为 true）。
+            code_multi_char: false,
             // 两条，且其中一条带空格与中文：目录列表用换行分隔，验它不被路径里的空格搅乱。
             codetable_dirs: vec![
                 std::path::PathBuf::from(r"D:\方案"),

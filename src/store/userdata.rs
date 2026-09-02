@@ -410,7 +410,9 @@ mod tests {
             user_dict_dir: Some(std::path::PathBuf::from(r"D:\我的词库")),
             disabled_dicts: vec!["Oxford.mdx".into()],
             dict_names: vec![("cedict".into(), "汉英".into())],
+            dict_order: vec!["cedict".into(), "ecdict".into()],
             codetables: false,
+            code_multi_char: false,
             codetable_dirs: vec![std::path::PathBuf::from(r"D:\方案")],
             left_pane_w: 340,
         };

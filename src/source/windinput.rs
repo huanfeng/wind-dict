@@ -16,7 +16,10 @@
 //!
 //! 卸载项的键名是产品显示名（本机上是「清风输入法」与「清风输入法 (开发版)」），它会随
 //! 品牌、语言、版本变；而「这个目录下有没有 `data\schemas`」是个客观事实。故遍历卸载项、
-//! 用后者判定——同时装了正式版与开发版时两个都能找到，各自成为一处来源。
+//! 用后者判定。
+//!
+//! **唯一按名字认的地方是 [`is_dev_build`]**：开发版与正式版的目录结构、方案数据完全
+//! 相同，从内容上分辨不出来，而开发机上两者并存时列两遍只是重复。
 //!
 //! ## 找不到不是错误
 //!
@@ -45,14 +48,37 @@ pub fn schema_dirs() -> Vec<SchemaDir> {
         }
     };
     for dir in imp::install_dirs() {
+        if is_dev_build(&dir) {
+            continue;
+        }
         let schemas = dir.join("data").join("schemas");
         push(schemas, format!("清风输入法 · {}", dir.display()));
     }
     for (conf_owner, data) in data_dirs() {
+        if conf_owner.to_ascii_lowercase().ends_with("dev") {
+            continue;
+        }
         let schemas = data.join("schemas");
         push(schemas, format!("{conf_owner} · {}", data.display()));
     }
     out
+}
+
+/// 这是不是开发版的安装。
+///
+/// 判据是**目录名以 `dev` 结尾**（`WindInputDev`、`%LOCALAPPDATA%\WindInputDev`）。
+///
+/// 开发机上正式版与开发版常常并存，而两者的内置方案是同一套：都列出来的话，设置页会有
+/// 两行内容一样的「方案来源」，方案本身还要靠 id 去重才不至于出现两个同名页签——用户
+/// 看到的是一堆重复，而这份重复对他没有任何用处。
+///
+/// 认名字是这里唯一能认的东西：开发版与正式版的目录结构、方案数据完全相同，从内容上
+/// 分辨不出来。这条约定跟着兄弟项目的安装器走，它变了这里就要跟着变。
+fn is_dev_build(dir: &Path) -> bool {
+    dir.file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase().ends_with("dev"))
+        .unwrap_or(false)
 }
 
 /// 从 `%LOCALAPPDATA%\<产品>\datadir.conf` 读出用户数据目录。
@@ -237,6 +263,28 @@ mod tests {
     #[test]
     fn 不存在的目录也答得出来() {
         assert!(!looks_like_schema_dir(Path::new(r"Z:\没有这个盘\x")));
+    }
+
+    #[test]
+    fn 开发版的目录认得出来() {
+        assert!(is_dev_build(Path::new(r"C:\Program Files\WindInputDev")));
+        assert!(is_dev_build(Path::new(r"C:\Program Files\windinputdev")));
+        assert!(!is_dev_build(Path::new(r"C:\Program Files\WindInput")));
+        // 「Dev」只在结尾才算，词中间带 dev 的正式产品不该被误伤。
+        assert!(!is_dev_build(Path::new(r"C:\Program Files\DevTools Input")));
+    }
+
+    /// 探测出来的来源里不该有开发版——开发机上它与正式版内容相同，只是重复。
+    #[test]
+    fn 来源里不含开发版() {
+        for d in schema_dirs() {
+            let low = d.path.to_string_lossy().to_ascii_lowercase();
+            assert!(
+                !low.contains("dev\\") && !low.ends_with("dev"),
+                "开发版不该出现在来源里：{:?}",
+                d.path
+            );
+        }
     }
 
     /// 探测本身不该 panic，装没装 WindInput 都一样。

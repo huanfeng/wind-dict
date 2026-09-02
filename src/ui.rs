@@ -148,12 +148,13 @@ const LEFT_FAVORITES: usize = 2;
 enum TabKey {
     /// 全部来源。
     All,
-    /// 随程序分发的词库，值是 `offline::ECDICT_KEY` / `CEDICT_KEY`。
-    Builtin(&'static str),
-    /// 自带词典，值是文件名（`source::user::key_of`）。
-    User(String),
-    /// 码表方案，值是方案 id（`source::codetable::SchemaRef::key`）。
-    Code(String),
+    /// 某一个来源，值是它的**稳定键**：内置词库是 `offline::ECDICT_KEY` /
+    /// `CEDICT_KEY`，自带词典是文件名，码表是方案 id。
+    ///
+    /// 三类来源共用一个变体而不是各占一个：用户眼里它们都是「一本词典」，页签要筛的
+    /// 也只是「这条出自哪一本」。分三个变体的话，每加一类来源就要在筛选、排序、页签
+    /// 三处各补一个分支，而那三处问的其实是同一个问题。
+    Source(String),
 }
 
 /// 一个页签：筛什么、叫什么、这次有没有货。
@@ -201,14 +202,53 @@ fn filter_cards(all: Vec<Card>, key: &TabKey) -> Vec<Card> {
 /// 按方向选路的直接结果。自带词典靠**稳定键**认，不能靠显示名：名字可以被用户改、
 /// 也可能撞车（两个文件的 MDX 标题一模一样是常有的事）。
 fn entry_in_tab(e: &Entry, key: &TabKey) -> bool {
+    match key {
+        TabKey::All => true,
+        TabKey::Source(k) => k == entry_source_key(e),
+    }
+}
+
+/// 某个来源在名单里的位置。不在名单里的排末尾。
+///
+/// 不在名单里 = 用户从没排过它（新装的词典、刚开的码表）。`usize::MAX` 配合**稳定**
+/// 排序，让这些新来的按各自的自然序留在末尾，而不是插进用户排好的序列中间。
+fn order_pos(order: &[String], key: &str) -> usize {
+    order.iter().position(|x| x == key).unwrap_or(usize::MAX)
+}
+
+/// 按词典顺序给词条排座次。
+///
+/// 稳定排序：同一来源内部保持词典自己给出的次序——义项的先后是词典编排的一部分，
+/// 不是可以随便动的东西。
+fn sort_entries_by(entries: &mut [Entry], order: &[String]) {
+    if order.is_empty() {
+        return;
+    }
+    entries.sort_by_key(|e| order_pos(order, entry_source_key(e)));
+}
+
+/// 把第 `from` 项挪到第 `to` 位。返回是否真的动了。
+fn move_key(keys: &mut Vec<String>, from: usize, to: usize) -> bool {
+    if from >= keys.len() || to >= keys.len() || from == to {
+        return false;
+    }
+    let k = keys.remove(from);
+    keys.insert(to, k);
+    true
+}
+
+/// 一条词条出自哪个来源（稳定键）。页签筛选与词典排序都按它。
+///
+/// 内置那两份靠**词条类型**认：`Entry::English` 只可能来自 ECDICT，`Entry::Chinese`
+/// 只可能来自 CC-CEDICT——这不是猜，是 `OfflineDictionary::lookup` 按方向选路的直接
+/// 结果。自带词典与码表各自带着自己的键。
+fn entry_source_key(e: &Entry) -> &str {
     use crate::source::offline::{CEDICT_KEY, ECDICT_KEY};
-    match (key, e) {
-        (TabKey::All, _) => true,
-        (TabKey::Builtin(k), Entry::English(_)) => *k == ECDICT_KEY,
-        (TabKey::Builtin(k), Entry::Chinese(_)) => *k == CEDICT_KEY,
-        (TabKey::User(k), Entry::User(u)) => *k == u.source_key,
-        (TabKey::Code(k), Entry::Code(c)) => *k == c.source_key,
-        _ => false,
+    match e {
+        Entry::English(_) => ECDICT_KEY,
+        Entry::Chinese(_) => CEDICT_KEY,
+        Entry::User(u) => &u.source_key,
+        Entry::Code(c) => &c.source_key,
     }
 }
 
@@ -1033,6 +1073,11 @@ struct State {
     /// 不同——自带词典是用户丢进词典目录的文件，码表是从清风输入法那边探测来的方案，
     /// 各有各的目录、开关与失败方式，设置页也分两处列。
     code_tables: RefCell<Vec<CodeTable>>,
+    /// 设置页停在哪一类（[`SETTINGS_TABS`] 的下标）。
+    ///
+    /// 不落库：它是「我此刻在看哪一页」，不是配置。下次打开设置从第一类开始，与用户
+    /// 上次改了什么无关——记住它反而会让人打开设置时对着一页陌生的东西。
+    settings_tab: Signal<usize>,
     /// 页签集合变了，标签条整体重建一次。
     tabs_rev: Signal<Vec<u64>>,
     /// 结果区的选择域。
@@ -1467,6 +1512,20 @@ impl State {
             }
         }
 
+        // 记历史用的词头**在排序前取**：`builtin_len` 是个下标，排序会打乱它。这批词头
+        // 只该来自内置词库——自带词典的词头常有大小写与标点变体（`Full-House` 与
+        // `fullhouse`，见 ADR-0015），全记下来会在历史里留下几行只差标点的记录。
+        // 内置一条也没命中时退回全部：那时这个词只有自带词典收录，不记的话它永远进不了
+        // 历史——原来的分支语义如此，排序不该顺手改掉它。
+        let record_words = if builtin_len > 0 {
+            headwords_to_record(&entries[..builtin_len])
+        } else {
+            headwords_to_record(&entries)
+        };
+        // 词条按用户配置的词典顺序排。放在最后：上面那几段是「谁查到了什么」，这一步
+        // 才是「按什么次序给用户看」。
+        self.sort_entries(&mut entries);
+
         if entries.is_empty() {
             self.rebuild_cards(&[]);
             self.hint.set(match err {
@@ -1489,12 +1548,7 @@ impl State {
             // 不合起来记：MDX 的词头按归一化后的形式重名（查 `fullhouse` 会同时命中
             // `Full-House` 与 `fullhouse`，见 ADR-0015），全记下来会让一次查询在历史里
             // 留下两三行只差标点的记录。历史是给人翻的。
-            let source = if builtin_len > 0 {
-                &entries[..builtin_len]
-            } else {
-                &entries[..]
-            };
-            self.record_all(&headwords_to_record(source));
+            self.record_all(&record_words);
             // 只有「确定要这个词」的查询才进导航路径，与记历史同一时机。
             // ↑↓ 扫过去的那些不进——否则按住方向键划过二十条，后退键就得
             // 按二十下才退得回来，而用户心里那一步只有一步。
@@ -1637,6 +1691,15 @@ impl State {
     /// 宣告设置有变，令设置页重建。
     fn bump_settings(&self) {
         bump(self.settings_rev);
+    }
+
+    /// 切设置页的分类。整页重建——左侧那一列的选中底色是构建期定死的（windui 的
+    /// `bg_role` 不跟信号走），右侧内容本来就要换。
+    fn set_settings_tab(&self, i: usize) {
+        if self.settings_tab.get() != i {
+            self.settings_tab.set(i);
+            self.bump_settings();
+        }
     }
 
     /// 落盘当前设置。**失败当场告知**——设置是用户主动表达的意图，静默失败会让人
@@ -1907,6 +1970,18 @@ impl State {
         true
     }
 
+    /// 查词组时要不要逐字列出。
+    fn set_code_multi_char(&self, on: bool) -> bool {
+        self.settings.borrow_mut().code_multi_char = on;
+        if !self.save_settings() {
+            return false;
+        }
+        // 重扫是为了把新值贴到每张已打开的表上；顺带让页签的可用态跟着当次结果重算。
+        self.reload_code_tables();
+        self.rebuild_tabs();
+        true
+    }
+
     /// 开关单个码表方案。键是方案 id，与自带词典共用 `disabled_dicts`。
     ///
     /// **不触发设置页重建**：与 `toggle_user_dict` 同一条理由——这一条是从 widget 的
@@ -2003,12 +2078,13 @@ impl State {
     /// 让它出现两个同名页签只会让人以为自己看重影了。
     fn reload_code_tables(&self) {
         self.code_tables.borrow_mut().clear();
-        let (on, manual, disabled) = {
+        let (on, manual, disabled, multi) = {
             let s = self.settings.borrow();
             (
                 s.codetables,
                 s.codetable_dirs.clone(),
                 s.disabled_dicts.clone(),
+                s.code_multi_char,
             )
         };
         if !on {
@@ -2028,7 +2104,8 @@ impl State {
                     continue;
                 }
                 // 一份表读坏了只是少一个页签，不该拖垮别的方案——与自带词典同一条纪律。
-                if let Ok(t) = CodeTable::load(&sc) {
+                if let Ok(mut t) = CodeTable::load(&sc) {
+                    t.set_multi_char(multi);
                     out.push(t);
                 }
             }
@@ -2355,37 +2432,77 @@ impl State {
             .unwrap_or(TabKey::All)
     }
 
-    /// 重建页签集合：全部 + 内置两份 + 每本自带词典。
+    /// 所有来源，**按用户配置的顺序**。返回 `(稳定键, 显示名, 类型说明)`。
     ///
-    /// 只在**页签集合本身**变化时调（装卸词典、改名、开关某本），不在每次查询时调——
-    /// 查询只改各页签的可用态，那走信号（见 [`TabSpec::on`]）。
-    fn rebuild_tabs(&self) {
+    /// 一份统一的名单：内置词库、自带词典、码表方案都在里面。页签、结果区的词条次序、
+    /// 设置页那个可拖的列表，三处读的都是它——否则「顺序」这件事就会有三份各自为政的
+    /// 实现，而用户以为自己只排了一次。
+    fn ordered_sources(&self) -> Vec<(String, String, &'static str)> {
         use crate::source::offline::{CEDICT_KEY, CEDICT_NAME, ECDICT_KEY, ECDICT_NAME};
-        let mut v = {
+        let mut v: Vec<(String, String, &'static str)> = {
             let s = self.settings.borrow();
             vec![
-                TabSpec::new(TabKey::All, "全部".into()),
-                TabSpec::new(
-                    TabKey::Builtin(ECDICT_KEY),
+                (
+                    ECDICT_KEY.to_string(),
                     s.dict_name(ECDICT_KEY, ECDICT_NAME),
+                    "内置 · 英汉",
                 ),
-                TabSpec::new(
-                    TabKey::Builtin(CEDICT_KEY),
+                (
+                    CEDICT_KEY.to_string(),
                     s.dict_name(CEDICT_KEY, CEDICT_NAME),
+                    "内置 · 汉英",
                 ),
             ]
         };
         for d in self.user_dicts.borrow().iter() {
-            v.push(TabSpec::new(
-                TabKey::User(d.key().to_string()),
-                d.name().to_string(),
-            ));
+            v.push((d.key().to_string(), d.name().to_string(), "自带词典"));
         }
         for t in self.code_tables.borrow().iter() {
-            v.push(TabSpec::new(
-                TabKey::Code(t.key().to_string()),
-                t.name().to_string(),
-            ));
+            v.push((t.key().to_string(), t.name().to_string(), "码表"));
+        }
+        // 排过的按名单走，没排过的留在末尾（`usize::MAX`）并保持各自的自然序——
+        // `sort_by_key` 是稳定排序，新装的词典因此出现在最后，而不是插进用户排好的
+        // 序列中间。
+        let order = self.settings.borrow().dict_order.clone();
+        v.sort_by_key(|(k, _, _)| order_pos(&order, k));
+        v
+    }
+
+    /// 把第 `from` 本词典挪到第 `to` 位。
+    fn move_dict_order(&self, from: usize, to: usize) {
+        let mut keys: Vec<String> = self
+            .ordered_sources()
+            .into_iter()
+            .map(|(k, _, _)| k)
+            .collect();
+        if !move_key(&mut keys, from, to) {
+            return;
+        }
+        self.settings.borrow_mut().dict_order = keys;
+        if self.save_settings() {
+            // 页签顺序跟着变。**不重建设置页**：可排序列表已经把行挪到位了
+            // （`CommitMode::Children`），此刻重建会在松手的瞬间把整页换掉，看着像闪了
+            // 一下，而拖拽的结果本来就已经在眼前。
+            self.rebuild_tabs();
+        }
+    }
+
+    /// 词条按用户配置的词典顺序排。
+    ///
+    /// 稳定排序：同一来源内部保持词典自己给出的次序（义项顺序是词典编排的一部分）。
+    fn sort_entries(&self, entries: &mut [Entry]) {
+        let order = self.settings.borrow().dict_order.clone();
+        sort_entries_by(entries, &order);
+    }
+
+    /// 重建页签集合：全部 + 每个来源各一个。
+    ///
+    /// 只在**页签集合本身**变化时调（装卸词典、改名、开关某本），不在每次查询时调——
+    /// 查询只改各页签的可用态，那走信号（见 [`TabSpec::on`]）。
+    fn rebuild_tabs(&self) {
+        let mut v = vec![TabSpec::new(TabKey::All, "全部".into())];
+        for (key, name, _) in self.ordered_sources() {
+            v.push(TabSpec::new(TabKey::Source(key), name));
         }
         // 词典少了的话当前下标可能落到外面。回「全部」而不是钳到末项：钳过去等于把
         // 用户默默扔进另一本词典的结果里，而他并没有选它。
@@ -2593,6 +2710,7 @@ pub fn build(
         tray,
         dict_tab: signal(DICT_ALL),
         tabs: RefCell::new(Vec::new()),
+        settings_tab: signal(0),
         tabs_rev: signal(vec![0]),
         sel_scope: SelectionScope::new(),
         // 开屏停在历史页：DESIGN.md 的「Search is home / Recall is a drawer」讲的是
@@ -3344,44 +3462,112 @@ fn settings_page(st: Rc<State>) -> Element {
                         .fg_role(Role::Text),
                 ),
         )
-        .child(scroll_area(Element::host_signal(
-            st.settings_rev,
-            move |_rev: u64| settings_body(st.clone()),
-        )))
+        // 滚动区**在右侧内容里面**，不在这一层：左侧那列分类要一直看得见，跟着正文
+        // 一起滚走的话，翻到长页面的底部就找不到别的分类了。
+        .child(
+            Element::host_signal(st.settings_rev, move |_rev: u64| settings_body(st.clone()))
+                .width_match()
+                .weight(1.0),
+        )
+}
+
+/// 设置页的分类。
+///
+/// 分五类而不是把十来个组一路平铺：平铺时「词典顺序」这种要反复来调的东西被埋在第七屏，
+/// 而它旁边是「快捷键一览」这种读一次就不再看的说明。
+const SETTINGS_TABS: [&str; 5] = ["常规", "外观", "词典", "数据", "关于"];
+
+/// 设置页左侧的分类列。
+fn settings_nav(st: Rc<State>) -> Element {
+    let cur = st.settings_tab.get();
+    let mut col = Element::col()
+        .width(150)
+        .height_match()
+        .padding_xy(10, 18)
+        .spacing(2)
+        // 与左栏同一套：分类列是导航，比正文暗一档，两边的分界不全靠那条竖线撑着。
+        .bg_role(Role::SurfaceAlt)
+        .border_role(Role::Divider, 1)
+        .border_edges(Edges::RIGHT);
+    for (i, name) in SETTINGS_TABS.iter().enumerate() {
+        let st2 = st.clone();
+        let on = i == cur;
+        let mut item = Element::row()
+            .width_match()
+            .height(34)
+            .cross(Align::Center)
+            .padding_xy(12, 0)
+            .corner(8.0)
+            .clickable()
+            .on_click(move |_| st2.set_settings_tab(i));
+        if on {
+            item = item.bg_role_alpha(Role::Accent, ACCENT_SOFT_A);
+        }
+        col = col.child(
+            item.child(
+                Element::label((*name).to_string())
+                    .font_size(13.5)
+                    .font_weight(if on { 600 } else { 400 })
+                    .fg_role(if on { Role::Accent } else { Role::Text }),
+            ),
+        );
+    }
+    col
 }
 
 /// 设置页正文。每次 `settings_rev` 变动整体重建，故其中的构建时求值（选中环、
 /// 词库路径）总是新鲜的。
 fn settings_body(st: Rc<State>) -> Element {
+    Element::row()
+        .width_match()
+        .height_match()
+        .child(settings_nav(st.clone()))
+        // `weight` 在横向容器里给的是**宽度**，纵向要另外 `height_match` ——
+        // 少这一句的话滚动区只有内容那么高，滚不起来。
+        .child(
+            Element::scroll()
+                .weight(1.0)
+                .height_match()
+                .child(settings_pane(st)),
+        )
+}
+
+/// 设置页右侧：当前分类下的那几组。
+///
+/// 回执不占正文里的一行：它走顶部的 Toast（见 `ToastSink`）。两处都报等于同一句话说
+/// 两遍，而设置页那条还会把它下面的所有分组往下顶一截——一条三秒后就该消失的消息，
+/// 不该让页面跳一下。
+fn settings_pane(st: Rc<State>) -> Element {
+    let mut inner = Element::col()
+        .width_match()
+        .max_width(620)
+        .padding_xy(40, 26)
+        .spacing(28);
+    inner = match st.settings_tab.get() {
+        0 => inner
+            .child(group("唤起", hotkey_row(st.clone())))
+            .child(group("启动", autostart_row(st))),
+        1 => inner
+            .child(group("外观", appearance_group(st.clone())))
+            .child(group("布局", pane_w_row(st))),
+        2 => inner
+            .child(group("词典顺序", dict_order_rows(st.clone())))
+            .child(group("词库", dict_rows(st.clone())))
+            .child(group("自带词典", user_dict_rows(st.clone())))
+            .child(group("码表反查", codetable_rows(st.clone())))
+            .child(group("释义显示", expand_en_row(st))),
+        3 => inner.child(group("数据", data_rows(st))),
+        // 快捷键一览是**说明书**，不是设置——读一次就记住了，故与「关于」同处最后一类，
+        // 不占前面几类的位置。
+        _ => inner
+            .child(group("快捷键", shortcut_rows()))
+            .child(group("关于", about_rows())),
+    };
+    // 内容居中：右侧比 620 宽出来的部分两边匀开，不靠着分类列那一边贴边。
     Element::col()
         .width_match()
-        // 内容居中。此前主列左边有 224px 的侧栏顶着，620 的限宽靠左也还平衡；召回移到
-        // 右侧抽屉之后主列宽了 200 多，再靠左就是一边贴边、一边空一大片。
         .cross(Align::Center)
-        .child(
-            Element::col()
-                .width_match()
-                .max_width(620)
-                .padding_xy(40, 26)
-                .spacing(28)
-                // 回执不再占正文里的一行：它现在走顶部的 Toast（见 `ToastSink`）。
-                // 两处都报等于同一句话说两遍，而设置页那条还会把它下面的所有分组
-                // 往下顶一截——一条三秒后就该消失的消息，不该让页面跳一下。
-                .child(group("外观", appearance_group(st.clone())))
-                .child(group("布局", pane_w_row(st.clone())))
-                .child(group("唤起", hotkey_row(st.clone())))
-                .child(group("启动", autostart_row(st.clone())))
-                .child(group("词库", dict_rows(st.clone())))
-                .child(group("自带词典", user_dict_rows(st.clone())))
-                .child(group("码表反查", codetable_rows(st.clone())))
-                .child(group("释义显示", expand_en_row(st.clone())))
-                .child(group("数据", data_rows(st)))
-                // 快捷键一览沉到底部：它是**说明书**，不是设置——读一次就记住了，
-                // 而上面每一项都是要反复来改的。七行键位摆在第四组，等于让每个来改
-                // 词库目录的人先滚过一屏自己早就知道的东西。
-                .child(group("快捷键", shortcut_rows()))
-                .child(group("关于", about_rows())),
-        )
+        .child(inner)
 }
 
 /// 数据管理：条数如实展示 + 清空历史。
@@ -3829,6 +4015,35 @@ fn expand_en_row(st: Rc<State>) -> Element {
     )
 }
 
+/// 词典顺序：一份可拖的名单，内置词库、自带词典、码表方案都在里面。
+///
+/// 分三处各排各的等于让用户在三个地方拼出一个顺序，而他心里只有一份「先看哪本」。
+fn dict_order_rows(st: Rc<State>) -> Element {
+    let items = st.ordered_sources();
+    if items.len() < 2 {
+        return card(vec![row(
+            "暂时无需排序",
+            Some("装上第二本词典（或打开码表反查）之后，这里可以拖动调整先后"),
+            Element::col(),
+        )]);
+    }
+    let rows: Vec<Element> = items
+        .iter()
+        .map(|(_, name, kind)| row(name, Some(kind), Element::col()))
+        .collect();
+    let st2 = st.clone();
+    card(vec![
+        row(
+            "拖动调整顺序",
+            Some("页签从左到右、同一个词头下的词条从上到下，都按这个顺序"),
+            Element::col(),
+        ),
+        Element::reorder_list(rows)
+            .width_match()
+            .on_reorder(move |_ctx, from, to| st2.move_dict_order(from, to)),
+    ])
+}
+
 /// 码表反查设置：总开关 + 方案来源 + 每个方案一行。
 ///
 /// 数据不由本程序分发，来自机器上已装的清风输入法（见 `source::windinput`），故这一组
@@ -3846,6 +4061,14 @@ fn codetable_rows(st: Rc<State>) -> Element {
     if !on {
         return card(rows);
     }
+
+    rows.push(toggle_row(
+        st.clone(),
+        "词组逐字列出",
+        "关掉后只对单字给编码；查词组时不再在释义中间铺开三五行",
+        |st| st.settings.borrow().code_multi_char,
+        |st, v| st.set_code_multi_char(v),
+    ));
 
     // 探测到的来源。**只读**：它们由清风输入法的安装位置决定，本程序改不了，给个
     // 「打开」让用户自己去看比给个删不掉的删除按钮诚实。
@@ -3913,24 +4136,32 @@ fn codetable_rows(st: Rc<State>) -> Element {
             })),
     ));
 
-    // 每个方案一行：名字 + 字数 + 改名框 + 开关。关掉的方案不在 `code_tables` 里
-    // （`reload_code_tables` 直接跳过），故要另外把它们列出来——否则关掉之后那一行
-    // 连同它的开关一起消失，用户再也开不回来。
+    // 每个方案一行：名字 + 字数 + 改名框 + 开关。
+    //
+    // **顺序只由目录序与文件名决定，与开关无关。** 从磁盘扫出全部方案、再标注哪些启用，
+    // 而不是「先列已加载的、再补上关掉的」——后者会让一个方案在关掉的瞬间跳到列表末尾，
+    // 用户想再打开它得先去别处找。开关是用来改状态的，不是用来改位置的。
+    //
+    // 关掉的方案不在 `code_tables` 里（`reload_code_tables` 直接跳过），故这里另行扫盘，
+    // 否则关掉之后那一行连同它的开关一起消失，用户再也开不回来。
     let disabled = st.settings.borrow().disabled_dicts.clone();
-    let mut seen = std::collections::HashSet::new();
-    let mut listed: Vec<(String, String, Option<usize>)> = Vec::new();
-    for t in st.code_tables.borrow().iter() {
-        if seen.insert(t.key().to_string()) {
-            listed.push((t.key().to_string(), t.name().to_string(), Some(t.len())));
-        }
-    }
     let mut dirs: Vec<std::path::PathBuf> = found.iter().map(|d| d.path.clone()).collect();
     dirs.extend(st.settings.borrow().codetable_dirs.iter().cloned());
+    let mut seen = std::collections::HashSet::new();
+    let mut listed: Vec<(String, String, Option<usize>)> = Vec::new();
     for dir in &dirs {
         for sc in crate::source::codetable::discover(dir) {
-            if seen.insert(sc.key.clone()) {
-                listed.push((sc.key, sc.name, None));
+            if !seen.insert(sc.key.clone()) {
+                continue;
             }
+            // 字数只有加载了才知道；没加载就是被关掉了。
+            let chars = st
+                .code_tables
+                .borrow()
+                .iter()
+                .find(|t| t.key() == sc.key)
+                .map(|t| t.len());
+            listed.push((sc.key, sc.name, chars));
         }
     }
     for (key, name, chars) in listed {
@@ -5200,9 +5431,9 @@ fn join(s: &Sense) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_left_w, entry_in_tab, expand_key, filter_cards, grading_row, group_by_headword,
-        headwords_to_record, scroll_area, signal, write_note, Card, ExpandedStates, NavPath, Role,
-        TabKey, RIGHT_MIN_W,
+        clamp_left_w, entry_in_tab, entry_source_key, expand_key, filter_cards, grading_row,
+        group_by_headword, headwords_to_record, move_key, order_pos, scroll_area, signal,
+        sort_entries_by, write_note, Card, ExpandedStates, NavPath, Role, TabKey, RIGHT_MIN_W,
     };
     use crate::domain::{
         ChineseEntry, EnglishEntry, Entry, ExamTag, Grading, Headword, Inflections, Sense,
@@ -5484,8 +5715,9 @@ mod tests {
         }
     }
 
-    fn 内置(key: &'static str) -> TabKey {
-        TabKey::Builtin(key)
+    /// 某个来源的页签。三类来源共用一个变体，测试里也就只有这一个构造。
+    fn 页(key: &str) -> TabKey {
+        TabKey::Source(key.to_string())
     }
 
     #[test]
@@ -5510,12 +5742,12 @@ mod tests {
         let en = 英汉("apple");
         let zh = 汉英("苹果", "ping2 guo3");
         let user = 自带("apple");
-        assert!(entry_in_tab(&en, &内置(ECDICT_KEY)));
-        assert!(!entry_in_tab(&zh, &内置(ECDICT_KEY)));
-        assert!(!entry_in_tab(&user, &内置(ECDICT_KEY)), "自带的不算内置的");
-        assert!(entry_in_tab(&zh, &内置(CEDICT_KEY)));
-        assert!(!entry_in_tab(&en, &内置(CEDICT_KEY)));
-        assert!(!entry_in_tab(&user, &内置(CEDICT_KEY)));
+        assert!(entry_in_tab(&en, &页(ECDICT_KEY)));
+        assert!(!entry_in_tab(&zh, &页(ECDICT_KEY)));
+        assert!(!entry_in_tab(&user, &页(ECDICT_KEY)), "自带的不算内置的");
+        assert!(entry_in_tab(&zh, &页(CEDICT_KEY)));
+        assert!(!entry_in_tab(&en, &页(CEDICT_KEY)));
+        assert!(!entry_in_tab(&user, &页(CEDICT_KEY)));
     }
 
     /// 混装卡片按页签**拆开**：内置页只留内置的词条，自带页只留那一本的。
@@ -5530,12 +5762,12 @@ mod tests {
         let all = filter_cards(vec![c.clone()], &TabKey::All);
         assert_eq!(all[0].entries.len(), 2, "全部页两条都在");
 
-        let ec = filter_cards(vec![c.clone()], &内置(ECDICT_KEY));
+        let ec = filter_cards(vec![c.clone()], &页(ECDICT_KEY));
         assert_eq!(ec.len(), 1, "词头还在");
         assert_eq!(ec[0].entries.len(), 1);
         assert!(matches!(ec[0].entries[0], Entry::English(_)));
 
-        let ox = filter_cards(vec![c], &TabKey::User("牛津.mdx".into()));
+        let ox = filter_cards(vec![c], &页("牛津.mdx"));
         assert_eq!(ox[0].entries.len(), 1);
         assert!(matches!(ox[0].entries[0], Entry::User(_)));
     }
@@ -5545,7 +5777,77 @@ mod tests {
     fn 筛空的卡片不留词头() {
         use crate::source::offline::CEDICT_KEY;
         let c = 卡片(vec![英汉("apple")]);
-        assert!(filter_cards(vec![c], &内置(CEDICT_KEY)).is_empty());
+        assert!(filter_cards(vec![c], &页(CEDICT_KEY)).is_empty());
+    }
+
+    fn 名单(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 没排过的来源留在末尾，且保持各自的自然序。
+    ///
+    /// 这是「新装一本词典」该有的样子：出现在最后，而不是插进用户排好的序列中间某处。
+    #[test]
+    fn 没排过的来源留在末尾() {
+        let order = 名单(&["cedict"]);
+        assert_eq!(order_pos(&order, "cedict"), 0);
+        assert_eq!(order_pos(&order, "ecdict"), usize::MAX);
+        assert_eq!(order_pos(&order, "wubi86"), usize::MAX);
+    }
+
+    /// 词条按名单排，同一来源内部的次序不动。
+    #[test]
+    fn 词条按词典顺序排座次() {
+        use crate::source::offline::{CEDICT_KEY, ECDICT_KEY};
+        let mut v = vec![
+            英汉("apple"),
+            自带来自("apple", "牛津.mdx"),
+            汉英("苹果", "ping2 guo3"),
+        ];
+        sort_entries_by(&mut v, &名单(&["牛津.mdx", CEDICT_KEY, ECDICT_KEY]));
+        assert_eq!(entry_source_key(&v[0]), "牛津.mdx");
+        assert_eq!(entry_source_key(&v[1]), CEDICT_KEY);
+        assert_eq!(entry_source_key(&v[2]), ECDICT_KEY);
+    }
+
+    /// 同一来源的多条词条保持原有先后——义项顺序是词典编排的一部分。
+    #[test]
+    fn 同一来源内部的次序不动() {
+        let mut v = vec![
+            自带来自("a", "牛津.mdx"),
+            自带来自("b", "牛津.mdx"),
+            英汉("apple"),
+        ];
+        sort_entries_by(&mut v, &名单(&["牛津.mdx"]));
+        assert_eq!(v[0].headword().as_str(), "a");
+        assert_eq!(v[1].headword().as_str(), "b");
+    }
+
+    /// 名单是空的（用户从没排过）就一条也不动。
+    #[test]
+    fn 没排过时保持查询的原始次序() {
+        let mut v = vec![自带来自("a", "牛津.mdx"), 英汉("apple")];
+        sort_entries_by(&mut v, &[]);
+        assert_eq!(entry_source_key(&v[0]), "牛津.mdx", "空名单不该重排");
+    }
+
+    #[test]
+    fn 挪位置() {
+        let mut k = 名单(&["a", "b", "c"]);
+        assert!(move_key(&mut k, 0, 2));
+        assert_eq!(k, 名单(&["b", "c", "a"]));
+        assert!(move_key(&mut k, 2, 0));
+        assert_eq!(k, 名单(&["a", "b", "c"]));
+    }
+
+    /// 越界与原地不动都要安全返回，不能 panic 也不能悄悄改坏名单。
+    #[test]
+    fn 挪位置的边界() {
+        let mut k = 名单(&["a", "b"]);
+        assert!(!move_key(&mut k, 0, 0), "原地不算动");
+        assert!(!move_key(&mut k, 5, 0), "起点越界");
+        assert!(!move_key(&mut k, 0, 5), "终点越界");
+        assert_eq!(k, 名单(&["a", "b"]), "边界情形下名单不该被改动");
     }
 
     /// 自带词典按**稳定键**认，不按显示名。
@@ -5556,7 +5858,7 @@ mod tests {
     fn 自带词典按文件名分页() {
         let a = 自带来自("apple", "牛津.mdx");
         let b = 自带来自("apple", "柯林斯.mdx");
-        let 牛津 = TabKey::User("牛津.mdx".into());
+        let 牛津 = 页("牛津.mdx");
         assert!(entry_in_tab(&a, &牛津));
         assert!(!entry_in_tab(&b, &牛津), "同名不同文件必须分开");
         assert!(!entry_in_tab(&英汉("apple"), &牛津), "内置的不进自带页");

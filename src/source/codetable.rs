@@ -63,6 +63,8 @@ pub struct CodeTable {
     /// 用户改的名字（`Settings::dict_names`）。与自带词典同一套机制。
     alias: Option<String>,
     font_family: Option<String>,
+    /// 查词组时要不要逐字列出（`Settings::code_multi_char`）。
+    multi_char: bool,
     map: HashMap<char, CodeInfo>,
 }
 
@@ -107,6 +109,7 @@ impl CodeTable {
             base_name: schema.name.clone(),
             alias: None,
             font_family: schema.font_family.clone(),
+            multi_char: true,
             map,
         })
     }
@@ -126,6 +129,11 @@ impl CodeTable {
 
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    /// 查词组时是否逐字列出。
+    pub fn set_multi_char(&mut self, on: bool) {
+        self.multi_char = on;
     }
 
     /// 改名。空名字 = 恢复默认，与自带词典同一套语义。
@@ -156,7 +164,9 @@ impl Dictionary for CodeTable {
                 })
             })
             .collect();
-        if chars.is_empty() {
+        // 判据是**命中的字数**而不是查询词的长度：查「的x」只命中一个字，那仍是一次
+        // 单字反查，不该被「词组」这条规则挡掉。
+        if chars.is_empty() || (!self.multi_char && chars.len() > 1) {
             return Ok(Lookup::NotFound);
         }
         Ok(Lookup::Found {
@@ -456,6 +466,38 @@ path = "wubi86/wubi86_jidian.dict.yaml"
         };
         assert_eq!(e.chars[0].code, "");
         assert_eq!(e.chars[0].roots, "白 勺");
+    }
+
+    /// 关掉「词组逐字」后，多字词不再给结果；单字照旧。
+    #[test]
+    fn 词组逐字可以关掉() {
+        let mut t = 表("的	白 勺	rqyy
+一	一	ggll
+");
+        t.set_multi_char(false);
+        assert!(matches!(
+            t.lookup(&Query::new("的一").unwrap()).unwrap(),
+            Lookup::NotFound
+        ));
+        assert!(matches!(
+            t.lookup(&Query::new("的").unwrap()).unwrap(),
+            Lookup::Found { .. }
+        ));
+    }
+
+    /// 只命中一个字的多字查询仍算单字反查。
+    #[test]
+    fn 关掉之后半命中的查询照样给() {
+        let mut t = 表("的	白 勺	rqyy
+");
+        t.set_multi_char(false);
+        assert!(
+            matches!(
+                t.lookup(&Query::new("的x").unwrap()).unwrap(),
+                Lookup::Found { .. }
+            ),
+            "「的x」只命中一个字，那仍是一次单字反查"
+        );
     }
 
     #[test]
