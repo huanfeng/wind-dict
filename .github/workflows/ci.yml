@@ -19,8 +19,13 @@ on:
 
 # 同一分支上新的推送把旧的取消：一次运行要几分钟，连推三次时后两次的结果才作数。
 # 排除 tag：发布跑的那次不能被任何东西掐掉。
+#
+# 组名里**必须带 github.workflow**。被 release.yml 以 workflow_call 复用时，
+# github.ref 仍是调用方那个 ref——只按 ref 分组的话，「推一次 main」与「在 main 上
+# 试跑发布」会落进同一组，互相把对方掐掉。而 workflow_call 下 github.workflow 是
+# 调用方的名字（release），两者天然分开。
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
