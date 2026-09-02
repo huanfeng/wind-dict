@@ -275,6 +275,17 @@ pub struct Settings {
     /// 只存改过的那些。没有条目就用默认名，故「恢复默认」等同于删掉这一条，不需要
     /// 另存一个「是否用了默认名」的标志——那种标志迟早会与实际的名字对不上。
     pub dict_names: Vec<(String, String)>,
+    /// 是否启用码表反查（由字查它在某个输入方案里的编码与拆分）。
+    ///
+    /// 默认**开**：数据来自机器上已装的清风输入法，探测不到就什么也不会出现，开着没有
+    /// 副作用；而默认关意味着装了兄弟软件的用户还得先来设置页找一遍才知道有这功能。
+    pub codetables: bool,
+    /// 手动指定的方案目录，自动探测之外的补充。
+    ///
+    /// 探测走的是注册表里的安装位置与 `datadir.conf`（见 `source::windinput`），覆盖不到
+    /// 便携版、解压即用、或装在别处的情形——那时用户自己指一下。存**目录**而不是单个
+    /// 方案文件，与自带词典目录同一条理由：丢进去就能用。
+    pub codetable_dirs: Vec<PathBuf>,
     /// 左栏宽度（逻辑 px）。
     ///
     /// 存**像素**而非左右比例，是因为左栏装的是一列词头：它需要的宽度由「一个词头加
@@ -296,6 +307,8 @@ impl Default for Settings {
             user_dict_dir: None,
             disabled_dicts: Vec::new(),
             dict_names: Vec::new(),
+            codetables: true,
+            codetable_dirs: Vec::new(),
             left_pane_w: LEFT_PANE_W_DEFAULT,
         }
     }
@@ -339,6 +352,8 @@ pub mod keys {
     pub const USER_DICT_DIR: &str = "user_dict_dir";
     pub const DISABLED_DICTS: &str = "disabled_dicts";
     pub const DICT_NAMES: &str = "dict_names";
+    pub const CODETABLES: &str = "codetables";
+    pub const CODETABLE_DIRS: &str = "codetable_dirs";
     pub const LEFT_PANE_W: &str = "left_pane_w";
 }
 
@@ -391,6 +406,12 @@ impl Settings {
             disabled_dicts: get(keys::DISABLED_DICTS)
                 .map(|s| lines_of(&s))
                 .unwrap_or_default(),
+            codetables: get(keys::CODETABLES)
+                .map(|s| s == "1")
+                .unwrap_or(d.codetables),
+            codetable_dirs: get(keys::CODETABLE_DIRS)
+                .map(|s| lines_of(&s).into_iter().map(PathBuf::from).collect())
+                .unwrap_or_default(),
             // 读回来就钳一次。库里的值可能是手改的、也可能是旧版本在别的窗口尺寸下
             // 写的，而一个 5px 或 5000px 的左栏会让界面直接不可用——那属于「读不到
             // 就退回默认」这条策略要挡住的同一类事故。
@@ -419,6 +440,18 @@ impl Settings {
                     .map(|(k, v)| format!("{k}\t{v}"))
                     .collect::<Vec<_>>()
                     .join("\n"),
+            ),
+            (keys::CODETABLES, bool_str(self.codetables).into()),
+            (
+                keys::CODETABLE_DIRS,
+                self.codetable_dirs
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(
+                        "
+",
+                    ),
             ),
             (keys::LEFT_PANE_W, self.left_pane_w.to_string()),
         ]
@@ -719,6 +752,13 @@ cedict
             dict_names: vec![
                 ("ecdict".into(), "我的英汉".into()),
                 ("朗文 当代.mdx".into(), "朗文".into()),
+            ],
+            // 取非默认值（默认为 true）：等于默认时兜底分支也能让断言过，就验不出往返。
+            codetables: false,
+            // 两条，且其中一条带空格与中文：目录列表用换行分隔，验它不被路径里的空格搅乱。
+            codetable_dirs: vec![
+                std::path::PathBuf::from(r"D:\方案"),
+                std::path::PathBuf::from(r"E:\my schemas"),
             ],
             // 特意取非默认值：等于默认时，`from_pairs` 的兜底分支也能让断言通过，
             // 那就验不出这一项到底有没有真的往返。

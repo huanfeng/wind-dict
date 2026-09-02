@@ -7,5 +7,7 @@
 //!
 //! 二者不统一抽象（docs/adr/0008）：可信度不同，数据形状也不同。译源尚未实现。
 
+pub mod codetable;
 pub mod offline;
 pub mod user;
+pub mod windinput;

@@ -367,6 +367,8 @@ pub enum Entry {
     Chinese(ChineseEntry),
     /// 自带词典的词条，源自用户放进来的 MDX。
     User(UserEntry),
+    /// 码表词条：这个词在某个输入方案里怎么打、怎么拆。
+    Code(CodeEntry),
 }
 
 impl Entry {
@@ -376,8 +378,39 @@ impl Entry {
             Entry::English(e) => &e.headword,
             Entry::Chinese(e) => &e.headword,
             Entry::User(e) => &e.headword,
+            Entry::Code(e) => &e.headword,
         }
     }
+}
+
+/// 一个字在某个输入方案里的编码与字根拆分。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CharCode {
+    pub ch: char,
+    /// 输入编码。可能为空——有的拆字表只给拆分。
+    pub code: String,
+    /// 字根序列，空格分隔。
+    ///
+    /// 五笔的字根落在 Unicode 私用区，要配字根字体才显示得出来（见 `CodeEntry::font_family`）；
+    /// 用汉字部件当字根的方案（虎码等）则是普通文本。
+    pub roots: String,
+}
+
+/// 码表词条：词头 + **逐字**的编码与拆分。
+///
+/// 逐字而不是整词一个编码：拆字表讲的是单字怎么拆，词的编码由各方案的造词规则算出来，
+/// 不在这份数据里，编不出来就不编。而逐字列出恰好是有用的那一面——想不起某个字怎么打
+/// 时，要看的正是它。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeEntry {
+    pub headword: Headword,
+    /// 方案名（用户可改）。
+    pub source: String,
+    /// 方案的**稳定键**，页签按它筛。同 `UserEntry::source_key` 的理由。
+    pub source_key: String,
+    /// 字根字体家族名。`None` = 字根是普通文本，用正文字体即可。
+    pub font_family: Option<String>,
+    pub chars: Vec<CharCode>,
 }
 
 /// 自带词典的词条：词头 + 一段富文本，没有任何字段化信息。

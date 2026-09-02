@@ -35,6 +35,7 @@ use crate::domain::{
 };
 use crate::settings::Settings;
 use crate::skin::{SkinMode, SkinStyle};
+use crate::source::codetable::CodeTable;
 use crate::source::offline::OfflineDictionary;
 use crate::source::user::UserDictionary;
 use crate::store::userdata::{now_secs, UserDataState};
@@ -151,6 +152,8 @@ enum TabKey {
     Builtin(&'static str),
     /// 自带词典，值是文件名（`source::user::key_of`）。
     User(String),
+    /// 码表方案，值是方案 id（`source::codetable::SchemaRef::key`）。
+    Code(String),
 }
 
 /// 一个页签：筛什么、叫什么、这次有没有货。
@@ -204,6 +207,7 @@ fn entry_in_tab(e: &Entry, key: &TabKey) -> bool {
         (TabKey::Builtin(k), Entry::English(_)) => *k == ECDICT_KEY,
         (TabKey::Builtin(k), Entry::Chinese(_)) => *k == CEDICT_KEY,
         (TabKey::User(k), Entry::User(u)) => *k == u.source_key,
+        (TabKey::Code(k), Entry::Code(c)) => *k == c.source_key,
         _ => false,
     }
 }
@@ -1023,6 +1027,12 @@ struct State {
     dict_tab: Signal<usize>,
     /// 页签集合。随装卸词典与改名而变，随查询**不变**（变的只是各自的可用态）。
     tabs: RefCell<Vec<TabSpec>>,
+    /// 已装的码表方案（由字查编码与拆分）。
+    ///
+    /// 与自带词典分开存而不是塞进同一个 `Vec<Box<dyn Dictionary>>`：两者的**来源**
+    /// 不同——自带词典是用户丢进词典目录的文件，码表是从清风输入法那边探测来的方案，
+    /// 各有各的目录、开关与失败方式，设置页也分两处列。
+    code_tables: RefCell<Vec<CodeTable>>,
     /// 页签集合变了，标签条整体重建一次。
     tabs_rev: Signal<Vec<u64>>,
     /// 结果区的选择域。
@@ -1449,6 +1459,14 @@ impl State {
             self.note_err(format!("自带词典读取失败：{}", broken.join("、")));
         }
 
+        // 码表排在最后：它回答的是「这个词怎么打」，而不是「这个词什么意思」。查词的人
+        // 多数时候要的是后者，把编码顶到释义前面等于替他改了目的。
+        for t in self.code_tables.borrow().iter() {
+            if let Ok(Lookup::Found { entries: found, .. }) = t.lookup(&q) {
+                entries.extend(found);
+            }
+        }
+
         if entries.is_empty() {
             self.rebuild_cards(&[]);
             self.hint.set(match err {
@@ -1872,6 +1890,87 @@ impl State {
         }
     }
 
+    /// 总开关：要不要做码表反查。
+    fn set_codetables(&self, on: bool) -> bool {
+        self.settings.borrow_mut().codetables = on;
+        if !self.save_settings() {
+            return false;
+        }
+        self.reload_code_tables();
+        self.rebuild_tabs();
+        let n = self.code_tables.borrow().len();
+        self.note_ok(if on {
+            format!("已开启码表反查，找到 {n} 个方案")
+        } else {
+            "已关闭码表反查".to_string()
+        });
+        true
+    }
+
+    /// 开关单个码表方案。键是方案 id，与自带词典共用 `disabled_dicts`。
+    ///
+    /// **不触发设置页重建**：与 `toggle_user_dict` 同一条理由——这一条是从 widget 的
+    /// `on_update` 里调进来的，重建会把调用者所在的子树连同它读的信号一起回收。
+    fn toggle_code_table(&self, key: &str, on: bool) -> bool {
+        {
+            let mut s = self.settings.borrow_mut();
+            s.disabled_dicts.retain(|x| x != key);
+            if !on {
+                s.disabled_dicts.push(key.to_string());
+            }
+        }
+        if !self.save_settings() {
+            return false;
+        }
+        self.reload_code_tables();
+        self.rebuild_tabs();
+        true
+    }
+
+    /// 手动添加一处方案目录。
+    ///
+    /// 先验一眼再存：目录里没有 `*.schema.toml` 就当场说清楚。否则用户填完看不出对错，
+    /// 要等下一次查询发现没有新页签才知道选错了，而那时他多半已经忘了自己填的是哪个。
+    fn add_codetable_dir(&self, dir: std::path::PathBuf) {
+        if !crate::source::windinput::looks_like_schema_dir(&dir) {
+            self.note_err(format!(
+                "{} 里没有 *.schema.toml，不像是方案目录",
+                dir.display()
+            ));
+            return;
+        }
+        {
+            let mut s = self.settings.borrow_mut();
+            if s.codetable_dirs.contains(&dir) {
+                drop(s);
+                self.note_ok("这个目录已经在列表里了".to_string());
+                return;
+            }
+            s.codetable_dirs.push(dir);
+        }
+        if self.save_settings() {
+            self.reload_code_tables();
+            self.rebuild_tabs();
+            let n = self.code_tables.borrow().len();
+            self.note_ok(format!("已添加方案目录，现有 {n} 个方案"));
+            self.bump_settings();
+        }
+    }
+
+    /// 移除一处手动添加的方案目录。探测到的那些移不掉——它们不由本程序管。
+    fn remove_codetable_dir(&self, dir: &std::path::Path) {
+        self.settings
+            .borrow_mut()
+            .codetable_dirs
+            .retain(|p| p != dir);
+        if self.save_settings() {
+            self.reload_code_tables();
+            self.rebuild_tabs();
+            self.note_ok("已移除方案目录".to_string());
+            self.bump_settings();
+        }
+    }
+
     /// 开关一本自带词典。`file` 是文件名，见 `Settings::disabled_dicts`。返回是否落实。
     ///
     /// **不触发设置页重建**：这一条是从 widget 的 `on_update` 里调进来的，而重建会把
@@ -1897,6 +1996,47 @@ impl State {
     /// 整个重来而不是增量增删：目录才是唯一的真相——用户可能在程序开着的时候往里
     /// 拖了一本、或者删掉一本，增量维护的那份列表根本不知道。重开一本实测 2 ms
     /// 量级（索引只有几十 KB），而这条路径只在开机与用户动设置时才走。
+    /// 重扫码表方案。
+    ///
+    /// 顺序即优先级：探测到的（清风输入法安装目录、用户数据目录）在前，手动指定的在后。
+    /// **同一个方案 id 只取第一处**——同时装了正式版与开发版时，两边都有 `wubi86`，
+    /// 让它出现两个同名页签只会让人以为自己看重影了。
+    fn reload_code_tables(&self) {
+        self.code_tables.borrow_mut().clear();
+        let (on, manual, disabled) = {
+            let s = self.settings.borrow();
+            (
+                s.codetables,
+                s.codetable_dirs.clone(),
+                s.disabled_dicts.clone(),
+            )
+        };
+        if !on {
+            return;
+        }
+        let mut dirs: Vec<std::path::PathBuf> = crate::source::windinput::schema_dirs()
+            .into_iter()
+            .map(|d| d.path)
+            .collect();
+        dirs.extend(manual);
+
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for dir in &dirs {
+            for sc in crate::source::codetable::discover(dir) {
+                if !seen.insert(sc.key.clone()) || disabled.contains(&sc.key) {
+                    continue;
+                }
+                // 一份表读坏了只是少一个页签，不该拖垮别的方案——与自带词典同一条纪律。
+                if let Ok(t) = CodeTable::load(&sc) {
+                    out.push(t);
+                }
+            }
+        }
+        *self.code_tables.borrow_mut() = out;
+        self.apply_dict_aliases();
+    }
+
     fn reload_user_dicts(&self) {
         let Some(dir) = self.user_dict_dir() else {
             self.user_dicts.borrow_mut().clear();
@@ -2241,6 +2381,12 @@ impl State {
                 d.name().to_string(),
             ));
         }
+        for t in self.code_tables.borrow().iter() {
+            v.push(TabSpec::new(
+                TabKey::Code(t.key().to_string()),
+                t.name().to_string(),
+            ));
+        }
         // 词典少了的话当前下标可能落到外面。回「全部」而不是钳到末项：钳过去等于把
         // 用户默默扔进另一本词典的结果里，而他并没有选它。
         if self.dict_tab.get() >= v.len() {
@@ -2257,6 +2403,10 @@ impl State {
         for d in self.user_dicts.borrow_mut().iter_mut() {
             let alias = names.iter().find(|(k, _)| k == d.key()).map(|(_, v)| v);
             d.set_alias(alias.map(String::as_str));
+        }
+        for t in self.code_tables.borrow_mut().iter_mut() {
+            let alias = names.iter().find(|(k, _)| k == t.key()).map(|(_, v)| v);
+            t.set_alias(alias.map(String::as_str));
         }
     }
 
@@ -2431,6 +2581,7 @@ pub fn build(
         // 先建空的，`State` 造好之后再扫——扫描要读设置里的目录与开关，那是
         // `State` 的方法。
         user_dicts: RefCell::new(Vec::new()),
+        code_tables: RefCell::new(Vec::new()),
         user,
         query: signal(String::new()),
         candidates: signal(Vec::new()),
@@ -2471,6 +2622,7 @@ pub fn build(
     // 扫词典目录。放在 `State` 造好之后，是因为扫描要读设置里的目录与开关，
     // 那两样都得先有 `State` 才拿得到。
     st.reload_user_dicts();
+    st.reload_code_tables();
     // 页签集合依赖上面扫到的那批词典，故必须排在它后面。
     st.rebuild_tabs();
     // 开屏即把左栏填上：驱动器要到第一次 layout 才跑，在那之前列表是空的，
@@ -3221,6 +3373,7 @@ fn settings_body(st: Rc<State>) -> Element {
                 .child(group("启动", autostart_row(st.clone())))
                 .child(group("词库", dict_rows(st.clone())))
                 .child(group("自带词典", user_dict_rows(st.clone())))
+                .child(group("码表反查", codetable_rows(st.clone())))
                 .child(group("释义显示", expand_en_row(st.clone())))
                 .child(group("数据", data_rows(st)))
                 // 快捷键一览沉到底部：它是**说明书**，不是设置——读一次就记住了，
@@ -3674,6 +3827,161 @@ fn expand_en_row(st: Rc<State>) -> Element {
         |st| st.settings.borrow().expand_en,
         |st, v| st.set_expand_en(v),
     )
+}
+
+/// 码表反查设置：总开关 + 方案来源 + 每个方案一行。
+///
+/// 数据不由本程序分发，来自机器上已装的清风输入法（见 `source::windinput`），故这一组
+/// 的重点是**说清楚东西是从哪来的**——用户看到一个「五笔」页签时，得知道它凭什么在那儿、
+/// 以及想去掉时该动谁。
+fn codetable_rows(st: Rc<State>) -> Element {
+    let on = st.settings.borrow().codetables;
+    let mut rows = vec![toggle_row(
+        st.clone(),
+        "码表反查",
+        "查一个字，顺带看它在五笔等输入方案里怎么打、怎么拆",
+        |st| st.settings.borrow().codetables,
+        |st, v| st.set_codetables(v),
+    )];
+    if !on {
+        return card(rows);
+    }
+
+    // 探测到的来源。**只读**：它们由清风输入法的安装位置决定，本程序改不了，给个
+    // 「打开」让用户自己去看比给个删不掉的删除按钮诚实。
+    let found = crate::source::windinput::schema_dirs();
+    if found.is_empty() {
+        rows.push(row(
+            "没有探测到清风输入法",
+            Some("装了却没找到（便携版、装在别处）就用下面的「添加目录…」手动指一下"),
+            Element::col(),
+        ));
+    } else {
+        for d in &found {
+            let path = d.path.clone();
+            rows.push(row(
+                "方案来源",
+                Some(&d.origin),
+                Element::row()
+                    .cross(Align::Center)
+                    .child(Element::button("打开").on_click(move |_| reveal(&path))),
+            ));
+        }
+    }
+
+    // 手动添加的目录，可移除。
+    let manual = st.settings.borrow().codetable_dirs.clone();
+    for dir in manual {
+        let st2 = st.clone();
+        let d2 = dir.clone();
+        let d3 = dir.clone();
+        rows.push(row(
+            "自定目录",
+            Some(&dir.display().to_string()),
+            Element::row()
+                .cross(Align::Center)
+                .spacing(8)
+                .child(Element::button("打开").on_click(move |_| reveal(&d2)))
+                .child(Element::button("移除").on_click(move |_| st2.remove_codetable_dir(&d3))),
+        ));
+    }
+
+    let st3 = st.clone();
+    let st4 = st.clone();
+    rows.push(row(
+        "添加方案目录",
+        Some("目录里要有 *.schema.toml；虎码、小鹤这类方案照这个格式放进去就自动出现"),
+        Element::row()
+            .cross(Align::Center)
+            .spacing(8)
+            .child(Element::button("刷新").on_click(move |_| {
+                st4.reload_code_tables();
+                let n = st4.code_tables.borrow().len();
+                st4.note_ok(format!("已重新扫描，可用 {n} 个方案"));
+                st4.bump_settings();
+            }))
+            .child(Element::button("添加目录…").on_click(move |ctx| {
+                let st = st3.clone();
+                ctx.request_pick_folder(
+                    PickDialog::new().title("选择方案目录"),
+                    move |picked| {
+                        if let Some(p) = picked {
+                            st.add_codetable_dir(p);
+                        }
+                    },
+                );
+            })),
+    ));
+
+    // 每个方案一行：名字 + 字数 + 改名框 + 开关。关掉的方案不在 `code_tables` 里
+    // （`reload_code_tables` 直接跳过），故要另外把它们列出来——否则关掉之后那一行
+    // 连同它的开关一起消失，用户再也开不回来。
+    let disabled = st.settings.borrow().disabled_dicts.clone();
+    let mut seen = std::collections::HashSet::new();
+    let mut listed: Vec<(String, String, Option<usize>)> = Vec::new();
+    for t in st.code_tables.borrow().iter() {
+        if seen.insert(t.key().to_string()) {
+            listed.push((t.key().to_string(), t.name().to_string(), Some(t.len())));
+        }
+    }
+    let mut dirs: Vec<std::path::PathBuf> = found.iter().map(|d| d.path.clone()).collect();
+    dirs.extend(st.settings.borrow().codetable_dirs.iter().cloned());
+    for dir in &dirs {
+        for sc in crate::source::codetable::discover(dir) {
+            if seen.insert(sc.key.clone()) {
+                listed.push((sc.key, sc.name, None));
+            }
+        }
+    }
+    for (key, name, chars) in listed {
+        let sub = match chars {
+            Some(n) => format!("{n} 字 · {key}"),
+            None => format!("已关闭 · {key}"),
+        };
+        let on = signal(!disabled.contains(&key));
+        let toggle = Element::row()
+            .cross(Align::Center)
+            // 监听器须先于开关注册（on_update 按注册顺序广播），且必须盯信号而非挂
+            // `on_toggle`——后者被 windui 静默吞掉，见 `SettingToggle`。
+            .child(
+                Element::leaf()
+                    .reactive()
+                    .widget(CodeTableToggle {
+                        st: st.clone(),
+                        key: key.clone(),
+                        on,
+                        last_version: on.version(),
+                    })
+                    .size(0, 0),
+            )
+            .child(Element::switch(on));
+        rows.push(dict_name_row(st.clone(), &key, &name, &sub, toggle));
+    }
+    card(rows)
+}
+
+/// 监视码表方案开关、落库的响应式控件。与 [`DictToggle`] 同构，理由相同。
+struct CodeTableToggle {
+    st: Rc<State>,
+    key: String,
+    on: Signal<bool>,
+    last_version: u64,
+}
+
+impl Widget for CodeTableToggle {
+    fn on_update(&mut self, _ctx: &mut EventCtx) {
+        let v = self.on.version();
+        if v == self.last_version {
+            return;
+        }
+        self.last_version = v;
+        let want = self.on.get();
+        if !self.st.toggle_code_table(&self.key, want) {
+            self.on.set(!want);
+            // 回拨自己也会推高版本，须同步记下，否则下一帧会把回拨当成新的用户操作。
+            self.last_version = self.on.version();
+        }
+    }
 }
 
 /// 一行开关设置：初值由 `init` 取，翻转由 `apply` 落实（失败则自动拨回）。
@@ -4525,6 +4833,18 @@ fn entry_view(e: Entry, expanded: Signal<bool>, st: Rc<State>, show_source: bool
         // 汉英词条整条就是一段富文本——它没有徽章类内容（CC-CEDICT 只有繁简、拼音、
         // 释义、量词四样，全是文字），故拼音到量词可以一气选到底。
         Entry::Chinese(x) => selectable(chinese_doc(&x), &st).width_match(),
+        // 码表：出处一行（仅「全部」页）+ 逐字的编码与拆分。
+        Entry::Code(x) => Element::col()
+            .spacing(6)
+            .width_match()
+            .child(if show_source {
+                Element::label(x.source.clone())
+                    .font_size(12.0)
+                    .fg_role(Role::TextMuted)
+            } else {
+                Element::col()
+            })
+            .child(selectable(code_doc(&x), &st)),
         // 自带词典：出处一行（仅「全部」页）+ 一整段富文本。
         Entry::User(x) => Element::col()
             .spacing(6)
@@ -4547,6 +4867,38 @@ fn entry_view(e: Entry, expanded: Signal<bool>, st: Rc<State>, show_source: bool
                     .on_span_click(move |_, id| st.select(id)),
             ),
     }
+}
+
+/// 码表词条的正文：一字一行，「字 编码 字根」。
+///
+/// 一字一行而不是挤成一段：想不起某个字怎么打时，眼睛要能一眼扫到那一行。
+///
+/// 字根那一段单独设字体家族。五笔的字根落在 Unicode 私用区，非得配字根字体才显示得
+/// 出来（装了清风输入法的机器上系统里就有「黑体字根」）；用汉字部件当字根的方案则
+/// `font_family` 为空，跟随正文字体即可。
+///
+/// 编码用强调色、字根用弱化色：这一行里「怎么打」是主，「怎么拆」是佐证。
+fn code_doc(x: &crate::domain::CodeEntry) -> RichDoc {
+    let mut doc = RichDoc::new();
+    for c in &x.chars {
+        let mut para =
+            Para::new().span(c.ch.to_string(), SpanStyle::new().size(19.0).family(SERIF));
+        if !c.code.is_empty() {
+            para = para.text("   ").span(
+                c.code.clone(),
+                SpanStyle::new().size(15.0).fg(RichColor::Accent),
+            );
+        }
+        if !c.roots.is_empty() {
+            let mut st = SpanStyle::new().size(19.0).fg(RichColor::Muted);
+            if let Some(f) = &x.font_family {
+                st = st.family(f.clone());
+            }
+            para = para.text("    ").span(c.roots.clone(), st);
+        }
+        doc = doc.para(para);
+    }
+    doc
 }
 
 /// 自带词典正文里每级列表的缩进。

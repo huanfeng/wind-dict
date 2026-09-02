@@ -73,6 +73,7 @@ fn main() -> anyhow::Result<()> {
                         }
                         // 本例只探随程序分发的两个库，走不到自带词典这一支。
                         Entry::User(_) => unreachable!("离线词典不产出自带词典的词条"),
+                        Entry::Code(_) => unreachable!("离线词典不产出码表词条"),
                     }
                 }
             }
