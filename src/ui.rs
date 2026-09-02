@@ -297,6 +297,24 @@ const SHORTCUTS: &[(&str, &str)] = &[
 /// 标题栏上导航按钮的边长。两枚箭头与它们的居中都按这个值算，见 [`nav_buttons`]。
 const NAV_BTN: i32 = 26;
 
+/// 标题栏上所有文字的字号。**应用名、版本号、右侧入口必须共用它。**
+///
+/// 不是审美偏好，是**基线对齐的唯一手段**：windui 的 `Align::Center` 居中的是行盒
+/// （`ascent + descent`），不是基线。同一行里两个字号不同的标签，各自的行盒高度不同、
+/// 居中后的盒顶不同，`盒顶 + ascent` 算出来的基线自然也不同——于是版本号会比应用名
+/// 高出半个到一个像素，而人眼对同一行文字的基线差极其敏感。
+///
+/// 曾把版本号设成 12.0（比应用名小半号，想让它读作次要信息），实机 150% 缩放下基线
+/// 差 1.25 设备 px，肉眼一眼就看出来。字号取齐之后差值降到 ±0.75 设备 px 以内，剩下
+/// 的只是两次字形光栅各自的取整，没得再调。
+///
+/// **不要用 padding 去纠偏**：那是逻辑坐标里的量，在 100% / 150% / 200% 下会被取整成
+/// 不同的设备像素，任何写死的补偿值必然在一个缩放下对、在另一个下错（改字号 13.0 试
+/// 过：200% 从偏 2px 降到 0.5px，100% 反而从 0 掉到 −2px）。
+///
+/// 次要信息靠 `Role::TextMuted` 区分，不靠字号——颜色不参与布局，怎么调都不会动基线。
+const BAR_TEXT_PT: f32 = 12.5;
+
 /// 分隔条宽度。
 ///
 /// 视觉上只有中间 1px 是线，其余 5px 是**命中余量**——一条 1px 的线用鼠标几乎抓不住。
@@ -3106,7 +3124,7 @@ fn bar_entry(text: &str, on_click: impl FnMut(&mut EventCtx) + 'static) -> Eleme
         .on_click(on_click)
         .child(
             Element::label(text.to_string())
-                .font_size(12.5)
+                .font_size(BAR_TEXT_PT)
                 .fg_role(Role::TextMuted),
         )
 }
@@ -3133,7 +3151,7 @@ fn brand() -> Element {
         )
         .child(
             Element::label(crate::app_title())
-                .font_size(12.5)
+                .font_size(BAR_TEXT_PT)
                 .font_weight(600)
                 .fg_role(Role::Text),
         )
@@ -3148,11 +3166,14 @@ fn brand() -> Element {
             // 拿掉它并没有丢信息：「中英两个方向都收」还在查询框的占位符「输入中文或
             // 英文…」里说着，而那里恰恰是用户要用到这条信息的时刻。
             //
+            // **字号必须与应用名一致**（[`BAR_TEXT_PT`]），次要感全靠 muted 那一档
+            // 颜色。小半号会让两者的基线错开，理由与实测见那个常量。
+            //
             // 用 `text_muted` 而非设计稿此处的 `--faint`：faint 对三套皮肤的标题栏底
             // 都只有 ~2:1 对比度，远低于 AA 的 4.5；版本号是要被**读出数字**的，不是
             // 装饰。muted 也仍未达 4.5（3.2/3.2/5.2），但那是设计稿整体的色阶问题。
             Element::label(format!("v{}", env!("CARGO_PKG_VERSION")))
-                .font_size(12.0)
+                .font_size(BAR_TEXT_PT)
                 .fg_role(Role::TextMuted),
         )
 }
