@@ -16,8 +16,7 @@
 
 <p align="center">
   <a href="../../releases/latest"><b>下载</b></a> ·
-  <a href="../../issues"><b>问题反馈</b></a> ·
-  <a href="docs/adr/"><b>设计决策</b></a>
+  <a href="../../issues"><b>问题反馈</b></a>
 </p>
 
 <p align="center">
