@@ -5,6 +5,7 @@
 #   assets/app-icon-40.png   标题栏品牌块用 (40px 源, 20 逻辑 px 处显示; 200% DPI 下 1:1)
 #   assets/tray-32.rgba      托盘用的裸 RGBA (Tray::icon_rgba 只吃裸字节, 不解 PNG)
 #   assets/wind-dict.ico     多尺寸图标, 供打包工具按 MAINICON 注入 exe 资源
+#   pic/logo.png             README 顶部那张 (128px; 不进程序, 只给仓库门面用)
 #
 # ## 为什么是脚本生成而不是手绘 SVG
 #
@@ -161,6 +162,15 @@ function Save-Png([System.Drawing.Bitmap]$bmp, [string]$path) {
 # ---- 标题栏用 PNG ----
 $b40 = New-IconBitmap 40
 Save-Png $b40 (Join-Path $Assets "app-icon-40.png")
+
+# ---- README 用 PNG ----
+# 与上面那张同源, 只是尺寸不同 —— 品牌标识全仓库一处生成, 不存在"README 里那个图标
+# 和程序里的不一样"这种事。它不进程序 (不被 include_bytes!), 故放 pic/ 而非 assets/。
+$pic = Join-Path $Root "pic"
+New-Item -ItemType Directory -Path $pic -Force | Out-Null
+$b128 = New-IconBitmap 128
+Save-Png $b128 (Join-Path $pic "logo.png")
+$b128.Dispose()
 
 # ---- 托盘用裸 RGBA ----
 # Tray::icon_rgba 收的是**非预乘 RGBA8**, 逐像素小端序 R,G,B,A。

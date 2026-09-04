@@ -3872,7 +3872,7 @@ fn about_rows() -> Element {
         ),
         row(
             "许可",
-            Some("程序代码 MIT OR Apache-2.0；三份词库各有其上游与协议，见随程序分发的 THIRD-PARTY.md"),
+            Some("程序代码 MIT 许可；三份词库各有其上游与协议，见随程序分发的 THIRD-PARTY.md"),
             Element::col(),
         ),
     ])

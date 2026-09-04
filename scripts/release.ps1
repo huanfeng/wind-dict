@@ -215,7 +215,7 @@ function Write-Readme ([string]$path, [string]$version, [hashtable]$git, [array]
   有更合用的词典就换掉它。
 
 ── 许可 ──────────────────────────────────────────
-  程序代码 MIT OR Apache-2.0。
+  程序代码 MIT 许可，见 LICENSE。
   三份词库各有其上游与协议，见 THIRD-PARTY.md——其中 cedict.db 源自 CC-CEDICT，
   按 CC BY-SA 4.0 分发。
 "@

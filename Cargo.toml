@@ -3,7 +3,7 @@ name = "wind-dict"
 version = "0.1.0"
 edition = "2021"
 description = "常驻托盘的桌面词典：全局热键唤起，离线词典为主"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [dependencies]
 # GUI。走本地路径：本项目依赖 windui 尚未发布的「后台工具」能力（全局热键、

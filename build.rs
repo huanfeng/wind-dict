@@ -101,7 +101,7 @@ BEGIN
             VALUE "ProductVersion",   "{a}.{b}.{c}.0"
             VALUE "OriginalFilename", "wind-dict.exe"
             VALUE "InternalName",     "wind-dict"
-            VALUE "LegalCopyright",   "MIT OR Apache-2.0"
+            VALUE "LegalCopyright",   "MIT"
         END
     END
     BLOCK "VarFileInfo"
