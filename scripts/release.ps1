@@ -182,7 +182,8 @@ function Write-Readme ([string]$path, [string]$version, [hashtable]$git, [array]
 清风词典 wind-dict $version ($Arch)
 构建于 $stamp · $from
 
-绿色应用：解压到任意目录，双击 wind-dict.exe 即可使用。
+绿色应用：解压到一个**空目录**，双击 wind-dict.exe 即可使用。
+（包内没有套一层目录——scoop 要求如此，见项目的 ADR-0017。）
 默认唤起热键 Ctrl+Alt+X（可在设置里改）。关闭窗口只是收起，程序留在托盘等热键。
 
 ── 这个目录里有什么 ────────────────────────────────
@@ -310,10 +311,18 @@ function New-Zip ([string]$stage, [string]$zip) {
     Say "`n[pack] 压缩 (词库压得动, 但 ~190MB 要等一会)..."
     $t = [Diagnostics.Stopwatch]::StartNew()
     # 走 .NET 而不是 Compress-Archive: 后者在这个量级上慢到数分钟, 且历史上有过
-    # 大文件相关的坑。includeBaseDirectory=$true 让包里带一层顶层目录, 解压不会
-    # 把一堆文件铺满当前目录 (scoop 那边对应 extract_dir)。
+    # 大文件相关的坑。
+    #
+    # **includeBaseDirectory = $false —— 包里不套一层顶层目录。** scoop 是把包直接
+    # 解开到应用目录的, 套一层就得靠清单里的 extract_dir 顶回来, 而那个字段由 bucket
+    # 那边的生成器写不出来 (它只写 version/url/hash/bin), 表现是装完之后 shim 指向
+    # 一个不存在的 exe。姊妹项目 keyremap 早就是这么定的, 两边保持一致。
+    #
+    # 代价: `Expand-Archive -DestinationPath .` 会把七个文件铺在当前目录。资源管理器
+    # 与 7-Zip 默认都会按包名建一层目录, 故这只影响明确指定了目标目录的命令行解压 ——
+    # 那时用户本来就在说"解到这里"。
     [System.IO.Compression.ZipFile]::CreateFromDirectory(
-        $stage, $zip, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+        $stage, $zip, [System.IO.Compression.CompressionLevel]::Optimal, $false)
     $t.Stop()
     Gray "  - $(Size-Of $zip)  用时 $([int]$t.Elapsed.TotalSeconds)s"
 }
@@ -322,9 +331,9 @@ function New-Zip ([string]$stage, [string]$zip) {
 #
 # 验的是**包**而不是暂存目录: 前面所有检查针对的都是磁盘上那堆文件, 而用户拿到的
 # 是这个 zip。压缩这一步漏一个文件不会报错, 只会让某台机器上的程序打不开词库。
-function Test-Zip ([string]$stage, [string]$zip, [string]$rootName) {
+function Test-Zip ([string]$stage, [string]$zip) {
     $want = Get-ChildItem $stage -Recurse -File |
-        ForEach-Object { "$rootName/" + $_.FullName.Substring($stage.Length + 1).Replace("\", "/") } |
+        ForEach-Object { $_.FullName.Substring($stage.Length + 1).Replace("\", "/") } |
         Sort-Object
     $a = [System.IO.Compression.ZipFile]::OpenRead($zip)
     try { $got = $a.Entries | ForEach-Object { $_.FullName } | Sort-Object } finally { $a.Dispose() }
@@ -346,43 +355,71 @@ function New-Checksum ([string]$zip) {
 }
 
 # ---------- scoop ----------
-# 只在给了 -Repo 时生成: manifest 的核心是那个下载 URL, 而 URL 猜不得 —— 猜错的
-# manifest 比没有 manifest 坏, 它会装出一个 404 而不是一句"还没配"。
-function New-ScoopManifest ([string]$repo, [string]$version, [string]$rootName, [string]$zipName, [string]$hash, [string]$path) {
+#
+# 静态元数据 (名字、bin、说明、主页、许可) 只有一处来源: `.github/scoop.json`。
+# 发布工作流通知 bucket 时读的也是它, 抄第二份就等着两边慢慢说出不同的话。
+function Get-ScoopMeta {
+    $p = "$Root\.github\scoop.json"
+    if (-not (Test-Path $p)) { return $null }
+    return Get-Content $p -Raw -Encoding UTF8 | ConvertFrom-Json
+}
+
+# 生成一份 scoop 清单。
+#
+# 只在给了 -Repo 时生成: 清单的核心是那个下载 URL, 而 URL 猜不得 —— 猜错的清单比
+# 没有清单坏, 它会装出一个 404 而不是一句"还没配"。
+#
+# **形状必须与 huanfeng/scoop-bucket 那边的生成器一致**: 那边收到 repository_dispatch
+# 后只重写 version 与 architecture.64bit.{url,bin,hash}, 其余字段从仓库里已有的那份
+# 原样保留。故本函数产出的这一份既是随 Release 分发的清单, 也是**首次入 bucket 时的
+# 种子** —— shortcuts / notes / checkver / autoupdate 这些自动流程写不出来的东西,
+# 全靠这一份带进去。两边形状对不上, 表现是第一次自动更新之后多出或少掉几个字段。
+function New-ScoopManifest ([string]$repo, [string]$version, [string]$zipName, [string]$hash, [string]$path) {
+    $meta = Get-ScoopMeta
+    if (-not $meta) { ErrMsg "找不到 $Root\.github\scoop.json, 无从取 scoop 元数据"; return $false }
+
+    $base = "https://github.com/$repo/releases/download"
     $m = [ordered]@{
         version      = $version
-        description  = "常驻托盘的桌面词典：全局热键唤起，离线词典为主"
-        homepage     = "https://github.com/$repo"
-        license      = "MIT OR Apache-2.0"
+        description  = $meta.description
+        homepage     = $meta.homepage
+        license      = $meta.license
         architecture = [ordered]@{
             "64bit" = [ordered]@{
-                url  = "https://github.com/$repo/releases/download/v$version/$zipName"
+                url  = "$base/v$version/$zipName"
+                # bin 与 hash 同层, 与 bucket 生成器写出来的位置一致。
+                bin  = @($meta.bin)
                 hash = $hash
             }
         }
-        extract_dir  = $rootName
-        shortcuts    = @(, @("wind-dict.exe", "清风词典"))
+        # 包里不套顶层目录 (见 New-Zip), 故没有 extract_dir。
+        shortcuts    = @(, @($meta.bin, "清风词典"))
         # persist 是空的, 而这不是漏写: 收藏/历史/设置都在 %LOCALAPPDATA%\wind-dict-data\,
         # 本就在 scoop 的 app 目录之外 (ADR-0011)。scoop update / uninstall 动不到它们,
         # 故没有什么需要 persist 保住。
         persist      = @()
         notes        = @(
-            "词库随包附带, 无需另外下载。",
+            "词库随包附带, 无需另外下载 (故每次升级都要重下 ~150MB)。",
             "示例词典: 把 dicts-example\ecdict-headless.mdx 复制到 %LOCALAPPDATA%\wind-dict-data\dicts\ 即可在 设置->词典 里启用。",
-            "收藏与历史存在 %LOCALAPPDATA%\wind-dict-data\, 卸载不会删除。"
+            "收藏、历史与设置存在 %LOCALAPPDATA%\wind-dict-data\, 升级与卸载都不会动它们。"
         )
-        checkver     = [ordered]@{ github = "https://github.com/$repo" }
+        checkver     = [ordered]@{ github = $meta.homepage }
         autoupdate   = [ordered]@{
             architecture = [ordered]@{
                 "64bit" = [ordered]@{
-                    url = "https://github.com/$repo/releases/download/v`$version/wind-dict-`$version-$Arch.zip"
+                    url = "$base/v`$version/wind-dict-`$version-$Arch.zip"
                 }
             }
-            extract_dir = "wind-dict-`$version-$Arch"
+            # 让 excavator 去读随包发布的 .sha256, 而不是把 150MB 拖下来自己算。
+            # 那个文件是 sha256sum 格式 (哈希 + 两个空格 + 文件名), scoop 认得。
+            hash = [ordered]@{
+                url = "$base/v`$version/wind-dict-`$version-$Arch.zip.sha256"
+            }
         }
     }
     $json = ($m | ConvertTo-Json -Depth 8) -replace "`r?`n", "`r`n"
     [System.IO.File]::WriteAllText($path, $json + "`r`n", (New-Object System.Text.UTF8Encoding $false))
+    return $true
 }
 
 # ---------- 主流程 ----------
@@ -484,11 +521,11 @@ if (-not (Test-Payload $stage)) { exit 1 }
 if ($NoSmoke) { Warn "`n跳过启动冒烟 (-NoSmoke)" } elseif (-not (Test-Smoke $stage $shot)) { exit 1 }
 
 New-Zip $stage $zip
-if (-not (Test-Zip $stage $zip $name)) { exit 1 }
+if (-not (Test-Zip $stage $zip)) { exit 1 }
 $hash = New-Checksum $zip
 
 if ($Repo) {
-    New-ScoopManifest $Repo $version $name (Split-Path $zip -Leaf) $hash "$OutDir\wind-dict.json"
+    if (-not (New-ScoopManifest $Repo $version (Split-Path $zip -Leaf) $hash "$OutDir\wind-dict.json")) { exit 1 }
     Gray "  - scoop manifest → $OutDir\wind-dict.json"
 } else {
     Gray "  - 未给 -Repo, 不生成 scoop manifest (URL 猜不得)"

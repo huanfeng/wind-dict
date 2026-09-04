@@ -181,3 +181,78 @@ jobs:
         run: |
           Write-Host "试跑完成：包已打出并通过全部验证，但**没有**建 Release。"
           Write-Host "正式发布请改 Cargo.toml 版本、提交，然后 git tag vX.Y.Z && git push origin vX.Y.Z"
+
+  # 通知自己的 scoop bucket 更新清单。
+  #
+  # **不传哈希**：对端会自己按 URL 把资产拉下来算 sha256。传过去反而多一处可能不一致
+  # ——两边算法、时序、甚至"算的是不是同一个文件"都得对上，而那些都是白担的风险。
+  #
+  # 只在 tag 触发时跑：试跑不该动 bucket。与「建 Release」那一步同一条判据。
+  notify-scoop-bucket:
+    needs: release
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      # 只取那一个文件。这个 job 与代码无关，检出整个仓库（含 Cargo.lock、词库脚本）
+      # 只是让它慢。
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/scoop.json
+          sparse-checkout-cone-mode: false
+
+      - name: 读 scoop.json
+        id: scoop
+        run: |
+          set -euo pipefail
+          for key in name bin description homepage license; do
+            echo "$key=$(jq -er ".$key" .github/scoop.json)" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: 向 scoop-bucket 发 repository_dispatch
+        env:
+          # tag 是 vX.Y.Z，清单里的 version 不带 v。release.ps1 已核对过它与
+          # Cargo.toml 一致，故从 tag 反推是安全的。
+          VERSION: ${{ github.ref_name }}
+          APP: ${{ steps.scoop.outputs.name }}
+          # 两个名字都认：姊妹项目 keyremap 用的是 SCOOP_TOKEN，别处有叫
+          # SCOOP_BUCKET_GITHUB_TOKEN 的。少一个二选一的配置步骤。
+          TOKEN: ${{ secrets.SCOOP_TOKEN || secrets.SCOOP_BUCKET_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 先明说缺什么。否则空 token 只会换来一个 401，看不出是没配 secret。
+          if [ -z "$TOKEN" ]; then
+            echo "::error::未配置 secret SCOOP_TOKEN（或 SCOOP_BUCKET_GITHUB_TOKEN），" \
+                 "需要一个对 huanfeng/scoop-bucket 有 contents:write 权限的 PAT"
+            exit 1
+          fi
+          VER="${VERSION#v}"
+          ASSET="${APP}-${VER}-x64.zip"
+          echo "通知 bucket: $APP $VER ($ASSET)"
+          curl -fsSL \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $TOKEN" \
+            "https://api.github.com/repos/huanfeng/scoop-bucket/dispatches" \
+            -d "$(jq -n \
+              --arg app "$APP" \
+              --arg repo "${{ github.repository }}" \
+              --arg version "$VER" \
+              --arg asset_name "$ASSET" \
+              --arg bin "${{ steps.scoop.outputs.bin }}" \
+              --arg description "${{ steps.scoop.outputs.description }}" \
+              --arg homepage "${{ steps.scoop.outputs.homepage }}" \
+              --arg license "${{ steps.scoop.outputs.license }}" \
+              '{
+                event_type: "update-scoop-manifest",
+                client_payload: {
+                  app: $app,
+                  repo: $repo,
+                  version: $version,
+                  asset_name: $asset_name,
+                  bin: $bin,
+                  description: $description,
+                  homepage: $homepage,
+                  license: $license
+                }
+              }'
+            )"

@@ -70,6 +70,46 @@
 CC BY-SA 4.0 分发，**署名是分发时的义务**；`unihan.db` 的 Unicode License 明写要求
 「随数据保留声明」。仓库里放一份不构成履行——拿到 zip 的人没有仓库。
 
+## 包里不套顶层目录，因为 scoop
+
+`New-Zip` 的 `includeBaseDirectory` 是 **`$false`**：解开来就是 `wind-dict.exe` 与那几份
+`.db`，外面没有一层 `wind-dict-0.1.0-x64\`。
+
+scoop 是把包**直接解开到应用目录**的。套一层就得靠清单里的 `extract_dir` 顶回来，而那个
+字段由 bucket 那边的生成器写不出来——它收到 `repository_dispatch` 后只重写 `version` 与
+`architecture.64bit.{url,bin,hash}`。少了 `extract_dir`，装完之后 shim 指向一个不存在的
+exe，而那句报错（`Can't shim 'wind-dict.exe': File doesn't exist`）说不清是包错了还是清单
+错了。姊妹项目 keyremap 早就是这么定的，两边保持一致。
+
+代价照实记：`Expand-Archive -DestinationPath .` 会把七个文件铺在当前目录。资源管理器与
+7-Zip 默认都按包名建一层目录，故这只影响明确指定了目标目录的命令行解压——那时用户本来
+就在说「解到这里」。包内 `README.txt` 也改成了「解压到一个**空目录**」。
+
+## scoop 的元数据只有一处来源
+
+`.github/scoop.json` 存名字、`bin`、说明、主页、许可。`release.ps1` 生成清单时读它，
+发布工作流通知 bucket 时也读它。抄第二份就等着两边慢慢说出不同的话，而那种不一致的
+表现是「`scoop search` 里的说明与 Release 页面上的对不上」——没人会为此报 bug，也就
+永远不会被发现。
+
+`release.ps1` 产出的那份 `wind-dict.json` 有两个身份：随 Release 分发的清单，以及**首次
+入 bucket 时的种子**。`shortcuts`、`notes`、`persist`、`checkver`、`autoupdate` 这些
+自动流程写不出来的字段全靠它带进去；bucket 的生成器保留已有字段，故此后每次发布只覆盖
+版本与下载信息。两边形状必须一致，否则第一次自动更新之后会多出或少掉几个字段。
+
+`persist` 是空的，这不是漏写：收藏、历史与设置都在 `%LOCALAPPDATA%\wind-dict-data\`，
+本就在 scoop 的 app 目录之外（ADR-0011），`scoop update` / `uninstall` 动不到它们。
+
+`autoupdate.hash` 指向随包发布的 `.sha256`，让 excavator 读那一行而不是把 150MB 拖下来
+自己算。那个文件是 `sha256sum` 格式（哈希 + 两个空格 + 文件名），scoop 认得。
+
+## 通知 bucket 时不传哈希
+
+发布工作流只把 `version` / `asset_name` 等发过去，**哈希由对端自己下载资产算**。
+
+传过去反而多一处可能不一致：两边的算法、时序、甚至「算的是不是同一个文件」都得对上，
+而那些都是白担的风险——对端本来就要下载那个文件才能确认它存在。
+
 ## 后果
 
 - `scripts/common.ps1`：路径与输出辅助从 `dev.ps1` 抽出，两个脚本共用。那些路径是
