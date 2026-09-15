@@ -12,7 +12,7 @@ windui = { path = "../wind-ui-rust" }
 
 # 词库与用户数据。bundled 编入 SQLite 自身，免去用户装 DLL。
 # 二进制因此 +~1.5MB——相对 windui 的极简理念是笔真实开销，见 docs/adr/0006。
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # MDX 词库的块解压（zlib）。后端是纯 Rust 的 miniz_oxide，不引 C 工具链。
 #
@@ -33,7 +33,7 @@ anyhow = "1"
 # `Win32_UI_WindowsAndMessaging` 是为 `main::fatal` 的消息框加的：程序改成无控制台的
 # GUI 子系统后，启动期致命错误（词库打不开）原先那几行 eprintln 无处可去，用户看到的
 # 只是「双击了没反应」。
-windows = { version = "0.58", features = [
+windows = { version = "0.62", features = [
     "Win32_System_Registry",
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",

@@ -76,7 +76,7 @@ mod imp {
             RegOpenKeyExW(
                 HKEY_CURRENT_USER,
                 PCWSTR(path.as_ptr()),
-                0,
+                None,
                 access,
                 &mut key,
             )
@@ -181,7 +181,7 @@ mod imp {
                     (value.len() + 1) * std::mem::size_of::<u16>(),
                 )
             };
-            unsafe { RegSetValueExW(key, PCWSTR(name.as_ptr()), 0, REG_SZ, Some(bytes)) }
+            unsafe { RegSetValueExW(key, PCWSTR(name.as_ptr()), None, REG_SZ, Some(bytes)) }
         } else {
             unsafe { RegDeleteValueW(key, PCWSTR(name.as_ptr())) }
         };

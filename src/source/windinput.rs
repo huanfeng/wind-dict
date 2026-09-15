@@ -150,7 +150,7 @@ mod imp {
         let path = HSTRING::from(UNINSTALL);
         let mut key = HKEY::default();
         let opened =
-            unsafe { RegOpenKeyExW(root, PCWSTR(path.as_ptr()), 0, KEY_READ, &mut key) }.is_ok();
+            unsafe { RegOpenKeyExW(root, PCWSTR(path.as_ptr()), None, KEY_READ, &mut key) }.is_ok();
         if !opened {
             return;
         }
@@ -163,10 +163,10 @@ mod imp {
                 RegEnumKeyExW(
                     key,
                     i,
-                    PWSTR(name.as_mut_ptr()),
+                    Some(PWSTR(name.as_mut_ptr())),
                     &mut len,
                     None,
-                    PWSTR::null(),
+                    None,
                     None,
                     None,
                 )
@@ -191,7 +191,7 @@ mod imp {
     fn read_install_location(parent: HKEY, sub: &str) -> Option<String> {
         let sub_h = HSTRING::from(sub);
         let mut k = HKEY::default();
-        if unsafe { RegOpenKeyExW(parent, PCWSTR(sub_h.as_ptr()), 0, KEY_READ, &mut k) }.is_err() {
+        if unsafe { RegOpenKeyExW(parent, PCWSTR(sub_h.as_ptr()), None, KEY_READ, &mut k) }.is_err() {
             return None;
         }
         let value = HSTRING::from("InstallLocation");
