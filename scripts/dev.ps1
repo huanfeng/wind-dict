@@ -27,6 +27,7 @@
 #   gm            下载一本示例 MDX (~70MB), 供手动测试「用户词典」; 部署时自动装进词典目录
 #   rel           发布: 构建 + 组装 + 验证 + 压成带版本的 zip → artifacts\release\
 #                 (要传参数就直接调 scripts\release.ps1, 见那个文件的头部)
+#   track         让 windui.ref 跟随 windui 的 main（开发期默认）; 发版前要先 pin 钉回去
 #   pin           把当前 ../wind-ui-rust 的 HEAD 写进 windui.ref —— CI 按它检出那个
 #                 path 依赖。两个仓库独立推送, 不钉住就只能听天由命, 见 windui.ref
 #   k=check  l=clippy  t=test  f=fmt  fc=fmt-check  ci(=fc+l+t)  clean
@@ -480,6 +481,40 @@ function Do-Release {
 }
 
 # ---------- windui 提交号 ----------
+# 把一行 ref（提交号或分支名）写进 windui.ref，**只换那一行、注释原样留着** ——
+# 那段注释是这个文件存在的全部理由。pin 与 track 共用。
+function Write-PinFile ([string]$ref) {
+    $lines = @(Get-Content $PinFile -Encoding UTF8)
+    $done = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $t = $lines[$i].Trim()
+        if ($t -and -not $t.StartsWith("#")) { $lines[$i] = $ref; $done = $true; break }
+    }
+    if (-not $done) { $lines += $ref }
+    [System.IO.File]::WriteAllText($PinFile, ($lines -join "`r`n") + "`r`n",
+        (New-Object System.Text.UTF8Encoding $false))
+    return $true
+}
+
+# 让 windui.ref 跟随 windui 的默认分支（写入 `main`），而不是钉死某个提交。
+#
+# 开发期两个仓库一起改、天天推，钉死意味着每次都要多一步 pin + 提交 windui.ref，
+# 忘了就是一次"CI 编的是旧版"的假失败。跟随把那一步去掉了。
+#
+# **代价要知道**：从此 wind-dict 的某个提交不再对应一份确定的 windui —— 同一个提交
+# 今天和下周编出来的可能是两个程序。故 `release.ps1` 在跟随模式下**拒绝打包**：
+# 发布包必须能由两个确定的提交重现（ADR-0022），要发版就先 `pin` 回去。
+function Do-Track {
+    $ref = "main"
+    $old = Get-PinnedWindui
+    if ($old -eq $ref) { Say "`nwindui.ref 已是 $ref, 无需改动"; return $true }
+    if (-not (Write-PinFile $ref)) { return $false }
+    Say "`nwindui.ref: $(if ($old) { if (Test-IsCommitSha $old) { $old.Substring(0,7) } else { $old } } else { '(空)' }) → $ref (跟随模式)"
+    Gray "  CI 从此按 windui 的 $ref 最新提交检出; 发版前记得 .\scripts\dev.ps1 pin 钉回去"
+    Gray "  记得把 windui.ref 一起提交"
+    return $true
+}
+
 # 把当前 ../wind-ui-rust 的 HEAD 写进 windui.ref，CI 便按它检出。
 #
 # **拒绝写入未推送的提交**：这个号是给 CI 用的，CI 只能从远端取。写一个本机独有的
@@ -505,18 +540,10 @@ function Do-Pin {
     $old = Get-PinnedWindui
     if ($old -eq $head) { Say "`nwindui.ref 已是 $($head.Substring(0,7)), 无需改动"; return $true }
 
-    # 只换最后那一行, 注释原样留着 —— 那段注释是这个文件存在的全部理由。
-    $lines = @(Get-Content $PinFile -Encoding UTF8)
-    $done = $false
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        $t = $lines[$i].Trim()
-        if ($t -and -not $t.StartsWith("#")) { $lines[$i] = $head; $done = $true; break }
-    }
-    if (-not $done) { $lines += $head }
-    [System.IO.File]::WriteAllText($PinFile, ($lines -join "`r`n") + "`r`n",
-        (New-Object System.Text.UTF8Encoding $false))
+    if (-not (Write-PinFile $head)) { return $false }
 
-    Say "`nwindui.ref: $(if ($old) { $old.Substring(0,7) } else { '(空)' }) → $($head.Substring(0,7))"
+    $oldShown = if ($old) { if (Test-IsCommitSha $old) { $old.Substring(0,7) } else { $old } } else { '(空)' }
+    Say "`nwindui.ref: $oldShown → $($head.Substring(0,7))"
     Gray "  记得把 windui.ref 一起提交, 否则 CI 仍按旧的那版检出"
     return $true
 }
@@ -564,7 +591,20 @@ function Test-PinFresh {
     $wu  = @(Get-PathDepPaths) | Where-Object { (Split-Path $_ -Leaf) -like "wind-ui*" } | Select-Object -First 1
     if (-not $pin -or -not $wu) { return $true }
     $head = Get-LocalWindui $wu
-    if (-not $head -or $head -eq $pin) { return $true }
+    if (-not $head) { return $true }
+
+    # 跟随模式（windui.ref 里是分支名）：比「对不对得上」更该问的是**推没推**。
+    # CI 检出的是那个分支在**远端**的样子, 本机未推的提交它一个也编不到 —— 这正是
+    # 钉死模式要防的那个失败, 换了个形状: 不是"编的是旧版", 而是"编的是少了几个提交的版"。
+    if (-not (Test-IsCommitSha $pin)) {
+        $onRemote = @(git -C $wu branch -r --contains $head 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $onRemote.Count -gt 0) { return $true }
+        Warn "`nwindui.ref 跟的是 $pin, 而本机 windui 的 $($head.Substring(0,7)) 还没推上去"
+        Gray "  CI 检出的是远端那一版, 编不到本机这几个提交。先在 windui 里 git push"
+        return $false
+    }
+
+    if ($head -eq $pin) { return $true }
     Warn "`nwindui.ref 钉的是 $($pin.Substring(0,7)), 本机 windui 在 $($head.Substring(0,7))"
     Gray "  CI 编的是前者。要让 CI 跟上本机, 先在 windui 里 git push, 再 .\scripts\dev.ps1 pin"
     return $false
@@ -594,6 +634,7 @@ function Invoke-Command ([string]$cmd) {
         { $_ -in "fc", "fmt-check" }{ Do-FmtCheck; return $true }
         "ci"                        { return (Do-Ci) }
         "pin"                       { return (Do-Pin) }
+        "track"                     { return (Do-Track) }
         "clean"                     { Do-Clean;    return $true }
         default { ErrMsg "未知命令: $cmd"; return $false }
     }
@@ -616,6 +657,7 @@ function Show-Menu {
     Write-Host "  发布      rel 打成带版本的 zip → artifacts\release\ (构建+验证+压包)"
     Write-Host "  质量      k check   l clippy   t test   f fmt   fc fmt-check   ci   clean"
     Write-Host "  依赖      pin 把当前 windui 的提交号写进 windui.ref (CI 按它检出)"
+    Write-Host "            track 改为跟随 windui 的 main (开发期; 发版前须 pin 钉回)"
     Write-Host "            q 退出"
     Write-Host ""
     $sel = Read-Host "请选择"

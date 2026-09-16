@@ -469,6 +469,18 @@ foreach ($d in $deps) {
 # CI 上这一条永远成立(windui 就是按 pin 检出的), 除非有人用 WINDUI_REF 覆盖了它 ——
 # 那种情况下更要拦。
 $pin = Get-PinnedWindui
+# 跟随模式（windui.ref 里是 `main` 这类分支名）在发版这条路上**直接拒绝**。
+#
+# 开发期跟随是划算的（见 dev.ps1 的 track 与 ADR-0022 的 2026-09 修订），但发布包的
+# 前提是"能由两个确定的提交重现"：分支是会动的，包内 README 写下的那一行
+# 「提交 xxx · wind-ui-rust main」等于什么都没说 —— 下次再按它检出，编出来的可能是
+# 另一个程序。要发版就先 `.\scripts\dev.ps1 pin` 钉回一个具体提交。
+if ($pin -and -not (Test-IsCommitSha $pin)) {
+    ErrMsg "windui.ref 当前是跟随模式 ($pin), 发布包要求钉死一个具体提交"
+    Gray  "  先把 windui 推上去, 再 .\scripts\dev.ps1 pin, 然后提交 windui.ref"
+    Gray  "  理由见 docs/adr/0022: 包内 README 那行提交号必须确有其事"
+    exit 1
+}
 if ($pin) {
     foreach ($d in $deps) {
         if (-not $d.Known -or ($d.Name -notlike "wind-ui*")) { continue }

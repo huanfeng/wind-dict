@@ -36,6 +36,15 @@ function Get-PinnedWindui {
     return $null
 }
 
+# windui.ref 里那一行是**钉死的提交号**还是**跟随的分支名**。
+#
+# 两种模式的分界就这一条正则：40 位十六进制 = 钉死，其余（如 `main`）= 跟随。
+# `actions/checkout` 的 ref 两种都认，故 CI 侧不必分支判断；要分的是本地脚本——
+# 跟随模式下「本机 HEAD 与它对不对得上」这个问题本身就没有意义。
+function Test-IsCommitSha ([string]$ref) {
+    return ($ref -match '^[0-9a-fA-F]{40}$')
+}
+
 # 本机 ../wind-ui-rust 当前的提交号（完整 40 位）。不在 git 工作树里则返回 $null。
 function Get-LocalWindui ([string]$path) {
     if (-not (Test-Path $path)) { return $null }
