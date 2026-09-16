@@ -17,7 +17,9 @@
 //   - 启动期致命错误 → 消息框（见 `fatal`），比控制台还醒目，且用户也看得见。
 #![windows_subsystem = "windows"]
 
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use windui::prelude::*;
 
@@ -95,17 +97,39 @@ fn main() {
         )),
     };
 
+    // 造主窗的工厂，由 `ui::build` 在下面填进来。
+    //
+    // **为什么要这么一个空格子**：托盘与热键的回调必须在 `ui::build` **之前**写死
+    // （托盘要整个交给 `App::tray`，热键的回调与它的句柄是同一次调用给出的），而工厂
+    // 只有 `build` 造得出——那里才有 `State`。两者的先后是 windui 的 API 形状定的，
+    // 不是这里可以调换的顺序，故留一格延迟绑定，并在 `build` 之后立刻填上。
+    //
+    // 取不到工厂时静默不开窗：那意味着这段代码的填充步骤被人删了，而那是编码错误，
+    // 不是用户能碰到的运行期情形——为它弹错框只会把真正的 bug 藏进一句用户看不懂的话里。
+    let win: Rc<RefCell<Option<ui::WindowFactory>>> = Rc::new(RefCell::new(None));
+
+    // 托盘的三条入口（左键、双击、菜单「查询」）都是**开窗**，不再是 show_window：
+    // 常驻模式下平时一个窗口都没有，没有可显示的对象。已经开着时 `Window::single` 会
+    // 把那一个激活到前台（见 `ui::WINDOW_KEY`），而不是再开一个。
+    let open = {
+        let win = win.clone();
+        move |ctx: &mut TrayCtx| {
+            if let Some(make) = win.borrow().as_ref() {
+                ctx.open_window(make());
+            }
+        }
+    };
     let tray = Tray::new()
         .tooltip(wind_dict::ui::tray_tip(&settings.hotkey))
         // 托盘图标与标题栏、任务栏是同一份产物（`scripts/gen-icon.ps1`）。此前这里是
         // 一块 16×16 的纯蓝方块占位——托盘里一排图标中它是唯一认不出是什么的那个。
         .icon_rgba(icon::TRAY_SIZE, icon::TRAY_SIZE, icon::TRAY_RGBA)
-        .on_left_click(|ctx| ctx.show_window())
-        .on_double_click(|ctx| ctx.show_window())
+        .on_left_click(open.clone())
+        .on_double_click(open.clone())
         .menu(vec![
-            TrayMenuItem::item("查询", |ctx| ctx.show_window()),
+            TrayMenuItem::item("查询", open),
             TrayMenuItem::separator(),
-            // 唯一的退出途径：窗口关闭与 ESC 都只是收起来（hide_on_close）。
+            // 唯一的退出途径：窗口关闭与 ESC 都只是把窗口销毁掉，进程照常留在托盘里。
             TrayMenuItem::item("退出", |ctx| ctx.quit()),
         ]);
 
@@ -116,75 +140,100 @@ fn main() {
     let system_dark = windui::event::system_prefers_dark();
     let theme = settings.style.theme(settings.mode.is_dark(system_dark));
 
-    // 窗口 920 宽：界面是左右两栏（`ui::dict_page`），左栏定宽 280，故释义那一栏拿到
-    // 640——正文限宽已撤（见 `ui::EN_DEF_MAX_W`），一行排满正好是舒适的阅读宽度。
-    let mut app = App::new(app_title(), 920, 620)
-        // 下限 720：扣掉左栏那 280 还剩 440 给释义，勉强够读。再窄就该让左栏改为可收起
-        // 而不是继续压缩释义（尚未实现），而不是让用户拖到一个不可用的尺寸。
-        .min_size(720, 480)
-        // 无系统标题栏：标题栏由 `ui::title_bar` 自绘，才能与整体配色一致。
-        .frameless()
-        // GPU 渲染（Direct2D）。本项目不以「后台内存尽可能小」为目标——见 ADR-0006
-        // 的修订，需求已改为优先响应与渲染质量。
-        //
-        // 取 `Auto` 而非 `Gpu`：无 GPU、RDP 远程会话、离屏截图等情形前者自动回退软
-        // 渲染，后者是**报错终止**——那条语义是给排障用的（静默回退会让人拿两张软渲染
-        // 的截图得出「软硬一致」），交付给用户的构建不该带。
+    // **零窗口常驻**：不建主窗，进程平时只有托盘图标与全局热键，窗口由回调按需建出、
+    // 关掉即销毁，渲染资源随之归还。见 ADR-0006 的第二次修订。
+    //
+    // 换掉的是 `App::new(..) + hide_on_close + start_hidden` 那一套：它留着一个隐藏的
+    // 主窗，而软件光栅要为它按**物理**像素挂着约 2.5 份全屏 RGBA 后备缓冲——用户看不见
+    // 的窗口，内存照付（上游实测：常驻关窗后回落 2.25MB，对照组停在 4.62MB 一分不还）。
+    let mut app = App::resident(app_title())
+        // GPU 渲染（Direct2D）。取 `Auto` 而非 `Gpu`：无 GPU、RDP 远程会话、离屏截图等
+        // 情形前者自动回退软渲染，后者是**报错终止**——那条语义是给排障用的（静默回退
+        // 会让人拿两张软渲染的截图得出「软硬一致」），交付给用户的构建不该带。
         .renderer(Renderer::Auto)
         .theme(theme.clone())
         .tray(tray)
-        // 常驻：关闭只收起，进程始终活着等热键。见 ADR-0006。
-        .hide_on_close()
-        .screenshot_from_args()
-        // 单实例。`app_id` 必须与上面 `claim_instance` 传的**完全一致**：不一致的话
-        // 本进程会撞上自己已经持有的那把锁、把自己误判成二次实例，然后把 argv 转发
-        // 给自己，窗口就永不出现了（windui `claim_instance` 的文档写了这一条）。
-        //
-        // 回调空着即可：平台层在它返回后就会显示并前置主窗口，而那正是「用户又双击了
-        // 一次图标」该有的结果——本程序常驻托盘，窗口多半正藏着，只置前是不够的。
-        .single_instance(SINGLE_ID, |_argv| {});
+        .screenshot_from_args();
 
-    // **只有开机自启才收进托盘**，手动运行照常显示窗口。
+    // 二次实例（用户又双击了一次图标）绕一趟通道回到 UI 线程再开窗。
     //
-    // 此前 `start_hidden()` 是无条件的，依据是 ADR-0006 的「常驻工具启动不该闪窗口」。
-    // 那条只对**开机自启**成立：开机时弹一个词典窗口是打扰。但同一段代码也管住了用户
-    // **双击图标**的情形，而那时他刚刚亲手表达了「我要用它」——却什么也没发生。除非
-    // 他知道去按热键或翻托盘，否则这个程序看起来就是坏的。
+    // 不能在 `single_instance` 的回调里直接开窗：它跑在一个独立的 message-only 窗口的
+    // `wndproc` 里、够不着任何宿主状态，且可能在嵌套消息泵里抵达（托盘菜单、文件对话框），
+    // 而 windui 给那个回调的签名本就没有 `ctx`。通道的 `on_message` 反过来是正经的
+    // UI 线程时机，常驻模式下由应用级路径排空，零窗口时照样送达。
     //
-    // 判据是命令行开关（见 `autostart::TRAY_ARG`），由自启项自己带上。
-    if launched_for_tray() {
-        app = app.start_hidden();
-    }
+    // 此前这里的回调是空的，靠平台层「返回后显示并前置主窗口」兜住——常驻模式没有主窗，
+    // 那条路整个不存在了，不补这一段的表现就是「再双击一次图标毫无反应」。
+    let second = {
+        let win = win.clone();
+        app.channel::<()>(move |ctx, ()| {
+            if let Some(make) = win.borrow().as_ref() {
+                ctx.open_window(make());
+            }
+        })
+    };
+    // 单实例。`app_id` 必须与上面 `claim_instance` 传的**完全一致**：不一致的话
+    // 本进程会撞上自己已经持有的那把锁、把自己误判成二次实例，然后把 argv 转发
+    // 给自己，窗口就永不出现了（windui `claim_instance` 的文档写了这一条）。
+    let mut app = app.single_instance(SINGLE_ID, move |_argv| {
+        // 发送失败只可能是 UI 线程已经在退出，那时开窗本就无意义。
+        let _ = second.send(());
+    });
 
-    // 两个句柄都必须在 `content` **之前**取到——界面要拿着它们才能即时换肤、改键。
+    // 三个句柄都必须在 `ui::build` **之前**取到——界面要拿着它们才能即时换肤、改键、
+    // 改托盘提示。
     let theme_handle = app.theme_handle();
     // 热键**切换**显隐，不是只管唤起。
     //
     // 「按一下出来、再按一下收回去」是常驻工具热键的通常语义（Listary、uTools 皆然），
-    // 而此前只有 `show_window`：窗口已经在眼前时再按一下毫无反应，用户只能去点关闭。
+    // 而只有唤起的话，窗口已经在眼前时再按一下毫无反应，用户只能去点关闭。
     //
-    // 可见性取自 `window_state()` 而非应用侧自己记的标志——隐藏可以发生在框架内部
-    // （ESC 关窗、`hide_on_close` 的关闭按钮），应用收不到通知，自建标志迟早对不上。
-    // 这个字段是为本项目在 windui 补的（`WindowState::visible`），一并补的还有热键
-    // 派发前刷新一次快照：热键是唯一能在窗口隐藏、毫无消息往来时抵达的输入，不刷新
-    // 就会读到窗口被藏起来之前的陈值。
-    let hotkey = app.hotkey_handle(settings.hotkey.to_hotkey(), |ctx| {
-        if window_state().visible {
-            ctx.hide_window();
-        } else {
-            ctx.show_window();
-        }
-    });
+    // 判据从 `window_state().visible` 换成了 `window_open`：常驻模式下窗口是「开着或
+    // 根本不存在」两态，而 `window_state()` 在零窗口时恒为 `UNKNOWN`（其 `visible` 是
+    // `true`），照搬旧写法会恒走收起那一侧——按下去毫无反应，且看不出是判据读错了。
+    //
+    // 收起即关掉：窗口本就关掉即销毁，「收起来」与「把那份后备缓冲还回去」在这个模式
+    // 里是同一个动作。走的是完整的关闭决策链，与用户点标题栏关闭按钮同义。
+    //
+    // **有一个毫秒级的缝**：关窗是投递 `WM_CLOSE`，在消息循环取走它之前窗口仍在登记表里，
+    // 此刻若点托盘，那条路会判「还开着」→ 把这个**即将销毁**的窗口激活到前台，随后它被
+    // 关掉——用户看到的是「点了托盘，窗口反而没了」。再点一次就正常。不为它加状态机：
+    // 代价与概率不成比例，但记在这里，省得日后当成偶发 bug 去查。
+    let hotkey = {
+        let win = win.clone();
+        app.hotkey_handle(settings.hotkey.to_hotkey(), move |ctx| {
+            if window_open(ui::WINDOW_KEY) {
+                ctx.close_window(ui::WINDOW_KEY);
+            } else if let Some(make) = win.borrow().as_ref() {
+                ctx.open_window(make());
+            }
+        })
+    };
 
-    // 托盘句柄要在 `content` 之前取到，与主题、热键两个句柄同理。
     let tray_handle = app.tray_handle();
     let ui = ui::build(dict, user, theme_handle, hotkey, tray_handle, system_dark);
-    app.on_shortcut(ui.shortcut)
+    // 填上那个延迟绑定的格子——托盘与热键的回调此刻起才真的能开出窗口。
+    *win.borrow_mut() = Some(ui.window.clone());
+
+    // 离屏截图的对象：常驻应用没有主窗可截，不指明就只能截出一张空图，而截图是本项目
+    // 验证界面的主要手段。用的是**同一个工厂**，故截的就是用户看到的那个界面。
+    app = app.screenshot_window((ui.window)());
+
+    // **只有开机自启才收进托盘**，手动运行照常显示窗口。
+    //
+    // 开机时弹一个词典窗口是打扰；但用户**双击图标**时他刚刚亲手表达了「我要用它」，
+    // 什么也不出现的话，除非他知道去按热键或翻托盘，否则这个程序看起来就是坏的。
+    //
+    // 判据是命令行开关（见 `autostart::TRAY_ARG`），由自启项自己带上。
+    if !launched_for_tray() {
+        app = app.start_window((ui.window)());
+    }
+
+    app
         // 运行期跟随系统亮暗。常驻工具尤其需要：一次会话可能横跨日出日落，而进程
         // 一直不重启——只在启动时读一次的话，用户在系统里切了暗色得把词典重开。
         .on_system_theme_changed(ui.system_theme)
-        .content(ui.root)
-        .run();
+        .run_resident();
 }
 
 /// 报告一条**启动期致命错误**后退出。

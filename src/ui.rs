@@ -1450,7 +1450,7 @@ impl State {
     /// 清空查询框，回到开屏状态。
     ///
     /// 常驻词典最高频的一个动作是「唤起 → 查另一个词」，而热键唤起时上次的词还在框里
-    /// （窗口只是被隐藏，状态原样保留）。在没有「唤起即聚焦并全选」之前
+    /// （窗口虽已销毁重建，`query` 活在 `State` 里、在树之外，见 `Ui` 的说明）。在没有「唤起即聚焦并全选」之前
     /// （见 `docs/upstream-keyboard-path.md`），用户得先把光标挪进去再全选删除——
     /// 一个按钮省掉的正是这一串。
     ///
@@ -2842,14 +2842,38 @@ fn headwords_to_record(entries: &[Entry]) -> Vec<Headword> {
     out
 }
 
-/// `build` 的产物：界面树，加上一份窗口级快捷键处理器。
+/// 主窗的单例键（[`windui::app::Window::single`]）。
+///
+/// 常驻模式下窗口是按需建、关掉即销毁的，「同时只存在一个主窗」这件事因此必须由平台
+/// 按键去重：托盘点一下、热键按一下、二次实例递来一次 argv，三条路都会请求开窗，没有
+/// 这个键就会开出三个各自持有一棵树的主窗——而它们抢同一批 `Signal`，且不报任何错。
+///
+/// 它同时是热键「再按一下收回去」的作用对象（`window_open` / `close_window` 都按键找窗）。
+///
+/// 去重的判据是平台的**窗口登记表**，登记发生在窗口真正建出来那一刻。所以它保的是
+/// 「跨批」——同一批请求里的两个同键请求曾经都能建出窗口来（上游 `966a535` 已补上批内
+/// 去重）。本项目真会撞上那一批：`App::channel` 一次排空全部消息，用户「双击图标没反应、
+/// 再双击一次」的两条二次实例消息正好落在同一批里。
+pub const WINDOW_KEY: &str = "main";
+
+/// `build` 的产物：造主窗的工厂，加上一份系统外观变化的处理器。
 ///
 /// 打包成一个结构而非让 `main` 各取一次，是因为两者共享同一个 `State`——分成两个函数
 /// 就得把 `State` 或它的构造过程暴露出去，而它是这个模块的全部内部机制。
+///
+/// **给的是工厂而不是一棵树**：常驻模式下窗口关掉即销毁，下次唤起要一棵新的
+/// （`Window::content` 收的也正是个构建闭包，好让树里的信号随窗口一起回收）。换肤本就
+/// 一直在重建整树（见 `build` 尾部），这条路早被验证过了。
+///
+/// **什么丢、什么不丢，要分清**：查询词、候选、历史、展开态活在 `State` 里、在树之外，
+/// 重建后原样还在；而**活在树上的会丢**——滚动位置（`scroll_y` 是节点字段）、焦点落点、
+/// hover 态，以及窗口自己的尺寸与位置（每次都是一份新的 `WindowRequest`，故恒为下面
+/// 那个尺寸、居中显示，用户拖过的几何不保留）。要保住其中任何一样，都得把它提到 `State`
+/// 或 `Settings` 里去，而不是指望重建。
 pub struct Ui {
-    pub root: Element,
-    /// 交给 [`windui::app::App::on_shortcut`]。
-    pub shortcut: ShortcutFn,
+    /// 造一份主窗请求。托盘、热键、启动即开窗、离屏截图**四处共用同一个工厂**——
+    /// 各写一份的话，截图验的就不再是用户看到的那个界面。
+    pub window: WindowFactory,
     /// 交给 [`windui::app::App::on_system_theme_changed`]。
     ///
     /// 只在 `SkinMode::System` 下真正换色，但任何时候都记下系统那一位——用户可能过
@@ -2857,8 +2881,14 @@ pub struct Ui {
     pub system_theme: SystemThemeFn,
 }
 
-/// 窗口级快捷键处理器。抽成别名只为让 [`Ui`] 的字段读得下去。
-pub type ShortcutFn = Box<dyn FnMut(&mut ShortcutCtx, KeyEvent) -> bool>;
+/// 造主窗请求的工厂。`Rc` 而非 `Box`：四个调用方各持一份，且都要求 `'static`。
+///
+/// **必须可反复调用且无副作用**：启动时它就会被调用两次，而其中一次的产物必然被丢弃
+/// ——`screenshot_window` 与 `start_window` 各要一份，上游按命令行只取其中一条路
+/// （截图那条 `return` 得更早，另一条只在非截图时入队）。工厂体里若写下 `signal(..)`
+/// 或改了 `State`，症状会是「启动时状态被莫名改了一次」，且只在某一条命令行路径上出现。
+/// 造信号是 `build` 的事，工厂只负责把它们组装成一棵树。
+pub type WindowFactory = Rc<dyn Fn() -> WindowRequest>;
 
 /// 系统外观变化的处理器。同上。
 pub type SystemThemeFn = Box<dyn FnMut(&mut EventCtx, bool)>;
@@ -2958,15 +2988,44 @@ pub fn build(
     //
     // 只包一层、不逐处细分：漏掉任何一处含图标的子树，就会出现「有的跟了有的没跟」，
     // 那是最难查的一类不一致。整树重建换来的是「不可能漏」。
-    let sc_st = st.clone();
     let sys_st = st.clone();
-    let root = Element::host_signal(st.skin_rev, move |_rev: u64| {
-        // `host_signal` 的回调是 `Fn`，会被反复调用，故每次都得拿一份自己的。
-        window_root(st.clone(), unavailable.clone())
+    // 窗口的形状（尺寸、下限、无边框）写在这里而不是 `main`：它们讲的都是界面自己的事实。
+    //
+    // 920 宽：界面是左右两栏（`dict_page`），左栏定宽 280，故释义那一栏拿到 640——正文
+    // 限宽已撤（见 `EN_DEF_MAX_W`），一行排满正好是舒适的阅读宽度。
+    //
+    // 下限 720：扣掉左栏那 280 还剩 440 给释义，勉强够读。再窄就该让左栏改为可收起
+    // 而不是继续压缩释义（尚未实现），而不是让用户拖到一个不可用的尺寸。
+    //
+    // 无系统标题栏：标题栏由 `title_bar` 自绘，才能与整体配色一致。
+    let window: WindowFactory = Rc::new(move || {
+        let (content_st, shortcut_st) = (st.clone(), st.clone());
+        let unavailable = unavailable.clone();
+        Window::new(crate::app_title(), 920, 620)
+            .min_size(720, 480)
+            .frameless(true)
+            // 每次居中。**不是审美选择，是止损**：窗口每次都是新建的，不设这一条时
+            // 上游传 `CW_USEDEFAULT`，而 Windows 对同一进程连续创建的顶层窗口做级联
+            // 偏移。实测（去掉本行做对照组，连按三次热键）：左上角从 (127,127) 走到
+            // (152,152) 再到 (177,177)，每次 +25px——用得久了窗口会跑出屏幕。
+            // 设上之后三次都稳定在 (386,151)。
+            //
+            // 旧的「隐藏主窗」模型里用户拖过的尺寸与位置随那个窗口一直活着，现在不再
+            // 保留（见 `Ui` 的说明）。真要保留，得把几何存进 `Settings`、开窗时读回来。
+            .centered(true)
+            .single(WINDOW_KEY)
+            // 快捷键必须挂在**窗口**上：常驻模式没有主窗，`App::on_shortcut` 无处可挂，
+            // 挂错地方的表现是「界面正常，所有 Ctrl+X 静默失灵」。
+            .on_shortcut(move |ctx, ev| handle_shortcut(&shortcut_st, ctx, ev))
+            .content(move || {
+                Element::host_signal(content_st.skin_rev, move |_rev: u64| {
+                    // `host_signal` 的回调是 `Fn`，会被反复调用，故每次都得拿一份自己的。
+                    window_root(content_st.clone(), unavailable.clone())
+                })
+            })
     });
     Ui {
-        root,
-        shortcut: Box::new(move |ctx, ev| handle_shortcut(&sc_st, ctx, ev)),
+        window,
         system_theme: Box::new(move |_ctx, dark| sys_st.system_theme_changed(dark)),
     }
 }
@@ -2997,8 +3056,9 @@ fn handle_shortcut(st: &Rc<State>, ctx: &mut ShortcutCtx, ev: KeyEvent) -> bool 
             st.refresh();
             true
         }
-        // Ctrl+W：收起窗口。走关闭决策链，本项目 `hide_on_close` 会把它落成隐藏——
-        // 常驻工具的 Ctrl+W 该是「收起」而不是「退出」，进程还要留着等热键。
+        // Ctrl+W：收起窗口。走关闭决策链，零窗口常驻下它把窗口**销毁**掉（渲染资源随之
+        // 归还），进程留在托盘里等热键——常驻工具的 Ctrl+W 该是「收起」而不是「退出」。
+        // 「收起」与「关掉」在这个模式里本就是同一件事，见 ADR-0007 的 2026-09 订正。
         Key::Other(VK_W) if ev.ctrl => {
             ctx.request_close();
             true
@@ -4888,15 +4948,17 @@ fn query_box(st: Rc<State>) -> Element {
                 .corner(10.0)
                 .font_size(15.0)
                 // 唤起后焦点落在这里，并全选旧内容——常驻词典最高频的动作是「唤起 →
-                // 查另一个词」，而窗口只是被隐藏、上次的词原样还在框里。全选让下一个词
-                // 直接覆盖打上去，不用先删。
+                // 查另一个词」，而上次的词原样还在框里（`query` 在 `State` 里）。全选让
+                // 下一个词直接覆盖打上去，不用先删。
                 //
-                // **每次唤起都重新兑现**：托盘点击 / 全局热键 / `WindowOp::Show` 造成的
-                // 隐藏→可见跃迁，上游都会重新 arm 一次（windui `on_window_shown`），
-                // 应用侧不需要挂 `on_show`。
+                // **唤起时之所以每次都兑现，是因为每次开窗都是一棵新树**（零窗口常驻，
+                // 见 ADR-0006 第二次修订）。此前的机制是「隐藏→可见跃迁时上游重新 arm
+                // 一次」，那条路随隐藏主窗一起没了——结论没变，理由换了。
                 //
-                // 这里此前写着「只在进程起来后第一次唤起兑现，第二次唤起焦点还停在原处」
-                // ——那条限制上游已经解掉了（`675d6d5`），注释一并作废。
+                // **有一处它兑现不了**：窗口已经开着、只是被别的程序盖住时，点托盘或
+                // 二次启动走的是 `NewWindow::Focus`（把既有窗口激活到前台），既不是新树、
+                // 也没有隐藏→可见跃迁，于是光标停在用户上次离开的地方，不回查询框。
+                // 热键那条不受影响——它是切换，窗口开着时先收起。
                 .autofocus_select_all()
                 .on_submit(move |_ctx| submit_st.submit())
                 // 焦点留在查询框时的键位。**Tab 一律放过**——它是所有 Windows 程序里
